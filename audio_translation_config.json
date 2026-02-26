@@ -1,0 +1,20 @@
+{
+  "baidu": {
+    "api_key": "",
+    "secret_key": "",
+    "translation_url": "wss://tsn.baidu.com/text2audio"
+  },
+  "srs": {
+    "url": "http://localhost:8080",
+    "rtmp_url": "rtmp://localhost/live"
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "format": "pcm_s16le",
+    "chunk_size_ms": 200,
+    "asr_format": "aac",
+    "input_format": null
+  },
+  "rooms": []
+}
