@@ -91,6 +91,23 @@ class UserManager:
     def _get_current_time(self) -> str:
         return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
+    def _repair_room_if_needed(self, room: Room) -> None:
+        """修复历史异常数据：移除 user_id 为空的假成员，并补全 owner_id。"""
+        if "" in room.members:
+            del room.members[""]
+        if room.owner_id and room.owner_id in room.members:
+            return
+        if not room.members:
+            room.owner_id = ""
+            return
+        for uid, member in room.members.items():
+            if member.role == UserRole.OWNER:
+                room.owner_id = uid
+                return
+        uid = next(iter(room.members))
+        room.owner_id = uid
+        room.members[uid].role = UserRole.OWNER
+    
     # ========== 房间管理 ==========
     
     def create_room(self, room_id: str, owner_id: str, name: str = "") -> Room:
@@ -106,24 +123,31 @@ class UserManager:
                 created_at=self._get_current_time()
             )
             
-            # 创建者自动成为群主
-            owner = User(
-                user_id=owner_id,
-                room_id=room_id,
-                role=UserRole.OWNER,
-                joined_at=self._get_current_time(),
-                last_active=self._get_current_time()
-            )
-            room.members[owner_id] = owner
+            # 创建者自动成为群主（owner_id 为空时不加入成员，避免 members 中出现 user_id 为空的假房主）
+            if owner_id:
+                owner = User(
+                    user_id=owner_id,
+                    room_id=room_id,
+                    role=UserRole.OWNER,
+                    joined_at=self._get_current_time(),
+                    last_active=self._get_current_time()
+                )
+                room.members[owner_id] = owner
+                # 同步创建流映射
+                stream_name = f"{room_id}_{owner_id}"
+                self._stream_to_user[stream_name] = owner_id
             
             self._rooms[room_id] = room
-            logger.info(f"[UserManager] Created room: {room_id}, owner: {owner_id}")
+            logger.info(f"[UserManager] Created room: {room_id}, owner: {owner_id or '(pending first join)'}")
             return room
     
     def get_room(self, room_id: str) -> Optional[Room]:
         """获取房间信息"""
         with self._lock:
-            return self._rooms.get(room_id)
+            room = self._rooms.get(room_id)
+            if room:
+                self._repair_room_if_needed(room)
+            return room
     
     def get_or_create_room(self, room_id: str, creator_id: str = "") -> Room:
         """获取或创建房间"""
@@ -157,11 +181,12 @@ class UserManager:
     def join_room(self, room_id: str, user_id: str, role: UserRole = UserRole.MEMBER) -> User:
         """用户加入房间"""
         with self._lock:
-            # 确保房间存在
+            # 确保房间存在（未先调用 create_room 时创建空房间，首位加入者在下方成为群主）
             if room_id not in self._rooms:
-                self.create_room(room_id, user_id if role == UserRole.OWNER else "")
+                self.create_room(room_id, "", "")
             
             room = self._rooms[room_id]
+            self._repair_room_if_needed(room)
             
             if user_id in room.members:
                 # 更新最后活跃时间
@@ -172,16 +197,22 @@ class UserManager:
             if len(room.members) >= room.max_members:
                 raise ValueError(f"Room {room_id} is full")
             
+            # 尚无群主且当前无人时：首位加入者自动成为群主（修复仅 join 且 role=member 时出现 user_id 为空的假房主）
+            effective_role = role
+            if not room.owner_id and len(room.members) == 0:
+                effective_role = UserRole.OWNER
+                room.owner_id = user_id
+            
             # 创建新用户
             user = User(
                 user_id=user_id,
                 room_id=room_id,
-                role=role,
+                role=effective_role,
                 joined_at=self._get_current_time(),
                 last_active=self._get_current_time()
             )
             
-            # 如果是第一个加入的成员且没有群主，设置群主
+            # 显式以群主身份加入且尚无群主记录时（房间已有其他成员的边缘情况）
             if not room.owner_id and role == UserRole.OWNER:
                 room.owner_id = user_id
                 user.role = UserRole.OWNER
@@ -232,6 +263,7 @@ class UserManager:
             room = self._rooms.get(room_id)
             if not room:
                 return []
+            self._repair_room_if_needed(room)
             return list(room.members.values())
     
     def get_user_by_stream(self, stream_name: str) -> Optional[User]:

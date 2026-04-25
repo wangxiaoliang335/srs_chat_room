@@ -11,7 +11,7 @@ import logging
 import requests
 import base64
 import time
-from typing import Optional, bytes
+from typing import Optional
 
 logging.basicConfig(
     level=logging.INFO,

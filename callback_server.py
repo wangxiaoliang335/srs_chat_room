@@ -12,6 +12,11 @@ import logging
 import subprocess
 import threading
 import uuid
+
+# 加载 .env 环境变量文件
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+
 from flask import Flask, request, jsonify
 from typing import Dict, Any, List
 
@@ -23,20 +28,34 @@ from user_manager import (
 )
 from notification_service import notification_service
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# 配置日志：同时输出到控制台和文件
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# 文件日志处理器
+log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'callback_server.log')
+file_handler = logging.FileHandler(log_file, encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+# 控制台日志处理器
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+# 添加处理器到logger
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 app = Flask(__name__)
 
 # 翻译管理器
 translation_manager = TranslationManager()
 
-# 存储运行中的翻译服务进程
+# 存储运行中的翻译服务进程和日志文件
 # 结构: {request_id: subprocess.Popen}
 translation_processes: Dict[str, subprocess.Popen] = {}
+translation_log_files: Dict[str, Any] = {}
 
 # SRS配置
 SRS_URL = os.getenv("SRS_URL", "rtmp://localhost:1935")
@@ -47,10 +66,75 @@ WS_PORT = int(os.getenv('CALLBACK_PORT', 8085))
 # Socket.IO 实例（延迟初始化）
 sio = None
 
+# 心跳检查定时器
+heartbeat_check_thread = None
+heartbeat_check_running = False
+
 # 用户说话状态管理
 # 结构: {room_id: {user_id: True/False}}
 speaking_users: Dict[str, Dict[str, bool]] = {}
 speaking_lock = threading.Lock()
+
+
+# ========== 心跳检查线程 ==========
+
+def heartbeat_check_worker():
+    """心跳检查工作线程，每10秒检查一次"""
+    global heartbeat_check_running
+    
+    logger.info("[HeartbeatCheck] Starting heartbeat check worker")
+    
+    while heartbeat_check_running:
+        try:
+            # 执行清理检查
+            results = translation_manager.check_and_cleanup()
+            
+            if results:
+                for result in results:
+                    if result["stopped"]:
+                        logger.info(f"[HeartbeatCheck] Cleaned up translation: {result['request_id']}, "
+                                  f"reason: {result['stop_reason']}")
+                        
+                        # 通知客户端翻译已停止
+                        notification_service.notify_translation_stopped(
+                            room_id=result["room_id"],
+                            source_user=result["source_user"],
+                            to_lang=result["to_lang"]
+                        )
+        
+        except Exception as e:
+            logger.error(f"[HeartbeatCheck] Error in heartbeat check: {e}", exc_info=True)
+        
+        # 等待10秒
+        for _ in range(10):
+            if not heartbeat_check_running:
+                break
+            threading.Event().wait(1)
+
+
+def start_heartbeat_checker():
+    """启动心跳检查线程"""
+    global heartbeat_check_thread, heartbeat_check_running
+    
+    if heartbeat_check_thread is not None and heartbeat_check_thread.is_alive():
+        logger.warning("[HeartbeatCheck] Heartbeat checker already running")
+        return
+    
+    heartbeat_check_running = True
+    heartbeat_check_thread = threading.Thread(target=heartbeat_check_worker, daemon=True)
+    heartbeat_check_thread.start()
+    logger.info("[HeartbeatCheck] Heartbeat checker started")
+
+
+def stop_heartbeat_checker():
+    """停止心跳检查线程"""
+    global heartbeat_check_running
+    
+    heartbeat_check_running = False
+    if heartbeat_check_thread:
+        heartbeat_check_thread.join(timeout=5)
+        heartbeat_check_thread = None
+    logger.info("[HeartbeatCheck] Heartbeat checker stopped")
 
 
 def parse_stream_name(stream_name: str) -> dict:
@@ -124,20 +208,36 @@ def start_translation_service(request_id: str, room_id: str, source_user: str, t
     env['SRS_URL'] = SRS_URL
     env['TEXT_SERVER_URL'] = os.getenv("TEXT_SERVER_URL", "http://localhost:8086")  # 文本推送服务地址
     
+    # 从.env文件加载百度API密钥
+    from dotenv import dotenv_values
+    env_values = dotenv_values(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+    if env_values:
+        if env_values.get('BAIDU_API_KEY'):
+            env['BAIDU_API_KEY'] = env_values['BAIDU_API_KEY']
+        if env_values.get('BAIDU_SECRET_KEY'):
+            env['BAIDU_SECRET_KEY'] = env_values['BAIDU_SECRET_KEY']
+    
     try:
-        # 启动翻译服务进程
-        # 使用绝对路径确保能找到脚本
+        python311 = "/usr/local/python3.11-ssl/bin/python3.11"
+        if not os.path.exists(python311):
+            python311 = sys.executable
+        
         script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audio_translation_service.py')
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audio_translation_service.log')
         logger.info(f"Starting translation service script: {script_path}")
         
+        # 打开日志文件用于记录子进程输出
+        log_file = open(log_path, 'a')
+        
         process = subprocess.Popen(
-            [sys.executable, script_path],
+            [python311, script_path],
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stdout=log_file,
+            stderr=subprocess.STDOUT
         )
         
         translation_processes[request_id] = process
+        translation_log_files[request_id] = log_file
         logger.info(f"Started translation service for request: {request_id}, "
                    f"stream: {stream_name}, PID: {process.pid}")
         
@@ -156,11 +256,20 @@ def stop_translation_service(request_id: str):
     try:
         process.terminate()
         process.wait(timeout=5)
+        
+        # 关闭日志文件
+        if request_id in translation_log_files:
+            translation_log_files[request_id].close()
+            del translation_log_files[request_id]
+        
         del translation_processes[request_id]
         logger.info(f"Stopped translation service for request: {request_id}")
         
     except subprocess.TimeoutExpired:
         process.kill()
+        if request_id in translation_log_files:
+            translation_log_files[request_id].close()
+            del translation_log_files[request_id]
         del translation_processes[request_id]
         logger.warning(f"Force killed translation service for request: {request_id}")
     except Exception as e:
@@ -515,6 +624,7 @@ def get_room_members(room_id: str):
         "message": "success",
         "data": {
             "room_id": "room_123",
+            "owner_id": "user_001",
             "member_count": 5,
             "allow_speak": true,
             "members": [
@@ -573,6 +683,7 @@ def get_room_members(room_id: str):
             'message': 'success',
             'data': {
                 'room_id': room_id,
+                'owner_id': room.owner_id,
                 'member_count': len(filtered_members),
                 'allow_speak': room.allow_speak,
                 'members': filtered_members
@@ -1585,6 +1696,261 @@ def get_all_requests():
         return jsonify({'code': 500, 'message': str(e)}), 500
 
 
+@app.route('/api/v1/translation/text/push', methods=['POST'])
+def push_translation_text():
+    """接收翻译服务推送的翻译文本，转发给客户端
+    
+    请求体:
+    {
+        "target_user": "B",           # 目标用户ID
+        "request_id": "xxx",          # 翻译请求ID
+        "room_id": "room1",           # 房间ID
+        "source_user": "A",           # 说话人用户ID
+        "original_text": "Hello",     # 原文
+        "translated_text": "你好",     # 译文
+        "source_lang": "en",          # 源语言
+        "target_lang": "zh",          # 目标语言
+        "timestamp": 1234567890       # 时间戳
+    }
+    
+    返回:
+    {
+        "code": 0,
+        "message": "success"
+    }
+    """
+    try:
+        data = request.json or {}
+        target_user = data.get('target_user', '')
+        room_id = data.get('room_id', '')
+        source_user = data.get('source_user', '')
+        original_text = data.get('original_text', '')
+        translated_text = data.get('translated_text', '')
+        source_lang = data.get('source_lang', '')
+        target_lang = data.get('target_lang', '')
+        
+        if not target_user or not room_id or not source_user:
+            return jsonify({
+                'code': 400,
+                'message': 'Missing required parameters: target_user, room_id, source_user'
+            }), 400
+        
+        logger.info(f"[Translation] Pushing text to {target_user}: '{original_text[:30]}...' -> '{translated_text[:30]}...'")
+        
+        # 通过通知服务转发给客户端
+        notification_service.notify_translation_text(
+            room_id=room_id,
+            source_user=source_user,
+            target_user=target_user,
+            original_text=original_text,
+            translated_text=translated_text,
+            source_lang=source_lang,
+            target_lang=target_lang
+        )
+        
+        return jsonify({
+            'code': 0,
+            'message': 'success'
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error pushing translation text: {e}")
+        return jsonify({'code': 500, 'message': str(e)}), 500
+
+
+# ========== 拉流者心跳接口 ==========
+
+@app.route('/api/v1/translation/heartbeat', methods=['POST'])
+def translation_heartbeat():
+    """拉流者心跳接口
+    
+    拉流客户端需要定期调用此接口报告心跳，表明仍在拉取翻译流。
+    如果超过15秒未收到心跳，服务器将认为该拉流者已断开。
+    
+    请求体:
+    {
+        "request_id": "xxx",     # 翻译请求ID
+        "puller_id": "user_b",   # 拉流者ID
+        "source_stream_active": true  # 拉流端检测到的源流状态（可选）
+    }
+    
+    返回:
+    {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "received": true,
+            "next_heartbeat_in": 5
+        }
+    }
+    """
+    try:
+        data = request.json or {}
+        request_id = data.get('request_id', '')
+        puller_id = data.get('puller_id', '')
+        source_stream_active = data.get('source_stream_active', None)
+        
+        if not request_id or not puller_id:
+            return jsonify({
+                'code': 400,
+                'message': 'Missing required parameters: request_id, puller_id'
+            }), 400
+        
+        # 记录心跳
+        success = translation_manager.heartbeat_puller(request_id, puller_id)
+        
+        # 如果客户端报告了源流状态，也更新
+        if source_stream_active is not None and success:
+            request = translation_manager.get_request(request_id)
+            if request:
+                translation_manager.update_source_stream_active(
+                    request.room_id, 
+                    request.source_user, 
+                    source_stream_active
+                )
+        
+        logger.debug(f"[Heartbeat] Received: request={request_id}, puller={puller_id}")
+        
+        return jsonify({
+            'code': 0,
+            'message': 'success',
+            'data': {
+                'received': success,
+                'next_heartbeat_in': 5
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error handling heartbeat: {e}")
+        return jsonify({'code': 500, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/translation/register_puller', methods=['POST'])
+def register_puller():
+    """注册拉流者接口
+    
+    客户端在开始拉取翻译流时调用此接口。
+    
+    请求体:
+    {
+        "request_id": "xxx",     # 翻译请求ID
+        "puller_id": "user_b"    # 拉流者ID
+    }
+    
+    返回:
+    {
+        "code": 0,
+        "message": "success"
+    }
+    """
+    try:
+        data = request.json or {}
+        request_id = data.get('request_id', '')
+        puller_id = data.get('puller_id', '')
+        
+        if not request_id or not puller_id:
+            return jsonify({
+                'code': 400,
+                'message': 'Missing required parameters: request_id, puller_id'
+            }), 400
+        
+        success = translation_manager.register_puller(request_id, puller_id)
+        
+        if success:
+            return jsonify({
+                'code': 0,
+                'message': 'success'
+            }), 200
+        else:
+            return jsonify({
+                'code': 404,
+                'message': 'Translation request not found'
+            }), 404
+            
+    except Exception as e:
+        logger.error(f"Error registering puller: {e}")
+        return jsonify({'code': 500, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/translation/unregister_puller', methods=['POST'])
+def unregister_puller():
+    """注销拉流者接口
+    
+    客户端主动停止拉取翻译流时调用此接口。
+    
+    请求体:
+    {
+        "request_id": "xxx",     # 翻译请求ID
+        "puller_id": "user_b"    # 拉流者ID
+    }
+    
+    返回:
+    {
+        "code": 0,
+        "message": 'success'
+    }
+    """
+    try:
+        data = request.json or {}
+        request_id = data.get('request_id', '')
+        puller_id = data.get('puller_id', '')
+        
+        if not request_id or not puller_id:
+            return jsonify({
+                'code': 400,
+                'message': 'Missing required parameters: request_id, puller_id'
+            }), 400
+        
+        success = translation_manager.unregister_puller(request_id, puller_id)
+        
+        return jsonify({
+            'code': 0,
+            'message': 'success'
+        }), 200
+            
+    except Exception as e:
+        logger.error(f"Error unregistering puller: {e}")
+        return jsonify({'code': 500, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/translation/requests/<request_id>/pullers', methods=['GET'])
+def get_request_pullers(request_id: str):
+    """获取翻译请求的拉流者列表
+    
+    返回:
+    {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "request_id": "xxx",
+            "pullers": [
+                {
+                    "puller_id": "user_b",
+                    "last_heartbeat": 1234567890,
+                    "seconds_ago": 3,
+                    "is_alive": true
+                }
+            ]
+        }
+    }
+    """
+    try:
+        pullers = translation_manager.get_pullers(request_id)
+        
+        return jsonify({
+            'code': 0,
+            'message': 'success',
+            'data': {
+                'request_id': request_id,
+                'pullers': pullers
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting pullers: {e}")
+        return jsonify({'code': 500, 'message': str(e)}), 500
+
+
 # ========== SRS回调接口 ==========
 
 @app.route('/api/v1/streams/on_publish', methods=['POST'])
@@ -1613,6 +1979,12 @@ def on_publish():
             user_id = parsed['user_id']
             
             if room_id and user_id:
+                # 获取房间信息
+                room = user_manager.get_room(room_id)
+                if not room:
+                    logger.warning(f"[Speaking] Room {room_id} does not exist")
+                    return jsonify({'code': 0}), 200
+                
                 # 检查用户是否在房间中
                 member = user_manager.get_member(room_id, user_id)
                 if member:
@@ -1623,9 +1995,15 @@ def on_publish():
                     
                     stream_url = f"{SRS_URL}/live/{stream_name}"
                     notification_service.notify_user_speaking_start(room_id, user_id, stream_url)
+                    
+                    # ========== 容错机制：更新源流状态 ==========
+                    translation_manager.update_source_stream_active(room_id, user_id, True)
+                    
                     logger.info(f"[Speaking] User {user_id} started speaking in room {room_id}")
                 else:
-                    logger.warning(f"[Speaking] User {user_id} not found in room {room_id}")
+                    # 用户不在房间中，打印房间成员列表以便调试
+                    member_ids = list(room.members.keys()) if room.members else []
+                    logger.warning(f"[Speaking] User {user_id} not in room {room_id}. Room members: {member_ids}. Please call /api/v1/room/{room_id}/join first")
             else:
                 logger.warning(f"[Speaking] Could not parse room_id/user_id from stream: {stream_name}")
                 
@@ -1687,6 +2065,10 @@ def on_unpublish():
                             del speaking_users[room_id]
                 
                 notification_service.notify_user_speaking_stop(room_id, user_id)
+                
+                # ========== 容错机制：更新源流状态 ==========
+                translation_manager.update_source_stream_active(room_id, user_id, False)
+                
                 logger.info(f"[Speaking] User {user_id} stopped speaking in room {room_id}")
                 
         elif parsed['type'] == 'translation':
@@ -1935,71 +2317,119 @@ if __name__ == '__main__':
     logger.info(f"Starting callback server on {host}:{port}")
     logger.info(f"SRS URL: {SRS_URL}")
     
+    # 设置翻译管理器的停止回调
+    def on_translation_stop(request_id: str):
+        """翻译停止时的回调"""
+        logger.info(f"[Callback] Translation stop callback: {request_id}")
+        # 停止翻译服务进程
+        if request_id in translation_processes:
+            stop_translation_service(request_id)
+        # 通知客户端
+        req = translation_manager.get_request(request_id)
+        if req:
+            notification_service.notify_translation_stopped(
+                room_id=req.room_id,
+                source_user=req.source_user,
+                to_lang=req.to_lang
+            )
+    
+    translation_manager.set_stop_callback(on_translation_stop)
+    
+    # 启动心跳检查线程
+    start_heartbeat_checker()
+    
+    # 尝试使用 flask-socketio 在同一端口提供 HTTP API + Socket.IO WebSocket
     try:
-        import socketio
-
-        # 创建 Socket.IO 服务器
-        sio = socketio.Server(async_mode='eventlet')
-
-        # 设置给通知服务
-        notification_service.set_socketio(sio)
-
-        @sio.event
-        def connect(sid, environ):
-            logger.info(f"[SocketIO] Client connected: {sid}")
+        from flask_socketio import SocketIO, emit, join_room, leave_room
         
-        @sio.event
-        def disconnect(sid):
-            logger.info(f"[SocketIO] Client disconnected: {sid}")
+        # 创建 Socket.IO 实例，与 Flask app 集成
+        socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
         
-        @sio.event
-        def subscribe(sid, data):
-            """订阅房间事件"""
+        # 设置 notification_service 的 socketio 实例
+        notification_service.set_socketio(socketio)
+        
+        @socketio.on('connect')
+        def handle_connect(*args):
+            logger.info("[Socket.IO] Client connected")
+        
+        @socketio.on('disconnect')
+        def handle_disconnect():
+            logger.info("[Socket.IO] Client disconnected")
+        
+        @socketio.on('subscribe')
+        def handle_subscribe(data):
             room_id = data.get('room_id', '')
             user_id = data.get('user_id', '')
+            logger.info(f"[Socket.IO] Subscribe: room={room_id}, user={user_id}")
             if room_id:
-                sio.enter_room(sid, f"room_{room_id}")
-                logger.info(f"[SocketIO] {sid} subscribed to room {room_id}")
-                sio.emit('subscribed', {'room_id': room_id, 'user_id': user_id}, room=sid)
-            
-            # 同时订阅私人通知房间（用于接收敲门等私人消息）
-            if user_id:
-                sio.enter_room(sid, f"user_{user_id}")
-                logger.info(f"[SocketIO] {sid} subscribed to private notifications for user {user_id}")
+                join_room(room_id)
+                notification_service.subscribe_room_socketio(room_id)
+            if user_id and room_id:
+                notification_service.register_user_socketio(user_id, room_id)
+            emit('subscribed', {'room_id': room_id, 'user_id': user_id})
         
-        @sio.event
-        def subscribe_private(sid, data):
-            """订阅私人通知（用于接收敲门等私人消息）"""
-            user_id = data.get('user_id', '')
-            if user_id:
-                sio.enter_room(sid, f"user_{user_id}")
-                logger.info(f"[SocketIO] {sid} subscribed to private notifications for user {user_id}")
-                sio.emit('subscribed_private', {'user_id': user_id}, room=sid)
-        
-        @sio.event
-        def unsubscribe(sid, data):
-            """取消订阅房间"""
+        @socketio.on('unsubscribe')
+        def handle_unsubscribe(data):
             room_id = data.get('room_id', '')
+            logger.info(f"[Socket.IO] Unsubscribe: room={room_id}")
             if room_id:
-                sio.leave_room(sid, f"room_{room_id}")
-                logger.info(f"[SocketIO] {sid} unsubscribed from room {room_id}")
+                leave_room(room_id)
+                notification_service.unsubscribe_room_socketio(room_id)
         
-        # 创建 Flask-SocketIO 应用
-        app.wsgi_app = socketio.Middleware(sio, app.wsgi_app)
+        @socketio.on('ping')
+        def handle_ping():
+            emit('pong')
         
-        logger.info(f"[Server] Running with Socket.IO support on {host}:{port}")
-        
-        # 使用 eventlet 运行
-        import eventlet
-        eventlet.wsgi.server(eventlet.listen((host, port)), app)
+        logger.info(f"[Server] Starting Flask-SocketIO server on {host}:{port}")
+        socketio.run(app, host=host, port=port, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
         
     except ImportError as e:
-        logger.warning(f"[Server] socketio/eventlet not available: {e}")
-        logger.info("[Server] Running Flask only (Socket.IO disabled)")
-        app.run(host=host, port=port, debug=False, threaded=True)
-    except Exception as e:
-        logger.warning(f"[Server] Error starting Socket.IO: {e}")
-        import traceback
-        traceback.print_exc()
-        logger.info("[Server] Running Flask only")
-        app.run(host=host, port=port, debug=False, threaded=True)
+        logger.warning(f"[WS] flask-socketio not installed: {e}")
+        logger.info("[WS] Falling back to gevent-websocket for WebSocket support")
+        
+        from gevent.pywsgi import WSGIServer
+        from geventwebsocket import WebSocketServer, WebSocketApplication
+        from geventwebsocket.resource import Resource
+
+        # WebSocket 应用
+        class NotificationApplication(WebSocketApplication):
+            def on_open(self):
+                logger.info("[WS] Client connected")
+                notification_service.register_global(self.ws)
+
+            def on_message(self, message):
+                if message is None:
+                    return
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get('type', '')
+                    if msg_type == 'subscribe':
+                        room_id = data.get('room_id', '')
+                        user_id = data.get('user_id', '')
+                        if room_id:
+                            notification_service.subscribe_room(self.ws, room_id)
+                        if user_id and room_id:
+                            notification_service.register_user(self.ws, user_id, room_id)
+                        self.ws.send(json.dumps({'type': 'subscribed', 'room_id': room_id, 'user_id': user_id}))
+                    elif msg_type == 'unsubscribe':
+                        room_id = data.get('room_id', '')
+                        if room_id:
+                            notification_service.unsubscribe_room(self.ws, room_id)
+                    elif msg_type == 'ping':
+                        self.ws.send(json.dumps({'type': 'pong'}))
+                except json.JSONDecodeError:
+                    logger.warning(f"[WS] Invalid JSON: {message}")
+
+            def on_close(self, reason):
+                logger.info("[WS] Client disconnected")
+                notification_service.unregister(self.ws)
+
+        # Resource: HTTP 请求走 Flask，WebSocket 请求走 NotificationApplication
+        resource = Resource([
+            ('/ws', NotificationApplication),
+            ('.*', app),
+        ])
+
+        logger.info(f"[Server] Starting HTTP+WebSocket server on {host}:{port}")
+        server = WebSocketServer((host, port), resource)
+        server.serve_forever()

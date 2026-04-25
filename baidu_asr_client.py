@@ -63,17 +63,19 @@ class BaiduASRClient:
             logger.error(f"Failed to get ASR access token: {e}")
             raise
     
-    def recognize(self, audio_data: bytes, format: str = "pcm", rate: int = 16000, 
-                  channel: int = 1, cuid: str = "srs_translation") -> Optional[str]:
+    def recognize(self, audio_data: bytes, format: str = "pcm", rate: int = 16000,
+                  channel: int = 1, cuid: str = "srs_translation",
+                  dev_pid: int = 1537) -> Optional[str]:
         """识别音频，返回文本
-        
+
         Args:
             audio_data: 音频数据（支持多种格式）
             format: 音频格式，支持：pcm, wav, mp3, amr, flac, aac等
             rate: 采样率（16000推荐，8000用于电话场景）
             channel: 声道数（1=单声道，2=双声道）
             cuid: 用户唯一标识
-        
+            dev_pid: 语音识别模型（1537=中文普通话，1737=英文，1736=日文/韩文）
+
         Returns:
             识别出的文本，失败返回None
         
@@ -95,20 +97,19 @@ class BaiduASRClient:
         speech = base64.b64encode(audio_data).decode('utf-8')
         speech_len = len(audio_data)
         
-        # 构建请求参数
+        # 构建请求参数（token、cuid、dev_pid 在 URL 中，format/channel/len/speech/rate 在 body 中）
         params = {
-            "dev_pid": 1537,  # 中文普通话（支持英文识别）
-            "lm_id": None,  # 语言模型ID（可选）
+            "dev_pid": dev_pid,
+            "cuid": cuid,
+            "token": token,
         }
         
         data = {
             "format": format,
-            "rate": rate,
+            "rate": rate,  # rate 在 body 中
             "channel": channel,
-            "cuid": cuid,
             "len": speech_len,
             "speech": speech,
-            "token": token
         }
         
         headers = {
@@ -146,19 +147,59 @@ class BaiduASRClient:
 
 
 class BaiduMTClient:
-    """百度机器翻译客户端"""
+    """百度机器翻译客户端
     
-    def __init__(self, api_key: str, secret_key: str):
+    注意：百度翻译API有多个版本：
+    - 百度AI平台（语音等）：使用 API Key + Secret Key 获取 token
+    - 百度翻译开放平台：使用 App ID + Secret Key 签名认证
+    
+    当前使用的是百度AI平台的通用接口，如果需要翻译功能，
+    需要到百度翻译开放平台(https://fanyi-api.baidu.com)申请单独的App ID
+    """
+    
+    def __init__(self, api_key: str, secret_key: str, use_translation_platform: bool = True):
         self.api_key = api_key
         self.secret_key = secret_key
         self.access_token = None
         self.token_expire_time = 0
+        # 百度翻译开放平台 API
         self.mt_url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+        # 备用：百度AI平台翻译API（需要开通）
+        self.ai_mt_url = "https://aip.baidubce.com/rpc/2.0/mt/v2/transtext"
+        self.use_translation_platform = use_translation_platform
     
     def get_access_token(self) -> str:
-        """获取访问令牌（机器翻译可能不需要token，使用签名）"""
-        # 百度翻译API使用签名认证，不需要token
-        return ""
+        """获取访问令牌"""
+        # 如果token未过期，直接返回
+        if self.access_token and time.time() < self.token_expire_time:
+            return self.access_token
+        
+        url = "https://aip.baidubce.com/oauth/2.0/token"
+        params = {
+            "grant_type": "client_credentials",
+            "client_id": self.api_key,
+            "client_secret": self.secret_key
+        }
+        
+        try:
+            response = requests.post(url, params=params, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            self.access_token = result.get("access_token")
+            
+            if not self.access_token:
+                logger.error("Failed to get MT access token")
+                raise Exception("Failed to get MT access token")
+            
+            expires_in = result.get("expires_in", 2592000)
+            self.token_expire_time = time.time() + expires_in - 300
+            
+            logger.info("Successfully obtained MT access token")
+            return self.access_token
+            
+        except Exception as e:
+            logger.error(f"Failed to get MT access token: {e}")
+            raise
     
     def translate(self, text: str, from_lang: str = "zh", to_lang: str = "en") -> Optional[str]:
         """翻译文本
@@ -174,39 +215,35 @@ class BaiduMTClient:
         if not text or not text.strip():
             return None
         
-        import hashlib
-        import random
-        
-        # 百度翻译API使用签名认证
-        appid = self.api_key  # 这里API Key就是App ID
-        secret_key = self.secret_key
-        salt = str(random.randint(32768, 65536))
-        
-        # 生成签名
-        sign_str = appid + text + salt + secret_key
-        sign = hashlib.md5(sign_str.encode('utf-8')).hexdigest()
-        
-        params = {
-            "q": text,
-            "from": from_lang,
-            "to": to_lang,
-            "appid": appid,
-            "salt": salt,
-            "sign": sign
-        }
-        
         try:
-            response = requests.get(self.mt_url, params=params, timeout=10)
+            token = self.get_access_token()
+            
+            # 百度AI平台翻译API
+            url = f"https://aip.baidubce.com/rpc/2.0/mt/v2/transtext?access_token={token}"
+            
+            headers = {
+                "Content-Type": "application/json"
+            }
+            
+            # 注意：百度AI平台翻译API的语言代码与通用代码不同
+            # 通用: zh, en -> 平台: zh, en
+            data = {
+                "q": text,
+                "from": from_lang,
+                "to": to_lang
+            }
+            
+            response = requests.post(url, json=data, headers=headers, timeout=10)
             response.raise_for_status()
             result = response.json()
             
-            if "trans_result" in result:
-                translated_text = result["trans_result"][0].get("dst", "")
+            if "result" in result:
+                translated_text = result["result"]["trans_result"][0]["dst"]
                 logger.info(f"Translated: {text} -> {translated_text}")
                 return translated_text
             else:
-                error_code = result.get("error_code", "Unknown")
-                error_msg = result.get("error_msg", "Unknown error")
+                error_code = result.get("error_code", result.get("error", "Unknown"))
+                error_msg = result.get("error_description", result.get("error_msg", "Unknown error"))
                 logger.error(f"Translation API error {error_code}: {error_msg}")
                 return None
                 

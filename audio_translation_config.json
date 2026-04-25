@@ -13,7 +13,7 @@
     "channels": 1,
     "format": "pcm_s16le",
     "chunk_size_ms": 200,
-    "asr_format": "aac",
+    "asr_format": "pcm",
     "input_format": null
   },
   "rooms": []
