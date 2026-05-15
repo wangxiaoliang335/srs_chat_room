@@ -1178,7 +1178,19 @@ srs_error_t SrsHttpStreamServer::hijack(ISrsHttpMessage* request, ISrsHttpHandle
     // for example, user disable the http flv then reload.
     if (streamHandlers.find(sid) != streamHandlers.end()) {
         SrsLiveEntry* s_entry = streamHandlers[sid];
-        if (!s_entry->stream->entry->enabled) {
+        
+        // Safety check: s_entry or its members might have been freed (use-after-free).
+        // This can happen during unmount or race conditions with translation requests.
+        if (s_entry == nullptr) {
+            srs_warn("http: hijack s_entry is null for sid=%s, erasing from streamHandlers", sid.c_str());
+            streamHandlers.erase(sid);
+        } else if (s_entry->stream == nullptr) {
+            srs_warn("http: hijack s_entry->stream is null for sid=%s, erasing from streamHandlers", sid.c_str());
+            streamHandlers.erase(sid);
+        } else if (s_entry->stream->entry == nullptr) {
+            srs_warn("http: hijack s_entry->stream->entry is null for sid=%s, erasing from streamHandlers", sid.c_str());
+            streamHandlers.erase(sid);
+        } else if (!s_entry->stream->entry->enabled) {
             // only when the http entry is disabled, check the config whether http flv disable,
             // for the http flv edge use hijack to trigger the edge ingester, we always mount it
             // eventhough the origin does not exists the specified stream.

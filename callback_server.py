@@ -12,13 +12,14 @@ import logging
 import subprocess
 import threading
 import uuid
+import websockets
+
+from flask import Flask, request, jsonify
+from typing import Dict, Any, List, Set
 
 # 加载 .env 环境变量文件
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
-
-from flask import Flask, request, jsonify
-from typing import Dict, Any, List
 
 from translation_manager import (
     TranslationManager, TranslationRequest, TranslationStatus
@@ -48,6 +49,32 @@ logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
 app = Flask(__name__)
+
+# ========== CORS 支持 ==========
+# 允许跨域访问，支持从不同域名调用API
+ALLOWED_ORIGINS = os.getenv('CORS_ALLOWED_ORIGINS', '*').split(',')
+
+@app.after_request
+def add_cors_headers(response):
+    """为所有响应添加 CORS 头"""
+    origin = request.headers.get('Origin', '*')
+    
+    # 检查origin是否在允许列表中
+    if '*' in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS:
+        response.headers['Access-Control-Allow-Origin'] = origin
+    else:
+        response.headers['Access-Control-Allow-Origin'] = ALLOWED_ORIGINS[0] if ALLOWED_ORIGINS else '*'
+    
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    return response
+
+@app.route('/<path:path>', methods=['OPTIONS'])
+@app.route('/', methods=['OPTIONS'])
+def handle_options(path=None):
+    """处理 OPTIONS 预检请求"""
+    return '', 204
 
 # 翻译管理器
 translation_manager = TranslationManager()
@@ -133,17 +160,130 @@ def stop_heartbeat_checker():
     heartbeat_check_running = False
     if heartbeat_check_thread:
         heartbeat_check_thread.join(timeout=5)
+
+
+# ========== 原生 WebSocket 广播 HTTP 端点 ==========
+
+@app.route('/broadcast', methods=['POST'])
+def broadcast_ws():
+    """通过原生 WebSocket 广播消息到房间"""
+    from flask import request
+    
+    data = request.get_json()
+    room_id = data.get('room_id', '')
+    message = data.get('message', '')
+    
+    if not room_id or not message:
+        return jsonify({'error': 'Missing room_id or message'}), 400
+    
+    # 异步发送到原生 WebSocket 客户端
+    def send_async():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_send_to_native_ws(room_id, message))
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.warning(f"[WS] Failed to send broadcast: {e}")
+    
+    threading.Thread(target=send_async, daemon=True).start()
+    
+    return jsonify({'status': 'ok', 'sent': True})
+
+
+async def _send_to_native_ws(room_id: str, message: str):
+    """异步向原生 WebSocket 房间发送消息"""
+    import asyncio
+    
+    # 获取所有连接的 websocket
+    with native_ws_lock:
+        if room_id not in native_ws_connections:
+            return
+        connections = list(native_ws_connections[room_id])
+    
+    # 并发发送
+    if connections:
+        await asyncio.gather(
+            *[ws.send(message) for ws in connections],
+            return_exceptions=True
+        )
+        logger.info(f"[WS] Broadcast to {len(connections)} native WS clients in room {room_id}")
+
+
+@app.route('/ws/send', methods=['POST'])
+def ws_send():
+    """发送消息到原生 WebSocket（兼容旧接口）"""
+    from flask import request
+    
+    data = request.get_json()
+    room_id = data.get('room_id', '')
+    user_id = data.get('user_id', '')
+    event_type = data.get('type', '')
+    event_data = data.get('data', {})
+    
+    if not room_id:
+        return jsonify({'error': 'Missing room_id'}), 400
+    
+    # 构建消息
+    message = json.dumps({
+        'type': event_type,
+        'room_id': room_id,
+        'user_id': user_id,
+        'data': event_data
+    }, ensure_ascii=False)
+    
+    # 异步发送
+    def send_async():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                if user_id:
+                    # 发送给特定用户
+                    loop.run_until_complete(_send_to_native_ws_user(user_id, message))
+                else:
+                    # 广播到房间
+                    loop.run_until_complete(_send_to_native_ws(room_id, message))
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.warning(f"[WS] Failed to send message: {e}")
+    
+    threading.Thread(target=send_async, daemon=True).start()
+    
+    return jsonify({'status': 'ok'})
+
+
+async def _send_to_native_ws_user(user_id: str, message: str):
+    """异步向特定用户发送消息"""
+    import asyncio
+    
+    with native_ws_lock:
+        all_ws = []
+        for room_conns in native_ws_connections.values():
+            all_ws.extend(room_conns)
+    
+    for ws in all_ws:
+        if getattr(ws, '_user_id', None) == user_id:
+            try:
+                await ws.send(message)
+                logger.info(f"[WS] Sent message to user {user_id}")
+                return
+            except Exception as e:
+                logger.warning(f"[WS] Failed to send to user {user_id}: {e}")
         heartbeat_check_thread = None
     logger.info("[HeartbeatCheck] Heartbeat checker stopped")
 
 
 def parse_stream_name(stream_name: str) -> dict:
     """解析流名称，提取 room_id、user_id 和流类型
-    
+
     流名称格式:
-    - 原声音频流: {room_id}_{user_id}
+    - 原声音频流: {room_id}_{user_id}  (room_id 以 room 开头，如 room1777389806400)
     - 翻译流: {room_id}_{source_user}_to_{lang}
-    
+
     Returns:
         dict: {
             'type': 'original' | 'translation',
@@ -158,37 +298,81 @@ def parse_stream_name(stream_name: str) -> dict:
         'user_id': None,
         'to_lang': None
     }
-    
+
     # 检查是否是翻译流（包含 "_to_"）
     if '_to_' in stream_name:
         parts = stream_name.split('_to_')
         if len(parts) == 2:
             prefix = parts[0]
             to_lang = parts[1]
-            # 翻译流的 user_id 是 source_user
-            user_id = prefix
+            # 从 prefix 中提取 room_id（prefix 格式为 room_id_source_user）
+            room_id, source_user = extract_room_id(prefix)
             result = {
                 'type': 'translation',
-                'room_id': None,  # 翻译流不直接包含 room_id，需要额外查找
-                'user_id': user_id,
+                'room_id': room_id,
+                'user_id': source_user,
                 'to_lang': to_lang
             }
     else:
-        # 原声音频流: room_id_user_id
-        # 使用 rsplit 从右边分割，只分割一次
-        parts = stream_name.rsplit('_', 1)
-        if len(parts) == 2:
+        # 原声音频流: room_id_user_id（room_id 以 room 开头）
+        room_id, user_id = extract_room_id(stream_name)
+        if room_id and user_id:
             result = {
                 'type': 'original',
-                'room_id': parts[0],
-                'user_id': parts[1],
+                'room_id': room_id,
+                'user_id': user_id,
                 'to_lang': None
             }
-    
+
     return result
 
 
-def start_translation_service(request_id: str, room_id: str, source_user: str, to_lang: str, target_user: str = ""):
+def extract_room_id(stream_name: str) -> tuple:
+    """从流名称中提取 room_id 和 user_id。
+
+    支持两种格式：
+    1. room_id_user_id: room1777389806400_user_70548 (room_id 无下划线)
+       → room_id='room1777389806400', user_id='user_70548'
+
+    2. room_数字_user_id: room_1778408735818_1 (room_id 带下划线分隔)
+       → room_id='room_1778408735818', user_id='1'
+
+    Args:
+        stream_name: 流名称字符串
+
+    Returns:
+        (room_id, user_id) 元组，如果解析失败则返回 (None, None)
+    """
+    # 找到 'room' 开头部分的位置
+    room_prefix_pos = stream_name.find('room')
+    if room_prefix_pos == -1:
+        return None, None
+
+    # 检查 room 后面是否有下划线 (room_格式)
+    first_underscore = stream_name.find('_', room_prefix_pos + 4)
+
+    if first_underscore != -1 and stream_name[room_prefix_pos + 4] == '_':
+        # room_格式: room_数字_user_id
+        # 找到数字部分结束的位置（下一个下划线）
+        second_underscore = stream_name.find('_', first_underscore + 1)
+        if second_underscore == -1:
+            return None, None
+
+        room_id = stream_name[:second_underscore]
+        user_id = stream_name[second_underscore + 1:]
+    else:
+        # 无下划线格式: room数字_user_id
+        if first_underscore == -1:
+            return None, None
+        room_id = stream_name[:first_underscore]
+        user_id = stream_name[first_underscore + 1:]
+
+    if room_id and user_id:
+        return room_id, user_id
+    return None, None
+
+
+def start_translation_service(request_id: str, room_id: str, source_user: str, to_lang: str, target_user: str = "", source_lang: str = "auto"):
     """启动指定翻译请求的服务"""
     if request_id in translation_processes:
         logger.warning(f"Translation service for request {request_id} is already running")
@@ -203,6 +387,7 @@ def start_translation_service(request_id: str, room_id: str, source_user: str, t
     env['ROOM_ID'] = room_id
     env['SOURCE_USER'] = source_user
     env['TO_LANG'] = to_lang
+    env['FROM_LANG'] = source_lang  # 源语言
     env['TARGET_USER'] = target_user  # 添加目标用户
     env['STREAM_NAME'] = stream_name
     env['SRS_URL'] = SRS_URL
@@ -216,21 +401,38 @@ def start_translation_service(request_id: str, room_id: str, source_user: str, t
             env['BAIDU_API_KEY'] = env_values['BAIDU_API_KEY']
         if env_values.get('BAIDU_SECRET_KEY'):
             env['BAIDU_SECRET_KEY'] = env_values['BAIDU_SECRET_KEY']
+        # 百度翻译开放平台 App ID（可选，用于MT）
+        if env_values.get('BAIDU_MT_APP_ID'):
+            env['BAIDU_MT_APP_ID'] = env_values['BAIDU_MT_APP_ID']
+        if env_values.get('BAIDU_MT_APP_SECRET'):
+            env['BAIDU_MT_APP_SECRET'] = env_values['BAIDU_MT_APP_SECRET']
+        # 百度实时语音翻译 WebSocket API 凭证
+        if env_values.get('BAIDU_APP_ID'):
+            env['BAIDU_APP_ID'] = env_values['BAIDU_APP_ID']
+        if env_values.get('BAIDU_APP_KEY'):
+            env['BAIDU_APP_KEY'] = env_values['BAIDU_APP_KEY']
     
     try:
-        python311 = "/usr/local/python3.11-ssl/bin/python3.11"
-        if not os.path.exists(python311):
-            python311 = sys.executable
+        # WebSocket 翻译服务需要 Python 3.7+（requests 库要求）
+        python_exe = "/usr/local/python3.11-ssl/bin/python3.11"
+        if not os.path.exists(python_exe):
+            # 回退到系统 Python
+            python_exe = sys.executable
         
-        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audio_translation_service.py')
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audio_translation_service.log')
-        logger.info(f"Starting translation service script: {script_path}")
-        
+        # 设置 PYTHONPATH 确保使用正确的 site-packages
+        env['PYTHONPATH'] = '/usr/local/python3.11-ssl/lib/python3.11/site-packages'
+        env['PATH'] = f"/usr/local/python3.11-ssl/bin:{env.get('PATH', '')}"
+
+        # 使用 WebSocket 实时翻译服务
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audio_translation_service_websocket.py')
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audio_translation_websocket.log')
+        logger.info(f"Starting WebSocket translation service script: {script_path}")
+
         # 打开日志文件用于记录子进程输出
         log_file = open(log_path, 'a')
-        
+
         process = subprocess.Popen(
-            [python311, script_path],
+            [python_exe, script_path],
             env=env,
             stdout=log_file,
             stderr=subprocess.STDOUT
@@ -366,6 +568,48 @@ def get_room_info(room_id: str):
         
     except Exception as e:
         logger.error(f"Error getting room info: {e}")
+        return jsonify({'code': 500, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/rooms', methods=['GET'])
+def get_all_rooms():
+    """获取所有房间列表
+    
+    返回:
+    {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "rooms": [
+                {
+                    "room_id": "room_123",
+                    "owner_id": "user_001",
+                    "member_count": 5,
+                    "created_at": "2024-01-01 10:00:00",
+                    "allow_speak": true,
+                    "members": [...]
+                },
+                ...
+            ],
+            "total": 10
+        }
+    }
+    """
+    try:
+        rooms = user_manager.get_all_rooms()
+        room_list = [room.to_dict() for room in rooms]
+        
+        return jsonify({
+            'code': 0,
+            'message': 'success',
+            'data': {
+                'rooms': room_list,
+                'total': len(room_list)
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting all rooms: {e}")
         return jsonify({'code': 500, 'message': str(e)}), 500
 
 
@@ -1460,6 +1704,7 @@ def translation_request():
         source_user = data.get('source_user', '')
         target_user = data.get('target_user', '')
         to_lang = data.get('to_lang', 'zh')
+        source_lang = data.get('source_lang', 'auto')  # 源语言，默认为 auto
         
         if not room_id or not source_user or not target_user:
             return jsonify({
@@ -1485,6 +1730,7 @@ def translation_request():
             source_user=source_user,
             target_user=target_user,
             to_lang=to_lang,
+            source_lang=source_lang,  # 源语言
             status=TranslationStatus.PENDING,
             stream_url=stream_url
         )
@@ -1502,7 +1748,7 @@ def translation_request():
                    f"source={source_user}, target={target_user}, to_lang={to_lang}, stream_url={stream_url}")
         
         # 启动翻译服务
-        start_translation_service(request_id, room_id, source_user, to_lang, target_user)
+        start_translation_service(request_id, room_id, source_user, to_lang, target_user, source_lang)
         
         # 更新状态为活跃
         translation_manager.update_status(request_id, TranslationStatus.ACTIVE)
@@ -1758,6 +2004,60 @@ def push_translation_text():
         return jsonify({'code': 500, 'message': str(e)}), 500
 
 
+# ========== 原语音识别文字推送接口 ==========
+
+@app.route('/api/v1/original/speech/text/push', methods=['POST'])
+def push_original_speech_text():
+    """接收翻译服务推送的原语音识别文字，广播给房间所有用户
+
+    请求体:
+    {
+        "room_id": "room1",
+        "source_user": "A",
+        "original_text": "Hello",
+        "source_lang": "en",
+        "timestamp": 1234567890
+    }
+
+    返回:
+    {
+        "code": 0,
+        "message": "success"
+    }
+    """
+    try:
+        data = request.json or {}
+        room_id = data.get('room_id', '')
+        source_user = data.get('source_user', '')
+        original_text = data.get('original_text', '')
+        source_lang = data.get('source_lang', '')
+
+        if not room_id or not source_user:
+            return jsonify({
+                'code': 400,
+                'message': 'Missing required parameters: room_id, source_user'
+            }), 400
+
+        logger.info(f"[OriginalSpeech] Pushing to room {room_id}: '{original_text[:30]}...'")
+
+        # 通过通知服务广播给房间所有用户
+        notification_service.notify_original_speech_text(
+            room_id=room_id,
+            source_user=source_user,
+            original_text=original_text,
+            source_lang=source_lang
+        )
+
+        return jsonify({
+            'code': 0,
+            'message': 'success'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error pushing original speech text: {e}")
+        return jsonify({'code': 500, 'message': str(e)}), 500
+
+
 # ========== 拉流者心跳接口 ==========
 
 @app.route('/api/v1/translation/heartbeat', methods=['POST'])
@@ -1854,7 +2154,30 @@ def register_puller():
                 'message': 'Missing required parameters: request_id, puller_id'
             }), 400
         
-        success = translation_manager.register_puller(request_id, puller_id)
+        success, is_restored = translation_manager.register_puller(request_id, puller_id)
+        
+        if is_restored:
+            # 翻译服务被自动恢复了，重新启动翻译服务
+            req = translation_manager.get_request(request_id)
+            if req:
+                logger.info(f"[Translation] Auto-restoring translation service for request: {request_id}")
+                # 启动翻译服务
+                start_translation_service(
+                    request_id=request_id,
+                    room_id=req.room_id,
+                    source_user=req.source_user,
+                    to_lang=req.to_lang,
+                    target_user=req.target_user,
+                    source_lang=getattr(req, 'source_lang', 'auto')
+                )
+                return jsonify({
+                    'code': 0,
+                    'message': 'success',
+                    'data': {
+                        'stream_url': req.stream_url,
+                        'restored': True
+                    }
+                }), 200
         
         if success:
             return jsonify({
@@ -1963,13 +2286,15 @@ def on_publish():
     try:
         data = request.json or {}
         stream_name = data.get('stream', '')
-        
+        tc_url = data.get('tcUrl', '')
+        client_ip = data.get('client_ip', '')
+
         if not stream_name:
             logger.warning("Received on_publish callback without stream name")
             return jsonify({'code': 0}), 200
-        
-        logger.info(f"Received on_publish callback for stream: {stream_name}")
-        
+
+        logger.info(f"Received on_publish callback for stream: {stream_name}, tcUrl: {tc_url}, client_ip: {client_ip}")
+
         # 解析流名称
         parsed = parse_stream_name(stream_name)
         
@@ -2101,6 +2426,75 @@ def on_unpublish():
         return jsonify({'code': 0}), 200
 
 
+@app.route('/api/v1/streams/on_play', methods=['POST'])
+def on_play():
+    """处理播放流回调（WebRTC拉流时SRS调用）
+
+    此接口用于验证播放权限，可以在这里添加业务逻辑。
+    如果返回非0 code或非200状态码，SRS会拒绝WebRTC连接。
+    """
+    try:
+        data = request.json or {}
+        stream_name = data.get('stream', '')
+        tc_url = data.get('tcUrl', '')
+        client_ip = data.get('client_ip', '')
+        client_id = data.get('client_id', '')
+
+        logger.info(f"Received on_play callback for stream: {stream_name}, tcUrl: {tc_url}, client_ip: {client_ip}, client_id: {client_id}")
+
+        # 解析流名称获取房间信息
+        parsed = parse_stream_name(stream_name) if stream_name else {}
+
+        if parsed.get('type') == 'translation':
+            # 翻译流：检查目标用户是否在房间中
+            room_id = parsed.get('room_id')
+            target_user = parsed.get('target_user')
+            if room_id and target_user:
+                member = user_manager.get_member(room_id, target_user)
+                if member:
+                    logger.info(f"[OnPlay] User {target_user} authorized to play translation stream in room {room_id}")
+                else:
+                    logger.warning(f"[OnPlay] User {target_user} not in room {room_id}, but allowing play")
+            
+            # 记录翻译流拉取日志
+            logger.info(f"[TranslationPlay] Client {client_ip} started playing translation stream: {stream_name}")
+
+        # 返回0表示允许播放
+        return jsonify({'code': 0}), 200
+
+    except Exception as e:
+        logger.error(f"Error handling on_play: {e}", exc_info=True)
+        return jsonify({'code': 0}), 200
+
+
+@app.route('/api/v1/streams/on_stop', methods=['POST'])
+def on_stop():
+    """处理停止播放回调（WebRTC拉流停止时SRS调用）
+
+    通知用户停止拉流。
+    """
+    try:
+        data = request.json or {}
+        stream_name = data.get('stream', '')
+        client_ip = data.get('client_ip', '')
+
+        logger.info(f"Received on_stop callback for stream: {stream_name}, client_ip: {client_ip}")
+
+        # 解析流名称获取房间信息
+        parsed = parse_stream_name(stream_name) if stream_name else {}
+        
+        if parsed.get('type') == 'translation':
+            room_id = parsed.get('room_id')
+            target_user = parsed.get('target_user')
+            logger.info(f"[TranslationStop] Client {client_ip} stopped playing translation stream: {stream_name}")
+
+        return jsonify({'code': 0}), 200
+
+    except Exception as e:
+        logger.error(f"Error handling on_stop: {e}", exc_info=True)
+        return jsonify({'code': 0}), 200
+
+
 @app.route('/api/v1/streams/status', methods=['GET'])
 def get_status():
     """获取翻译服务状态"""
@@ -2109,6 +2503,57 @@ def get_status():
         'processes': list(translation_processes.keys())
     }
     return jsonify(status), 200
+
+
+@app.route('/api/v1/streams/translation_stats', methods=['GET'])
+def get_translation_stats():
+    """获取翻译流统计信息
+    
+    从SRS API获取翻译流的详细统计，包括：
+    - send_bytes: 发送字节数
+    - recv_bytes: 接收字节数
+    - clients: 客户端数量
+    - audio: 音频编码信息
+    """
+    try:
+        # 从SRS获取流统计
+        srs_api = os.getenv('SRS_API', 'http://127.0.0.1:1985')
+        resp = requests.get(f"{srs_api}/api/v1/streams/", timeout=5)
+        if resp.status_code != 200:
+            return jsonify({'code': 1, 'message': 'Failed to get SRS stats'}), 500
+        
+        data = resp.json()
+        streams = data.get('streams', [])
+        
+        # 筛选翻译流
+        translation_streams = []
+        for stream in streams:
+            name = stream.get('name', '')
+            if '_to_' in name:
+                translation_streams.append({
+                    'name': name,
+                    'url': stream.get('url', ''),
+                    'vhost': stream.get('vhost', ''),
+                    'clients': stream.get('clients', 0),
+                    'send_bytes': stream.get('send_bytes', 0),
+                    'recv_bytes': stream.get('recv_bytes', 0),
+                    'kbps': stream.get('kbps', {}),
+                    'publish': stream.get('publish', {}),
+                    'audio': stream.get('audio', None)
+                })
+        
+        return jsonify({
+            'code': 0,
+            'message': 'success',
+            'data': {
+                'translation_streams': translation_streams,
+                'total': len(translation_streams)
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting translation stats: {e}")
+        return jsonify({'code': 1, 'message': str(e)}), 500
 
 
 @app.route('/api/v1/room/<room_id>/speaking', methods=['GET'])
@@ -2152,9 +2597,80 @@ def health():
 # ========== WebSocket 通知端点 ==========
 # 客户端通过 HTTP 长轮询或 WebSocket 连接此端点接收事件通知
 
+# 用于缓存自动检测的外网IP
+_auto_detected_ws_host = None
+_auto_detect_attempted = False
+
+
+def get_auto_detected_ws_host():
+    """自动检测外网可访问的IP/域名
+    
+    检测优先级：
+    1. 环境变量 WS_HOST
+    2. 自动检测外网IP（通过外部API）
+    3. 回退到 127.0.0.1
+    """
+    global _auto_detected_ws_host, _auto_detect_attempted
+    
+    if _auto_detected_ws_host:
+        return _auto_detected_ws_host
+    
+    if _auto_detect_attempted:
+        return None
+    
+    _auto_detect_attempted = True
+    
+    # 尝试多个IP检测服务
+    ip_services = [
+        'https://api.ipify.org',
+        'https://icanhazip.com',
+        'https://checkip.amazonaws.com',
+    ]
+    
+    import urllib.request
+    import urllib.error
+    
+    for service in ip_services:
+        try:
+            req = urllib.request.Request(service, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                ip = response.read().decode('utf-8').strip()
+                if ip and ip != '127.0.0.1' and not ip.startswith('10.') and not ip.startswith('192.168.'):
+                    _auto_detected_ws_host = ip
+                    logger.info(f"[WS] Auto-detected external IP: {ip}")
+                    return ip
+        except Exception as e:
+            logger.debug(f"[WS] Failed to get IP from {service}: {e}")
+            continue
+    
+    logger.warning("[WS] Could not auto-detect external IP, falling back to 127.0.0.1")
+    return None
+
+
+def get_ws_host_from_request(request):
+    """从请求中提取合适的主机名/IP"""
+    # 优先使用 X-Forwarded-Host（通过反向代理时）
+    forwarded_host = request.headers.get('X-Forwarded-Host')
+    if forwarded_host:
+        host = forwarded_host.split(':')[0]
+        # 如果不是内网地址，直接使用
+        if host not in ('127.0.0.1', 'localhost', '0.0.0.0'):
+            return host
+        # 如果是内网，检查端口
+        port = forwarded_host.split(':')[1] if ':' in forwarded_host else None
+        return host, port
+    
+    # 使用 Host 头
+    host = request.host.split(':')[0]
+    if host not in ('127.0.0.1', 'localhost', '0.0.0.0'):
+        return host
+    
+    return host
+
+
 @app.route('/api/v1/ws/subscribe', methods=['POST'])
 def ws_subscribe():
-    """手动订阅房间（用于不支持 WebSocket 的客户端）
+    """手动订阅房间
     
     请求体:
     {
@@ -2167,7 +2683,7 @@ def ws_subscribe():
         "code": 0,
         "message": "success",
         "data": {
-            "ws_url": "ws://localhost:8086/ws?room=room_123&user=user_001"
+            "ws_url": "ws://localhost:8085/ws?room=room_123&user=user_001"
         }
     }
     """
@@ -2175,15 +2691,34 @@ def ws_subscribe():
         data = request.json or {}
         room_id = data.get('room_id', '')
         user_id = data.get('user_id', '')
-        
+
         if not room_id:
             return jsonify({
                 'code': 400,
                 'message': 'Missing required parameter: room_id'
             }), 400
+
+        # 返回纯 WebSocket 连接地址
+        # 优先级：WS_HOST环境变量 > 自动检测外网IP > X-Forwarded-Host > Host请求头
+        ws_host = os.getenv('WS_HOST')
         
-        # 返回 WebSocket 连接地址
-        ws_host = os.getenv('WS_HOST', request.host.split(':')[0])
+        if not ws_host:
+            # 尝试从请求头获取
+            request_host = get_ws_host_from_request(request)
+            if isinstance(request_host, tuple):
+                ws_host = request_host[0]
+            else:
+                ws_host = request_host
+            
+            # 如果是内网地址，尝试自动检测外网IP
+            if ws_host in ('127.0.0.1', 'localhost', '0.0.0.0'):
+                detected_ip = get_auto_detected_ws_host()
+                if detected_ip:
+                    ws_host = detected_ip
+                else:
+                    # 最终回退：使用主机名（如果有的话）
+                    ws_host = os.getenv('HOSTNAME', ws_host)
+        
         ws_url = f"ws://{ws_host}:{WS_PORT}/ws?room={room_id}"
         if user_id:
             ws_url += f"&user={user_id}"
@@ -2217,96 +2752,147 @@ def ws_status():
     }), 200
 
 
-# ========== WebSocket 服务器（使用 gevent）==========
+# ========== WebSocket 服务器（使用原生 WebSocket + websockets 库）==========
+
+import asyncio
+import threading
+from typing import Set
+
+# 保留向后兼容的空类
+class NativeWebSocketHandler:
+    pass
+
+native_ws = None  # 保留向后兼容
+
+sio = None  # 保留向后兼容
+
+@app.after_request
+def after_request(response):
+    """添加 CORS 头"""
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+
+async def handle_native_ws(websocket, path):
+    """处理原生 WebSocket 连接"""
+    # 解析 room 和 user 参数
+    from urllib.parse import parse_qs, urlparse
+    
+    try:
+        parsed = urlparse(path)
+        params = parse_qs(parsed.query)
+        
+        room_id = params.get('room', [''])[0]
+        user_id = params.get('user', [''])[0]
+        
+        if not room_id:
+            await websocket.close(1008, "Missing room parameter")
+            return
+        
+        # 注册连接
+        async with lock:
+            if room_id not in native_ws_connections:
+                native_ws_connections[room_id] = set()
+            native_ws_connections[room_id].add(websocket)
+        
+        websocket._room_id = room_id
+        websocket._user_id = user_id
+        
+        logger.info(f"[WS] Native WebSocket connected: room={room_id}, user={user_id}")
+        
+        # 发送连接成功消息
+        await websocket.send(json.dumps({
+            "type": "connected",
+            "room_id": room_id,
+            "user_id": user_id
+        }))
+        
+        # 保持连接，处理消息
+        async for message in websocket:
+            # 解析客户端消息
+            try:
+                data = json.loads(message)
+                msg_type = data.get('type', '')
+                
+                if msg_type == 'ping':
+                    await websocket.send(json.dumps({"type": "pong"}))
+                elif msg_type == 'subscribe':
+                    # 重新订阅
+                    new_room = data.get('room_id', room_id)
+                    async with lock:
+                        if room_id in native_ws_connections:
+                            native_ws_connections[room_id].discard(websocket)
+                        if new_room not in native_ws_connections:
+                            native_ws_connections[new_room] = set()
+                        native_ws_connections[new_room].add(websocket)
+                    websocket._room_id = new_room
+                    await websocket.send(json.dumps({
+                        "type": "subscribed",
+                        "room_id": new_room
+                    }))
+            except json.JSONDecodeError:
+                pass
+                
+    except Exception as e:
+        logger.warning(f"[WS] WebSocket error: {e}")
+    finally:
+        # 清理连接
+        room_id = getattr(websocket, '_room_id', None)
+        if room_id:
+            async with lock:
+                if room_id in native_ws_connections:
+                    native_ws_connections[room_id].discard(websocket)
+                    if not native_ws_connections[room_id]:
+                        del native_ws_connections[room_id]
+        logger.info(f"[WS] Native WebSocket disconnected: room={room_id}")
+
+
+# 原生 WebSocket 连接存储
+native_ws_connections: Dict[str, Set] = {}
+native_ws_lock = threading.Lock()
+lock = threading.Lock()
+
+# 异步锁（用于 async 函数）
+import asyncio
+async_lock = asyncio.Lock()
+
+
+def start_native_ws_server():
+    """启动原生 WebSocket 服务器（独立线程）"""
+    import asyncio
+    
+    async def run_server():
+        native_ws_port = 8087
+        logger.info(f"[WS] Starting native WebSocket server on 0.0.0.0:{native_ws_port}/ws")
+        
+        async with websockets.serve(handle_native_ws, '0.0.0.0', native_ws_port, ping_interval=30, ping_timeout=10):
+            logger.info(f"[WS] Native WebSocket server started on port {native_ws_port}")
+            await asyncio.Future()  # 永久运行
+    
+    # 在新线程中运行
+    def run_in_thread():
+        asyncio.run(run_server())
+    
+    ws_thread = threading.Thread(target=run_in_thread, daemon=True)
+    ws_thread.start()
+    logger.info("[WS] Native WebSocket server thread started")
+
 
 def start_websocket_server():
-    """启动 WebSocket 服务器（使用 gevent）"""
-    try:
-        from gevent import monkey
-        monkey.patch_all()
-        
-        from gevent.pywsgi import WSGIServer
-        from geventwebsocket.handler import WebSocketHandler
-        from geventwebsocket import WebSocketServer, WebSocketApplication
-        
-        class RoomApplication(WebSocketApplication):
-            """房间 WebSocket 应用"""
-            
-            def on_open(self):
-                logger.info("[WS] WebSocket connection opened")
-                # 注册为全局连接
-                notification_service.register_global(self.ws)
-            
-            def on_message(self, message):
-                if message is None:
-                    return
-                
-                try:
-                    data = json.loads(message)
-                    msg_type = data.get('type', '')
-                    
-                    if msg_type == 'subscribe':
-                        room_id = data.get('room_id', '')
-                        user_id = data.get('user_id', '')
-                        
-                        # 订阅房间
-                        if room_id:
-                            notification_service.subscribe_room(self.ws, room_id)
-                        
-                        # 注册用户
-                        if user_id and room_id:
-                            notification_service.register_user(self.ws, user_id, room_id)
-                        
-                        # 发送确认
-                        self.ws.send(json.dumps({
-                            'type': 'subscribed',
-                            'room_id': room_id,
-                            'user_id': user_id
-                        }))
-                    
-                    elif msg_type == 'unsubscribe':
-                        room_id = data.get('room_id', '')
-                        if room_id:
-                            notification_service.unsubscribe_room(self.ws, room_id)
-                    
-                    elif msg_type == 'ping':
-                        self.ws.send(json.dumps({'type': 'pong'}))
-                    
-                except json.JSONDecodeError:
-                    logger.warning(f"[WS] Invalid JSON message: {message}")
-            
-            def on_close(self, reason):
-                logger.info(f"[WS] WebSocket connection closed: {reason}")
-                notification_service.unregister(self.ws)
-        
-        class NotificationApp:
-            """通知应用"""
-            
-            def __call__(self, environ, start_response):
-                path = environ.get('PATH_INFO', '')
-                
-                if path == '/ws' or path.startswith('/ws?'):
-                    # WebSocket 连接
-                    environ['wsgi.websocket'] = environ.get('wsgi.websocket')
-                    try:
-                        app = RoomApplication(environ['wsgi.websocket'])
-                        app()
-                    except Exception:
-                        pass
-                    return []
-                else:
-                    # 普通 HTTP 请求
-                    return app(environ, start_response)
-        
-        logger.info(f"[WS] Starting WebSocket server on port {WS_PORT}")
-        server = WSGIServer(('0.0.0.0', WS_PORT), NotificationApp(), handler_class=WebSocketHandler)
-        server.serve_forever()
-        
-    except ImportError as e:
-        logger.warning(f"[WS] Cannot start WebSocket server: {e}")
-        logger.info("[WS] Install gevent and gevent-websocket for WebSocket support")
-    except Exception as e:
-        logger.error(f"[WS] WebSocket server error: {e}")
+    """启动 WebSocket + HTTP 服务器"""
+    # 启动原生 WebSocket 服务器（用于 /ws 端点）
+    start_native_ws_server()
+    
+    # 设置 notification_service 使用原生 WebSocket（通过本地 HTTP）
+    notification_service._native_ws_url = "http://127.0.0.1:8085"
+    logger.info("[Notification] Native WS URL set to http://127.0.0.1:8085")
+    
+    # 启动 Flask HTTP 服务器
+    from waitress import serve
+    logger.info("[Server] Starting Flask HTTP server on 0.0.0.0:8085")
+    serve(app, host='0.0.0.0', port=8085, threads=4)
 
 
 if __name__ == '__main__':
@@ -2338,98 +2924,6 @@ if __name__ == '__main__':
     # 启动心跳检查线程
     start_heartbeat_checker()
     
-    # 尝试使用 flask-socketio 在同一端口提供 HTTP API + Socket.IO WebSocket
-    try:
-        from flask_socketio import SocketIO, emit, join_room, leave_room
-        
-        # 创建 Socket.IO 实例，与 Flask app 集成
-        socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-        
-        # 设置 notification_service 的 socketio 实例
-        notification_service.set_socketio(socketio)
-        
-        @socketio.on('connect')
-        def handle_connect(*args):
-            logger.info("[Socket.IO] Client connected")
-        
-        @socketio.on('disconnect')
-        def handle_disconnect():
-            logger.info("[Socket.IO] Client disconnected")
-        
-        @socketio.on('subscribe')
-        def handle_subscribe(data):
-            room_id = data.get('room_id', '')
-            user_id = data.get('user_id', '')
-            logger.info(f"[Socket.IO] Subscribe: room={room_id}, user={user_id}")
-            if room_id:
-                join_room(room_id)
-                notification_service.subscribe_room_socketio(room_id)
-            if user_id and room_id:
-                notification_service.register_user_socketio(user_id, room_id)
-            emit('subscribed', {'room_id': room_id, 'user_id': user_id})
-        
-        @socketio.on('unsubscribe')
-        def handle_unsubscribe(data):
-            room_id = data.get('room_id', '')
-            logger.info(f"[Socket.IO] Unsubscribe: room={room_id}")
-            if room_id:
-                leave_room(room_id)
-                notification_service.unsubscribe_room_socketio(room_id)
-        
-        @socketio.on('ping')
-        def handle_ping():
-            emit('pong')
-        
-        logger.info(f"[Server] Starting Flask-SocketIO server on {host}:{port}")
-        socketio.run(app, host=host, port=port, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
-        
-    except ImportError as e:
-        logger.warning(f"[WS] flask-socketio not installed: {e}")
-        logger.info("[WS] Falling back to gevent-websocket for WebSocket support")
-        
-        from gevent.pywsgi import WSGIServer
-        from geventwebsocket import WebSocketServer, WebSocketApplication
-        from geventwebsocket.resource import Resource
-
-        # WebSocket 应用
-        class NotificationApplication(WebSocketApplication):
-            def on_open(self):
-                logger.info("[WS] Client connected")
-                notification_service.register_global(self.ws)
-
-            def on_message(self, message):
-                if message is None:
-                    return
-                try:
-                    data = json.loads(message)
-                    msg_type = data.get('type', '')
-                    if msg_type == 'subscribe':
-                        room_id = data.get('room_id', '')
-                        user_id = data.get('user_id', '')
-                        if room_id:
-                            notification_service.subscribe_room(self.ws, room_id)
-                        if user_id and room_id:
-                            notification_service.register_user(self.ws, user_id, room_id)
-                        self.ws.send(json.dumps({'type': 'subscribed', 'room_id': room_id, 'user_id': user_id}))
-                    elif msg_type == 'unsubscribe':
-                        room_id = data.get('room_id', '')
-                        if room_id:
-                            notification_service.unsubscribe_room(self.ws, room_id)
-                    elif msg_type == 'ping':
-                        self.ws.send(json.dumps({'type': 'pong'}))
-                except json.JSONDecodeError:
-                    logger.warning(f"[WS] Invalid JSON: {message}")
-
-            def on_close(self, reason):
-                logger.info("[WS] Client disconnected")
-                notification_service.unregister(self.ws)
-
-        # Resource: HTTP 请求走 Flask，WebSocket 请求走 NotificationApplication
-        resource = Resource([
-            ('/ws', NotificationApplication),
-            ('.*', app),
-        ])
-
-        logger.info(f"[Server] Starting HTTP+WebSocket server on {host}:{port}")
-        server = WebSocketServer((host, port), resource)
-        server.serve_forever()
+    # 使用 python-socketio 服务器
+    logger.info("[Server] Using python-socketio")
+    start_websocket_server()

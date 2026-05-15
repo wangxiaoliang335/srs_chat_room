@@ -8,7 +8,7 @@
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -30,8 +30,9 @@ class TranslationRequest:
     source_user: str             # 说话人用户ID
     target_user: str             # 听翻译的用户ID
     to_lang: str                 # 目标语言
-    status: TranslationStatus   # 状态
-    stream_url: str              # 翻译流地址
+    source_lang: str = "auto"    # 源语言，默认为 auto
+    status: TranslationStatus = TranslationStatus.PENDING  # 状态
+    stream_url: str = ""         # 翻译流地址
     created_at: float = field(default_factory=lambda: time.time())
     # ========== 容错机制新增字段 ==========
     pullers: Dict[str, float] = field(default_factory=dict)  # 拉流者ID -> 最后心跳时间
@@ -56,8 +57,8 @@ class TranslationManager:
         
         # 心跳超时配置（秒）
         self.heartbeat_timeout = 15  # 拉流者心跳超时时间
-        self.source_stream_timeout = 30  # 源流检测超时时间
-        self.no_puller_stop_delay = 30  # 无拉流者多久后停止翻译
+        self.source_stream_timeout = 300  # 源流检测超时时间（5分钟）
+        self.no_puller_stop_delay = 300  # 无拉流者多久后停止翻译（5分钟）
         
         logger.info("[TranslationManager] Initialized with fault tolerance support")
 
@@ -128,7 +129,7 @@ class TranslationManager:
     
     # ========== 拉流者心跳管理 ==========
     
-    def register_puller(self, request_id: str, puller_id: str) -> bool:
+    def register_puller(self, request_id: str, puller_id: str) -> Tuple[bool, bool]:
         """注册拉流者
         
         Args:
@@ -136,21 +137,33 @@ class TranslationManager:
             puller_id: 拉流者ID（通常是target_user）
         
         Returns:
-            True if registered successfully
+            (success, restored): 
+                - success: 是否注册成功（请求存在）
+                - restored: 是否自动恢复了已停止的翻译服务
         """
         with self._lock:
             request = self._requests_by_id.get(request_id)
             if not request:
                 logger.warning(f"[TranslationManager] Cannot register puller: request {request_id} not found")
-                return False
+                return False, False
+            
+            restored = False
+            
+            # 如果请求已停止但有拉流者尝试注册，自动恢复翻译服务
+            if request.status == TranslationStatus.STOPPED:
+                logger.info(f"[TranslationManager] Restoring stopped translation: request={request_id}")
+                request.status = TranslationStatus.ACTIVE
+                request.stop_reason = ""
+                request.pullers.clear()
+                restored = True
             
             request.pullers[puller_id] = time.time()
             # 重置无拉流者计时器
             request._no_puller_since = None
             
             logger.info(f"[TranslationManager] Puller registered: request={request_id}, puller={puller_id}, "
-                       f"total_pullers={len(request.pullers)}")
-            return True
+                       f"total_pullers={len(request.pullers)}, restored={restored}")
+            return True, restored
     
     def unregister_puller(self, request_id: str, puller_id: str) -> bool:
         """注销拉流者
@@ -284,7 +297,24 @@ class TranslationManager:
         """获取所有翻译请求"""
         with self._lock:
             return list(self._requests_by_id.values())
-    
+
+    def get_active_translations(self) -> List[Dict[str, Any]]:
+        """获取所有活跃的翻译请求"""
+        with self._lock:
+            result = []
+            for request in self._requests_by_id.values():
+                if request.status == TranslationStatus.ACTIVE:
+                    result.append({
+                        "request_id": request.request_id,
+                        "room_id": request.room_id,
+                        "source_user": request.source_user,
+                        "target_user": request.target_user,
+                        "to_lang": request.to_lang,
+                        "source_lang": request.source_lang,
+                        "status": request.status.value if hasattr(request.status, 'value') else request.status
+                    })
+            return result
+
     def check_and_cleanup(self) -> List[Dict[str, Any]]:
         """检查并清理超时的翻译请求
         
@@ -398,24 +428,27 @@ class TranslationManager:
             TranslationRequest if found
         """
         with self._lock:
-            # 流名称格式: {room_id}_{user_id}
-            parts = stream_name.rsplit('_', 1)
-            if len(parts) != 2:
+            # stream_name 格式: {room_id}_{user_id}，room_id 以 'room' 开头
+            room_prefix_pos = stream_name.find('room')
+            if room_prefix_pos == -1:
                 return None
-            
-            parsed_room_id, source_user = parts
-            
+            underscore_pos = stream_name.find('_', room_prefix_pos + 4)
+            if underscore_pos == -1:
+                return None
+            parsed_room_id = stream_name[:underscore_pos]
+            source_user = stream_name[underscore_pos + 1:]
+
             # 验证 room_id
             if parsed_room_id != room_id:
                 return None
-            
+
             # 查找翻译请求
             if room_id in self._requests and source_user in self._requests[room_id]:
                 # 返回第一个活跃的翻译请求
                 for to_lang, request in self._requests[room_id][source_user].items():
                     if request.status == TranslationStatus.ACTIVE:
                         return request
-            
+
             return None
     
     def get_request_by_source(self, room_id: str, source_user: str, to_lang: str = None) -> Optional[TranslationRequest]:
@@ -441,6 +474,51 @@ class TranslationManager:
                     if request.status == TranslationStatus.ACTIVE:
                         return request
             return None
+
+    def start_translation(self, room_id: str, source_user: str, target_user: str,
+                          to_lang: str, source_lang: str = "auto",
+                          srs_url: str = "rtmp://localhost:1935") -> str:
+        """启动翻译请求 - 创建请求并生成流地址"""
+        import uuid
+
+        request_id = f"trans_{uuid.uuid4().hex[:12]}"
+
+        # 构建流名称 - 使用与客户端一致的命名格式
+        # 客户端期望: translation_{source_user}_{to_lang}
+        stream_name = f"translation_{source_user}_{to_lang}"
+        stream_url = f"{srs_url}/app/{stream_name}"
+
+        # 创建翻译请求
+        request = TranslationRequest(
+            request_id=request_id,
+            room_id=room_id,
+            source_user=source_user,
+            target_user=target_user,
+            to_lang=to_lang,
+            source_lang=source_lang,
+            stream_url=stream_url,
+            status=TranslationStatus.ACTIVE
+        )
+
+        # 添加到管理器
+        self.add_request(request)
+
+        logger.info(f"[TranslationManager] Started translation: {request_id}, "
+                   f"room={room_id}, source={source_user}, target={target_user}, "
+                   f"to_lang={to_lang}, stream={stream_name}")
+
+        return request_id
+
+    def stop_translation_by_request(self, request_id: str) -> bool:
+        """通过请求ID停止翻译"""
+        request = self.get_request(request_id)
+        if not request:
+            logger.warning(f"[TranslationManager] Request not found: {request_id}")
+            return False
+
+        self.update_status(request_id, TranslationStatus.STOPPED)
+        logger.info(f"[TranslationManager] Stopped translation: {request_id}")
+        return True
 
 
 # 全局单例

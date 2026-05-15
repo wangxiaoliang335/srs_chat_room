@@ -269,17 +269,18 @@ class UserManager:
     def get_user_by_stream(self, stream_name: str) -> Optional[User]:
         """通过流名称获取用户"""
         with self._lock:
-            user_id = self._stream_to_user.get(stream_name)
-            if not user_id:
+            # stream_name 格式: {room_id}_{user_id}，room_id 以 'room' 开头
+            room_prefix_pos = stream_name.find('room')
+            if room_prefix_pos == -1:
                 return None
-            
-            # 解析 room_id 和 user_id
-            # stream_name 格式: {room_id}_{user_id}
-            parts = stream_name.rsplit('_', 1)
-            if len(parts) == 2:
-                room_id, parsed_user_id = parts
-                return self.get_member(room_id, parsed_user_id)
-            return None
+            underscore_pos = stream_name.find('_', room_prefix_pos + 4)
+            if underscore_pos == -1:
+                return None
+            room_id = stream_name[:underscore_pos]
+            user_id = stream_name[underscore_pos + 1:]
+            if not room_id or not user_id:
+                return None
+            return self.get_member(room_id, user_id)
     
     def update_user_role(self, room_id: str, user_id: str, new_role: UserRole) -> bool:
         """更新用户角色"""

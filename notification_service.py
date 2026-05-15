@@ -37,6 +37,7 @@ class EventType(Enum):
     TRANSLATION_STARTED = "translation_started"
     TRANSLATION_STOPPED = "translation_stopped"
     TRANSLATION_TEXT = "translation_text"  # 翻译文本
+    ORIGINAL_SPEECH_TEXT = "original_speech_text"  # 原语音识别文字
     USER_SPEAKING_START = "user_speaking_start"  # 用户开始说话
     USER_SPEAKING_STOP = "user_speaking_stop"  # 用户停止说话
 
@@ -67,112 +68,109 @@ class RoomEvent:
 
 
 class NotificationService:
-    """通知服务 - 通过纯 WebSocket 或 Socket.IO 广播房间事件"""
+    """通知服务 - 通过纯 WebSocket 广播房间事件"""
 
     def __init__(self):
-        self._ws_server = None  # WebSocket 服务器实例
-        self._socketio = None  # Socket.IO 实例
         self._lock = threading.RLock()
         self._connections = set()  # 追踪所有 WebSocket 连接
         self._room_subscriptions = {}  # room_id -> set of ws connections
         self._user_connections = {}  # ws -> {user_id, room_id}
-        logger.info("[Notification] Service initialized (WebSocket/Socket.IO)")
+        logger.info("[Notification] Service initialized (Pure WebSocket)")
 
     def set_websocket_server(self, ws_server):
         """设置 WebSocket 服务器实例"""
         self._ws_server = ws_server
         logger.info("[Notification] WebSocket server instance set")
 
-    def set_socketio(self, socketio):
+    def set_socketio(self, socketio_instance):
         """设置 Socket.IO 实例"""
-        self._socketio = socketio
+        self._socketio = socketio_instance
         logger.info("[Notification] Socket.IO instance set")
 
-    def register_global(self, ws):
-        """注册全局 WebSocket 连接"""
-        with self._lock:
-            self._connections.add(ws)
-        logger.info("[Notification] WebSocket client registered globally")
-
-    def unregister(self, ws):
-        """注销 WebSocket 连接"""
-        with self._lock:
-            if ws in self._connections:
-                self._connections.remove(ws)
-                # Remove from room subscriptions
-                if ws in self._user_connections:
-                    user_info = self._user_connections.pop(ws)
-                    room_id = user_info.get('room_id')
-                    if room_id and room_id in self._room_subscriptions:
-                        self._room_subscriptions[room_id].discard(ws)
-                logger.info("[Notification] WebSocket client unregistered")
-
-    def subscribe_room_socketio(self, room_id: str):
-        """订阅房间事件 (Socket.IO 使用内置 room 功能)"""
-        logger.info(f"[Notification] Socket.IO join room {room_id}")
-
-    def unsubscribe_room_socketio(self, room_id: str):
-        """取消订阅房间 (Socket.IO 使用内置 room 功能)"""
-        logger.info(f"[Notification] Socket.IO leave room {room_id}")
-
-    def register_user_socketio(self, user_id: str, room_id: str):
-        """注册用户"""
-        logger.info(f"[Notification] Socket.IO user {user_id} registered in room {room_id}")
-
-    def _emit(self, event: RoomEvent):
-        """通过 WebSocket 或 Socket.IO 发送事件到房间"""
-        # Try Socket.IO first if available
-        if self._socketio is not None:
-            self._emit_socketio(event)
-            return
-            
-        if self._ws_server is None:
-            # 使用本地连接列表
-            self._emit_local(event)
-            return
-
-        try:
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            from websocket_server import WebSocketMessage
-            ws_msg = WebSocketMessage(
-                type=event.event_type,
-                data=event.to_dict()
-            )
-            
-            # 通过 WebSocket 服务器广播
-            loop.run_until_complete(
-                self._ws_server.broadcast_to_room(event.room_id, ws_msg)
-            )
-            loop.close()
-            
-            logger.info(f"[WS] Sent {event.event_type} to room {event.room_id}")
-        except Exception as e:
-            logger.warning(f"[WS] Failed to send via server: {e}, using local")
-            self._emit_local(event)
+    def set_sio(self, sio_instance):
+        """设置 python-socketio AsyncServer 实例"""
+        self._sio = sio_instance
+        logger.info("[Notification] python-socketio AsyncServer instance set")
 
     def _emit_socketio(self, event: RoomEvent):
-        """通过 Socket.IO 发送事件到房间"""
-        if self._socketio is None:
+        """通过 python-socketio 同步发送事件到房间"""
+        sio_instance = getattr(self, '_sio', None)
+        if sio_instance is None:
             return
-            
+        
+        message = {
+            "type": event.event_type,
+            "data": event.to_dict()
+        }
+        
         try:
-            # Use Flask-SocketIO's room feature for broadcasting
-            payload = {
-                "type": event.event_type,
-                "data": event.to_dict()
-            }
-            
-            # Emit to the room using Socket.IO's built-in room management
-            self._socketio.emit(event.event_type, payload, room=event.room_id)
-            logger.info(f"[Socket.IO] Emitted {event.event_type} to room {event.room_id}")
+            sio_instance.emit('room_event', message, room=event.room_id)
+            logger.info(f"[WS] Sent {event.event_type} to room {event.room_id} via socketio")
         except Exception as e:
-            logger.warning(f"[Socket.IO] Failed to emit: {e}")
+            logger.warning(f"[WS] Failed to send via socketio: {e}")
 
-    def _emit_local(self, event: RoomEvent):
-        """通过本地连接列表发送事件"""
+    def _emit_native_ws(self, event: RoomEvent):
+        """通过原生 WebSocket 发送事件到房间"""
+        native_ws_url = getattr(self, '_native_ws_url', None)
+        if native_ws_url is None:
+            return
+        
+        import requests
+        
+        message = json.dumps({
+            "type": event.event_type,
+            "data": event.to_dict()
+        })
+        
+        # 发送到 /broadcast 端点
+        try:
+            resp = requests.post(
+                f"{native_ws_url}/broadcast",
+                json={"room_id": event.room_id, "message": message},
+                timeout=2
+            )
+            if resp.status_code == 200:
+                logger.info(f"[WS] Sent {event.event_type} to room {event.room_id} via native WS")
+        except Exception as e:
+            logger.warning(f"[WS] Failed to send via native WS: {e}")
+
+    async def _emit_socketio_async(self, event: RoomEvent):
+        """通过 python-socketio 异步发送事件（向后兼容）"""
+        self._emit_socketio(event)
+
+    def subscribe_room_socketio(self, room_id: str):
+        """订阅房间事件 (Socket.IO 使用内置 room 功能) - 已弃用"""
+        logger.warning("[Notification] Socket.IO subscribe_room_socketio is deprecated")
+
+    def unsubscribe_room_socketio(self, room_id: str):
+        """取消订阅房间 (Socket.IO 使用内置 room 功能) - 已弃用"""
+        logger.warning("[Notification] Socket.IO unsubscribe_room_socketio is deprecated")
+
+    def register_user_socketio(self, user_id: str, room_id: str):
+        """注册用户 - 已弃用"""
+        logger.warning("[Notification] Socket.IO register_user_socketio is deprecated")
+
+    def _emit(self, event: RoomEvent):
+        """通过 WebSocket 发送事件到房间"""
+        # 尝试使用原生 WebSocket
+        if hasattr(self, '_native_ws') and self._native_ws is not None:
+            self._emit_native_ws(event)
+        # 尝试使用 socket.io
+        elif hasattr(self, '_sio') and self._sio is not None:
+            self._emit_socketio(event)
+        # 回退到旧的纯 WebSocket 方式
+        else:
+            self._emit_websocket(event)
+
+    async def _emit_async(self, event: RoomEvent):
+        """异步发送事件"""
+        if hasattr(self, '_sio') and self._sio is not None:
+            await self._emit_socketio_async(event)
+        else:
+            self._emit_websocket(event)
+
+    def _emit_websocket(self, event: RoomEvent):
+        """通过纯 WebSocket 发送事件到房间"""
         with self._lock:
             if event.room_id not in self._room_subscriptions:
                 return
@@ -184,10 +182,8 @@ class NotificationService:
             
             for ws in self._room_subscriptions[event.room_id]:
                 try:
-                    if hasattr(ws, 'send'):
-                        ws.send(message)
-                    elif hasattr(ws, 'send_text'):
-                        ws.send_text(message)
+                    ws.send(message)
+                    logger.info(f"[WS] Sent {event.event_type} to room {event.room_id}")
                 except Exception as e:
                     logger.warning(f"[WS] Failed to send: {e}")
 
@@ -339,35 +335,6 @@ class NotificationService:
 
     def _emit_to_user(self, event: RoomEvent, target_user_id: str):
         """向特定用户发送事件"""
-        if self._ws_server is None:
-            # 使用本地连接列表
-            self._emit_to_user_local(event, target_user_id)
-            return
-
-        try:
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            from websocket_server import WebSocketMessage
-            ws_msg = WebSocketMessage(
-                type=event.event_type,
-                data=event.to_dict()
-            )
-            
-            # 通过 WebSocket 服务器发送
-            loop.run_until_complete(
-                self._ws_server.send_to_user(target_user_id, ws_msg)
-            )
-            loop.close()
-            
-            logger.info(f"[WS] Sent {event.event_type} to user {target_user_id}")
-        except Exception as e:
-            logger.warning(f"[WS] Failed to send via server: {e}, using local")
-            self._emit_to_user_local(event, target_user_id)
-
-    def _emit_to_user_local(self, event: RoomEvent, target_user_id: str):
-        """通过本地连接列表向特定用户发送事件"""
         with self._lock:
             message = json.dumps({
                 "type": event.event_type,
@@ -377,10 +344,7 @@ class NotificationService:
             for ws, info in self._user_connections.items():
                 if info.get('user_id') == target_user_id:
                     try:
-                        if hasattr(ws, 'send'):
-                            ws.send(message)
-                        elif hasattr(ws, 'send_text'):
-                            ws.send_text(message)
+                        ws.send(message)
                         logger.info(f"[WS] Sent {event.event_type} to user {target_user_id}")
                     except Exception as e:
                         logger.warning(f"[WS] Failed to send to user {target_user_id}: {e}")
@@ -420,21 +384,31 @@ class NotificationService:
                 "target_lang": target_lang
             }
         )
-        
-        # 通过 Socket.IO 发送给目标用户
+
+        # 通过 WebSocket 发送给目标用户
         self._emit_to_user(event, target_user)
-        
+
         # 通过 WebSocket 广播到房间
         self.broadcast_to_room(room_id, EventType.TRANSLATION_TEXT.value, {
             "user_id": source_user,
             "data": event.data
         })
-        
-        # 通过 WebSocket 单独发送给目标用户
-        self.send_to_user_ws(target_user, EventType.TRANSLATION_TEXT.value, {
-            "user_id": source_user,
-            "data": event.data
-        })
+
+    def notify_original_speech_text(self, room_id: str, source_user: str,
+                                    original_text: str, source_lang: str):
+        """通知原语音识别文字 - 推送给房间所有用户"""
+        event = RoomEvent(
+            event_type=EventType.ORIGINAL_SPEECH_TEXT.value,
+            room_id=room_id,
+            user_id=source_user,
+            data={
+                "original_text": original_text,
+                "source_lang": source_lang
+            }
+        )
+
+        # 通过 WebSocket 广播到房间
+        self._emit(event)
 
     def notify_user_speaking_start(self, room_id: str, user_id: str, stream_url: str = ""):
         """通知用户开始说话"""

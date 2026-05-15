@@ -48,3 +48,31 @@ cmake-build-debug
 /trunk/srs.log
 /trunk/objs/srs.pid
 /trunk/objs/srs.id
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+*.pid
+
+# Build outputs
+objs/
+pids/
+core-*
+
+# Test and docs
+test/
+test_*.py
+docs/
+
+# Config
+.env
+.env.*
+
+# Audio translation
+audio_translation_*.log
+translation_trans_*.log
+callback_server.log
+*.zip
+*.tar.gz
