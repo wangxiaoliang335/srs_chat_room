@@ -23,7 +23,6 @@ import signal
 import fcntl
 import requests
 from typing import Optional, Dict, Any
-import base64
 
 from baidu_realtime_translation import BaiduRealtimeTranslationClient, RealtimeTranslationProcessor
 
@@ -166,6 +165,12 @@ class RealtimeTranslationService:
         logger.info(f"[{self.request_id}] Connected to Baidu realtime translation")
         return True
     
+    def is_connected(self) -> bool:
+        """检查是否连接到百度服务"""
+        if not self.processor:
+            return False
+        return self.processor.is_connected()
+    
     @property
     def _needs_reconnect(self) -> bool:
         """检查是否需要重连"""
@@ -266,6 +271,18 @@ class AudioStreamProcessorWebSocket:
         
         # 实时翻译服务
         self.realtime_service = None
+        
+        # 静音填充包配置
+        # 每块音频大小: 16bits * 1ch * 40ms = 1280 bytes @ 16000Hz
+        self.chunk_size = int(self.sample_rate * 2 * 40 / 1000)
+        # 静音包（40ms的静音数据）
+        self.silence_chunk = b'\x00' * self.chunk_size
+        # 静默超时阈值：超过这个时间没有音频数据就发送静音包（秒）
+        self.silence_heartbeat_interval = 3.0  # 3秒发一次心跳
+        # 上次有音频数据的时间
+        self.last_audio_time = time.time()
+        # 上次发送心跳的时间
+        self.last_heartbeat_time = time.time()
     
     def _get_stream_vhost(self) -> str:
         """从 SRS API 获取流的 vhost"""
@@ -382,7 +399,12 @@ class AudioStreamProcessorWebSocket:
         return self.ffmpeg_process
     
     def _read_audio_thread(self):
-        """读取音频数据并发送到实时翻译服务"""
+        """读取音频数据并发送到实时翻译服务
+        
+        注意：此线程只有在以下情况下才会退出：
+        1. 用户主动停止翻译 (is_running = False)
+        否则会一直重试，即使源流中断也会自动恢复
+        """
         chunk_size = 8192
         http_flv_port = self.audio_config.get("http_flv_port", 8080)
         srs_api_url = self.audio_config.get("srs_api_url", "http://localhost:1985")
@@ -391,18 +413,33 @@ class AudioStreamProcessorWebSocket:
         
         logger.info(f"[{self.request_id}] Audio read thread started, chunk_size={chunk_size}")
         
-        # 翻译服务重连相关
-        reconnect_count = 0
-        max_reconnects = 100  # 增加到 100 次重连
-        reconnect_delay = 1  # 减少到 1 秒延迟
+        # 重试配置：直到用户停止才退出
+        max_retries = 600          # 最多重试 600 次
+        retry_interval = 1         # 每次重试间隔 1 秒
+        retry_count = 0
+        start_time = time.time()
+        last_error_type = None
+        
+        # 百度翻译服务重连相关
+        baidu_reconnect_count = 0
+        max_baidu_reconnects = 600  # 增加到 600 次
         
         while self.is_running:
             try:
+                # 检查是否超时重置计数器
+                elapsed = time.time() - start_time
+                if elapsed > 600:
+                    logger.info(f"[{self.request_id}] Audio read retry cycle reset, elapsed={elapsed:.1f}s")
+                    start_time = time.time()
+                    retry_count = 0
+                
                 # 等待源流就绪
                 stream_ready = self._wait_for_stream_ready()
                 if not stream_ready:
-                    logger.warning(f"[{self.request_id}] Stream not ready, waiting...")
-                    time.sleep(2)
+                    logger.warning(f"[{self.request_id}] Stream not ready, retry={retry_count}/{max_retries}")
+                    retry_count += 1
+                    time.sleep(retry_interval)
+                    continue
                 
                 # 连接实时翻译服务
                 if not self.realtime_service:
@@ -417,36 +454,40 @@ class AudioStreamProcessorWebSocket:
                     )
                     
                     if not self.realtime_service.connect():
-                        logger.error(f"[{self.request_id}] Failed to connect realtime service")
-                        time.sleep(5)
+                        logger.error(f"[{self.request_id}] Failed to connect to Baidu realtime service")
+                        time.sleep(retry_interval)
                         continue
                     
-                    reconnect_count = 0  # 重置重连计数
-                    logger.info(f"[{self.request_id}] Connected to realtime translation service")
+                    baidu_reconnect_count = 0  # 重置百度重连计数
+                    logger.info(f"[{self.request_id}] Connected to Baidu realtime translation service")
                 
-                self._start_ffmpeg_input(http_flv_url)
-                logger.info(f"[{self.request_id}] FFmpeg process started with PID: {self.ffmpeg_process.pid}")
+                # 启动 ffmpeg 输入进程
+                if not self.ffmpeg_process:
+                    self._start_ffmpeg_input(http_flv_url)
+                    logger.info(f"[{self.request_id}] FFmpeg input started with PID: {self.ffmpeg_process.pid}")
                 
                 read_count = 0
                 total_bytes_read = 0
                 consecutive_empty_count = 0
+                last_audio_time = time.time()
+                last_heartbeat_time = time.time()
                 
                 while self.is_running and self.ffmpeg_process:
                     # 检查百度是否需要重连（音频无效被断开等）
                     if self.realtime_service and self.realtime_service._needs_reconnect:
-                        if reconnect_count >= max_reconnects:
-                            logger.warning(f"[{self.request_id}] Max reconnection attempts reached, waiting longer...")
-                            # 不退出，继续等待，只是暂停一下
+                        if baidu_reconnect_count >= max_baidu_reconnects:
+                            logger.warning(f"[{self.request_id}] Max Baidu reconnection attempts reached, waiting longer...")
                             time.sleep(5)
-                            reconnect_count = 0  # 重置计数，继续等待
+                            baidu_reconnect_count = 0  # 重置计数，继续等待
                             continue
                         
-                        reconnect_count += 1
-                        logger.info(f"[{self.request_id}] Reconnecting to Baidu (attempt {reconnect_count}/{max_reconnects})...")
+                        baidu_reconnect_count += 1
+                        logger.info(f"[{self.request_id}] Reconnecting to Baidu (attempt {baidu_reconnect_count}/{max_baidu_reconnects})...")
                         
                         # 断开旧连接
-                        self.realtime_service.disconnect()
-                        time.sleep(reconnect_delay)
+                        if self.realtime_service:
+                            self.realtime_service.disconnect()
+                        time.sleep(0.5)  # 减少重连延迟，从1秒改为0.5秒
                         
                         # 重新创建连接
                         self.realtime_service = RealtimeTranslationService(
@@ -460,18 +501,24 @@ class AudioStreamProcessorWebSocket:
                         )
                         
                         if not self.realtime_service.connect():
-                            logger.error(f"[{self.request_id}] Reconnection failed")
-                            time.sleep(reconnect_delay)
+                            logger.error(f"[{self.request_id}] Baidu reconnection failed")
+                            time.sleep(0.5)  # 减少重连延迟
                             continue
                         
-                        reconnect_count = 0  # 重置计数
-                        logger.info(f"[{self.request_id}] Reconnected successfully")
+                        baidu_reconnect_count = 0  # 重置计数
+                        last_heartbeat_time = time.time()  # 重置心跳时间
+                        logger.info(f"[{self.request_id}] Reconnected to Baidu successfully")
                     
+                    # 检查 ffmpeg 进程状态
                     poll_result = self.ffmpeg_process.poll()
                     if poll_result is not None:
-                        logger.error(f"[{self.request_id}] FFmpeg input process exited! returncode={poll_result}")
+                        error_type = f"FFmpeg input exited with code {poll_result}"
+                        if error_type != last_error_type:
+                            logger.error(f"[{self.request_id}] FFmpeg input process exited! returncode={poll_result}")
+                            last_error_type = error_type
                         break
                     
+                    # 读取音频数据
                     try:
                         audio_chunk = self.ffmpeg_process.stdout.read(chunk_size)
                     except (BlockingIOError, IOError):
@@ -482,57 +529,85 @@ class AudioStreamProcessorWebSocket:
                         break
                     
                     read_count += 1
+                    current_time = time.time()
                     
                     if not audio_chunk:
                         consecutive_empty_count += 1
-                        if consecutive_empty_count >= 10000:  # 增加到 10000，约 100 秒
-                            logger.warning(f"[{self.request_id}] FFmpeg output empty for too long, assuming stream ended")
+                        
+                        # 改进：发送静音填充包保持百度会话活跃
+                        # 每隔 silence_heartbeat_interval 秒发送一个静音包
+                        time_since_last_heartbeat = current_time - last_heartbeat_time
+                        if time_since_last_heartbeat >= self.silence_heartbeat_interval:
+                            if self.realtime_service:
+                                self.realtime_service.add_audio(self.silence_chunk)
+                                last_heartbeat_time = current_time
+                                # 减少日志频率：每30秒打印一次
+                                if consecutive_empty_count % 3000 == 0:
+                                    logger.info(f"[{self.request_id}] Sending silence heartbeat (no audio for {consecutive_empty_count/100:.1f}s)")
+                        
+                        # 检查是否长时间没有音频数据（可能源流已停止）
+                        if consecutive_empty_count >= 10000:  # 约 100 秒
+                            logger.warning(f"[{self.request_id}] No audio for 100s, restarting FFmpeg...")
                             break
-                        if consecutive_empty_count % 500 == 0:  # 减少日志频率
+                        elif consecutive_empty_count % 2000 == 0:  # 减少日志频率，每20秒打印一次
                             logger.info(f"[{self.request_id}] Waiting for audio... consecutive_empty={consecutive_empty_count}")
                         time.sleep(0.01)
                         continue
                     
                     consecutive_empty_count = 0
                     total_bytes_read += len(audio_chunk)
+                    last_audio_time = current_time
                     
                     # 发送到实时翻译服务
                     if self.realtime_service:
                         self.realtime_service.add_audio(audio_chunk)
+                        last_heartbeat_time = current_time  # 有实际音频时重置心跳时间
                     
-                    if read_count % 100 == 0:
+                    if read_count % 500 == 0:  # 减少日志频率
                         logger.info(f"[{self.request_id}] Audio stats: total_bytes={total_bytes_read}, chunks={read_count}")
                 
-                logger.info(f"[{self.request_id}] Audio read loop ended. Total: {total_bytes_read} bytes, {read_count} chunks")
-                
-                # 断开实时翻译服务
-                if self.realtime_service:
-                    self.realtime_service.disconnect()
-                    self.realtime_service = None
-                
+                # 循环结束，处理重连
                 if self.is_running:
-                    logger.warning(f"[{self.request_id}] FFmpeg exited, waiting for stream to restart...")
-                    time.sleep(0.5)  # 减少等待时间，快速重试
+                    # FFmpeg 退出或出错，重启
+                    logger.info(f"[{self.request_id}] Audio read loop ended, total={total_bytes_read} bytes, will retry...")
+                    
+                    # 清理资源，准备重试
+                    if self.ffmpeg_process:
+                        try:
+                            self.ffmpeg_process.terminate()
+                            self.ffmpeg_process.wait(timeout=2)
+                        except:
+                            pass
+                        self.ffmpeg_process = None
+                    
+                    # 短暂等待后重试
+                    time.sleep(retry_interval)
                     
             except Exception as e:
                 logger.error(f"[{self.request_id}] Error in audio read thread: {e}", exc_info=True)
-                time.sleep(1)
+                time.sleep(retry_interval)
         
         logger.info(f"[{self.request_id}] Audio read thread ended")
+
     
     def _push_tts_audio_thread(self):
-        """推送 TTS 音频到 SRS"""
+        """推送 TTS 音频到 SRS
+        
+        注意：此线程只有在以下情况下才会退出：
+        1. 用户主动停止翻译 (is_running = False)
+        2. 源流停止推送
+        否则会一直重试，最多重试 10 分钟（600 秒）
+        """
         # SRS 地址 - 优先使用内网地址，如果连接失败再用公网地址
         srs_host = os.environ.get("SRS_HOST", "127.0.0.1")
         srs_port = os.environ.get("SRS_PORT", "1935")
         
         # 使用标准 RTMP URL 格式: rtmp://host/vhost/app/stream
         # 注意: vhost 名称需要与 SRS 配置一致
-        # 使用与源流相同的 vhost (可能是 __defaultVhost__ 或其他)
+        # 使用与源流相同的 vhost
         vhost = getattr(self, 'stream_vhost', '__defaultVhost__')
-        # __defaultVhost__ 在 SRS API 中可能显示为 vid-xxx，但 URL 中使用 __defaultVhost__
-        if vhost.startswith('vid-'):
-            vhost = '__defaultVhost__'
+        # 如果是 vid-xxx 格式，保留原样，因为 SRS 配置中就是这样的 vhost
+        # __defaultVhost__ 用于没有特定vhost的场景
         # 流名称添加 .flv 后缀，因为客户端通过 HTTP-FLV 播放，需要带 .flv 扩展名
         output_stream_name = f"{self.stream_name}.flv"
         rtmp_url = f"rtmp://{srs_host}:{srs_port}/live/{output_stream_name}?vhost={vhost}"
@@ -540,15 +615,15 @@ class AudioStreamProcessorWebSocket:
 
         # FFmpeg 命令（接收 MP3 音频）
         # 百度TTS返回16kHz采样率的MP3，需要转码为AAC才能推流到SRS
+        # 注意：必须使用 -af 音频过滤器强制重采样，-ar 和 -ac 只是输入格式声明
         ffmpeg_bin = os.environ.get("FFMPEG_BIN", "/usr/bin/ffmpeg")
         ffmpeg_output_cmd = [
             ffmpeg_bin,
             "-hide_banner",           # 隐藏 banner 信息
             "-loglevel", "error",     # 只显示错误
-            "-i", "-",                 # 从 stdin 读取，让 FFmpeg 自动检测格式
+            "-i", "-",               # 从 stdin 读取，让 FFmpeg 自动检测格式
+            "-af", "aresample=16000:filter_size=64:cutoff=0.95,pan=mono|c0=c0",  # 强制重采样为 16kHz 单声道
             "-c:a", "aac",           # 转码为 AAC
-            "-ar", "16000",           # 保持 16kHz 采样率
-            "-ac", "1",               # 单声道
             "-b:a", "64k",
             "-f", "flv",
             "-reconnect", "1",        # 自动重连
@@ -559,144 +634,176 @@ class AudioStreamProcessorWebSocket:
         
         logger.info(f"[{self.request_id}] Starting FFmpeg output process: {' '.join(ffmpeg_output_cmd)}")
         
+        # 重试配置：直到用户停止或源流停止才退出
+        max_retries = 600          # 最多重试 600 次
+        retry_interval = 1         # 每次重试间隔 1 秒
+        retry_count = 0
+        start_time = time.time()
+        last_error_type = None
+        
+        # stderr buffer 用于存储 ffmpeg 错误信息
+        stderr_buffer = []
+        stderr_thread = None
+        
         try:
-            # 使用 PIPE 捕获 stderr，并设置 bufsize=0 以立即写入
-            self.output_process = subprocess.Popen(
-                ffmpeg_output_cmd,
-                stdin=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0
-            )
-            
-            logger.info(f"[{self.request_id}] FFmpeg output process started, PID={self.output_process.pid}")
-            
-            # 启动 stderr 读取线程，确保能捕获所有错误信息
-            stderr_buffer = []
-            stderr_thread = threading.Thread(
-                target=self._read_ffmpeg_stderr,
-                args=(self.output_process.stderr, stderr_buffer),
-                daemon=True
-            )
-            stderr_thread.start()
-            logger.info(f"[{self.request_id}] stderr reader thread started")
-            
-            audio_processed = 0
-            max_retries = 3
-            retry_count = 0
-            last_check_time = time.time()
-            check_interval = 1.0  # 每秒检查一次进程状态
-            
             while self.is_running:
-                # 定期检查 FFmpeg 进程状态
-                current_time = time.time()
-                if current_time - last_check_time >= check_interval:
-                    last_check_time = current_time
-                    
-                    if self.output_process:
-                        poll_result = self.output_process.poll()
-                        if poll_result is not None:
-                            # 进程已退出，获取 stderr 内容
-                            stderr_thread.join(timeout=1)  # 等待 stderr 线程结束
-                            stderr_text = "".join(stderr_buffer)
-                            
-                            logger.error(f"[{self.request_id}] FFmpeg output exited! returncode={poll_result}")
-                            if stderr_text:
-                                logger.error(f"[{self.request_id}] FFmpeg stderr:\n{stderr_text[:3000]}")
-                            
-                            # 检查是否有 AAC 编码器错误
-                            if "Unknown encoder" in stderr_text or "codec not found" in stderr_text:
-                                logger.error(f"[{self.request_id}] AAC encoder not found! Check FFmpeg build.")
-                            elif "Connection refused" in stderr_text or "Server error" in stderr_text:
-                                logger.error(f"[{self.request_id}] Cannot connect to SRS at {rtmp_url}")
-                            elif "Invalid data found" in stderr_text or "bitrate" in stderr_text.lower():
-                                logger.error(f"[{self.request_id}] MP3 input format error! TTS may be sending wrong format.")
-                            
-                            retry_count += 1
-                            if retry_count <= max_retries:
-                                logger.info(f"[{self.request_id}] Restarting FFmpeg output ({retry_count}/{max_retries})...")
-                                time.sleep(2)
-                                try:
-                                    self.output_process = subprocess.Popen(
-                                        ffmpeg_output_cmd,
-                                        stdin=subprocess.PIPE,
-                                        stderr=subprocess.PIPE,
-                                        bufsize=0
-                                    )
-                                    stderr_buffer = []
-                                    stderr_thread = threading.Thread(
-                                        target=self._read_ffmpeg_stderr,
-                                        args=(self.output_process.stderr, stderr_buffer),
-                                        daemon=True
-                                    )
-                                    stderr_thread.start()
-                                    logger.info(f"[{self.request_id}] FFmpeg restarted, PID={self.output_process.pid}")
-                                except Exception as e:
-                                    logger.error(f"[{self.request_id}] Failed to restart FFmpeg: {e}")
-                                    break
-                            else:
-                                logger.error(f"[{self.request_id}] FFmpeg output failed after {max_retries} retries")
-                                break
-                        else:
-                            # 进程正常运行，每 10 秒打印一次状态
-                            if audio_processed % 500000 < 1000 and audio_processed > 0:
-                                logger.info(f"[{self.request_id}] FFmpeg running OK, audio_processed={audio_processed}")
+                # 检查是否超时（10 分钟 = 600 秒）
+                elapsed = time.time() - start_time
+                if elapsed > 600:
+                    logger.warning(f"[{self.request_id}] FFmpeg output retry timeout (10min), but still running...")
+                    # 重置计数器，继续尝试
+                    start_time = time.time()
+                    retry_count = 0
                 
-                # 获取 TTS 音频
-                tts_audio = None
-                if self.realtime_service:
-                    tts_audio = self.realtime_service.get_tts_audio(timeout=0.1)
-                    if tts_audio:
-                        logger.info(f"[{self.request_id}] Got TTS audio from queue: {len(tts_audio)} bytes, queue_size={self.realtime_service.tts_queue.qsize()}")
-
-                # 检查 FFmpeg 状态
-                ff_status = None
-                if self.output_process:
-                    ff_status = self.output_process.poll()
-                if tts_audio:
-                    logger.info(f"[{self.request_id}] TTS check: audio={len(tts_audio)}B, ff_status={ff_status}, has_stdin={self.output_process.stdin is not None if self.output_process else False}")
-
-                # 如果 FFmpeg 进程已退出，尝试重启
-                if self.output_process and ff_status is not None:
-                    logger.warning(f"[{self.request_id}] FFmpeg output process exited (code={ff_status}), attempting restart...")
+                # 检查是否需要启动/重启 ffmpeg
+                if not self.output_process or self.output_process.poll() is not None:
+                    # 关闭之前的进程（如果存在）
+                    if self.output_process:
+                        try:
+                            self.output_process.terminate()
+                            self.output_process.wait(timeout=2)
+                        except:
+                            pass
+                    
+                    # 记录重试信息
+                    if retry_count > 0:
+                        logger.info(f"[{self.request_id}] FFmpeg restart attempt {retry_count}/{max_retries}, elapsed={elapsed:.1f}s")
+                    
+                    retry_count += 1
+                    stderr_buffer = []
+                    
                     try:
+                        # 使用 PIPE 捕获 stderr，并设置 bufsize=0 以立即写入
                         self.output_process = subprocess.Popen(
                             ffmpeg_output_cmd,
                             stdin=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                             bufsize=0
                         )
-                        # 重启 stderr 读取线程
-                        stderr_buffer = []
+                        
+                        # 启动 stderr 读取线程
                         stderr_thread = threading.Thread(
                             target=self._read_ffmpeg_stderr,
                             args=(self.output_process.stderr, stderr_buffer),
                             daemon=True
                         )
                         stderr_thread.start()
-                        logger.info(f"[{self.request_id}] FFmpeg output restarted, PID={self.output_process.pid}")
-                    except Exception as e:
-                        logger.error(f"[{self.request_id}] Failed to restart FFmpeg output: {e}")
-                        self.output_process = None
-
-                if tts_audio and self.output_process and self.output_process.poll() is None and self.output_process.stdin:
-                    try:
-                        self.output_process.stdin.write(tts_audio)
-                        self.output_process.stdin.flush()
-                        audio_processed += len(tts_audio)
                         
-                        if audio_processed % 100000 < len(tts_audio):
-                            logger.info(f"[{self.request_id}] Pushed TTS audio: {audio_processed} bytes total")
-                    except (BrokenPipeError, OSError) as e:
-                        logger.error(f"[{self.request_id}] Broken pipe writing to FFmpeg: {e}")
-                        # 进程可能已经退出，设为 None 以触发重连
+                        logger.info(f"[{self.request_id}] FFmpeg output started, PID={self.output_process.pid}")
+                    except Exception as e:
+                        logger.error(f"[{self.request_id}] Failed to start FFmpeg: {e}")
+                        time.sleep(retry_interval)
+                        continue
+                
+                # 检查 FFmpeg 进程状态
+                if self.output_process:
+                    poll_result = self.output_process.poll()
+                    
+                    # 如果进程已退出
+                    if poll_result is not None:
+                        # 获取 stderr 内容
+                        if stderr_thread:
+                            stderr_thread.join(timeout=1)
+                        stderr_text = "".join(stderr_buffer)
+                        
+                        # 分类错误类型
+                        if "Unknown encoder" in stderr_text or "codec not found" in stderr_text:
+                            error_type = "AAC encoder not found"
+                            logger.error(f"[{self.request_id}] AAC encoder not found! Check FFmpeg build.")
+                        elif "Connection refused" in stderr_text:
+                            error_type = "SRS connection refused"
+                            logger.error(f"[{self.request_id}] Cannot connect to SRS at {rtmp_url} - Connection refused")
+                        elif "Server error" in stderr_text or "404" in stderr_text:
+                            error_type = "SRS server error"
+                            logger.error(f"[{self.request_id}] SRS server error")
+                        elif "Invalid data" in stderr_text:
+                            error_type = "Invalid input data"
+                            logger.error(f"[{self.request_id}] Invalid input data format!")
+                        elif poll_result != 0:
+                            error_type = f"FFmpeg exited with code {poll_result}"
+                            if stderr_text:
+                                logger.error(f"[{self.request_id}] FFmpeg stderr: {stderr_text[:500]}")
+                        else:
+                            error_type = "Unknown"
+                            if stderr_text:
+                                logger.warning(f"[{self.request_id}] FFmpeg stderr: {stderr_text[:200]}")
+                        
+                        # 只在错误类型变化时打印警告
+                        if error_type != last_error_type:
+                            logger.warning(f"[{self.request_id}] FFmpeg output error: {error_type}, retry={retry_count}/{max_retries}, elapsed={elapsed:.1f}s")
+                            last_error_type = error_type
+                        
+                        # 关闭进程引用
                         self.output_process = None
-                elif not tts_audio:
+                        time.sleep(retry_interval)
+                        continue
+                
+                # 获取 TTS 音频
+                tts_audio = None
+                if self.realtime_service:
+                    tts_audio = self.realtime_service.get_tts_audio(timeout=0.1)
+                
+                # 诊断日志：每 2 秒打印一次状态
+                if not hasattr(self, '_last_tts_diag_time'):
+                    self._last_tts_diag_time = time.time()
+                current_time = time.time()
+                if current_time - self._last_tts_diag_time >= 2.0:
+                    self._last_tts_diag_time = current_time
+                    realtime_connected = self.realtime_service.is_connected() if self.realtime_service else False
+                    output_running = self.output_process.poll() is None if self.output_process else False
+                    output_exists = self.output_process is not None
+                    tts_queue_size = len(self.realtime_service._tts_queue) if self.realtime_service and hasattr(self.realtime_service, '_tts_queue') else 0
+                    logger.info(f"[{self.request_id}] TTS Status: realtime_connected={realtime_connected}, output_exists={output_exists}, output_running={output_running}, tts_queue_size={tts_queue_size}")
+                
+                # 写入音频数据
+                if tts_audio:
+                    if self.output_process and self.output_process.poll() is None:
+                        try:
+                            stdin_valid = self.output_process.stdin is not None
+                            process_running = self.output_process.poll() is None
+                            
+                            if stdin_valid and process_running:
+                                self.output_process.stdin.write(tts_audio)
+                                self.output_process.stdin.flush()
+                                
+                                audio_processed = getattr(self, '_audio_processed', 0) + len(tts_audio)
+                                setattr(self, '_audio_processed', audio_processed)
+                                
+                                logger.info(f"[{self.request_id}] TTS audio written to FFmpeg: {len(tts_audio)} bytes, total_processed={audio_processed}")
+                            else:
+                                logger.warning(f"[{self.request_id}] FFmpeg stdin invalid: stdin={stdin_valid}, running={process_running}")
+                        except (BrokenPipeError, OSError, IOError) as e:
+                            logger.error(f"[{self.request_id}] Broken pipe/IO error writing to FFmpeg: {e}")
+                            if self.output_process:
+                                try:
+                                    self.output_process.terminate()
+                                except:
+                                    pass
+                            self.output_process = None
+                    else:
+                        # FFmpeg 进程不存在或已退出，打印诊断信息
+                        if not self.output_process:
+                            logger.warning(f"[{self.request_id}] FFmpeg output process is None (TTS audio dropped: {len(tts_audio)} bytes)")
+                        elif self.output_process.poll() is not None:
+                            logger.warning(f"[{self.request_id}] FFmpeg output process exited with code: {self.output_process.poll()} (TTS audio dropped: {len(tts_audio)} bytes)")
+                else:
+                    # 没有 TTS 音频时短暂休眠
                     time.sleep(0.01)
             
-            logger.info(f"[{self.request_id}] TTS push thread ended. Total audio: {audio_processed} bytes")
+            # 正常退出时打印统计
+            total_processed = getattr(self, '_audio_processed', 0)
+            logger.info(f"[{self.request_id}] TTS push thread ended. Total: {total_processed} bytes, retries={retry_count}")
             
         except Exception as e:
-            logger.error(f"[{self.request_id}] Error pushing TTS audio: {e}", exc_info=True)
+            logger.error(f"[{self.request_id}] Error in TTS push thread: {e}", exc_info=True)
+        finally:
+            # 确保进程被正确关闭
+            if self.output_process:
+                try:
+                    self.output_process.terminate()
+                    self.output_process.wait(timeout=2)
+                except:
+                    pass
     
     def _read_ffmpeg_stderr(self, stderr_pipe, buffer: list):
         """读取 FFmpeg stderr 的线程函数"""
@@ -737,11 +844,7 @@ class AudioStreamProcessorWebSocket:
                         break
         except Exception as e:
             buffer.append(f"stderr read error: {e}\n")
-            
-            logger.info(f"[{self.request_id}] TTS push thread ended. Total audio: {audio_processed} bytes")
-            
-        except Exception as e:
-            logger.error(f"[{self.request_id}] Error pushing TTS audio: {e}", exc_info=True)
+            logger.warning(f"[{getattr(self, 'request_id', 'unknown')}] stderr read error: {e}")
     
     def stop(self):
         """停止音频流处理"""

@@ -2,20 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 百度实时语音翻译 WebSocket 客户端
-使用 WebSocket 协议实现真正的实时语音翻译
-支持：语音识别 + 机器翻译 + TTS语音合成
+参考 Demo: realtime_trans_python3/realtime-asr-python.py
+直接发送二进制音频，不需要 Base64 编码
 """
 
 import os
 import json
 import logging
+import websocket
 import threading
-import queue
 import time
-import struct
-import base64
+import queue
 from typing import Optional, Dict, Any, Callable
-from websocket import create_connection, WebSocketException
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,327 +24,306 @@ logger = logging.getLogger(__name__)
 
 class BaiduRealtimeTranslationClient:
     """百度实时语音翻译 WebSocket 客户端
-    
-    使用 WebSocket 协议实现真正的实时流式翻译
-    - 支持 45 种语言
-    - 实时语音识别
-    - 实时机器翻译
-    - 实时 TTS 语音合成（可选）
-    
-    音频要求：
-    - 格式：PCM
-    - 采样率：8kHz、16kHz、44.1kHz
-    - 位深：16bits
-    - 单声道
-    - 小端序
+
+    使用 WebSocket 直接传输二进制音频，无需 Base64 编码
+    集成 ASR + MT + TTS，一步到位
     """
-    
-    def __init__(self, app_id: str, app_key: str, 
+
+    # 实时翻译 WebSocket URL
+    WS_URL = "wss://aip.baidubce.com/ws/realtime_speech_trans"
+
+    def __init__(self, app_id: str, app_key: str,
                  from_lang: str = "zh", to_lang: str = "en",
-                 sample_rate: int = 16000,
-                 return_tts: bool = True,
-                 tts_speaker: str = "woman",
-                 on_translation_result: Callable[[Dict], None] = None,
-                 on_tts_audio: Callable[[bytes], None] = None,
-                 on_error: Callable[[int, str], None] = None):
-        """初始化实时翻译客户端
-        
-        Args:
-            app_id: 百度应用 App ID
-            app_key: 百度应用 App Key
-            from_lang: 源语言代码（如 "zh", "en"）
-            to_lang: 目标语言代码（如 "en", "zh"）
-            sample_rate: 采样率（8000, 16000, 44100）
-            return_tts: 是否返回 TTS 音频
-            tts_speaker: TTS 发音人（"man" 或 "woman"）
-            on_translation_result: 翻译结果回调 {asr, translation, is_final, ...}
-            on_tts_audio: TTS 音频回调（二进制 MP3 数据）
-            on_error: 错误回调 (error_code, error_msg)
-        """
+                 sample_rate: int = 16000, channels: int = 1):
         self.app_id = app_id
         self.app_key = app_key
         self.from_lang = from_lang
         self.to_lang = to_lang
         self.sample_rate = sample_rate
-        self.return_tts = return_tts
-        self.tts_speaker = tts_speaker
-        
-        self.on_translation_result = on_translation_result
-        self.on_tts_audio = on_tts_audio
-        self.on_error = on_error
-        
+        self.channels = channels
+
         self.ws = None
-        self.is_connected = False
         self.is_running = False
-        self.receive_thread = None
-        self.lock = threading.Lock()
-        self.bytes_sent = 0
-        
-        # WebSocket URL
-        self.ws_url = "wss://aip.baidubce.com/ws/realtime_speech_trans"
-        
-        # 音频包配置（40ms @ 16000Hz = 1280 bytes）
-        self.audio_chunk_duration_ms = 40
-        self.audio_chunk_size = int(sample_rate * 2 * self.audio_chunk_duration_ms / 1000)  # 16bits * 1ch * 40ms
-        
-        logger.info(f"BaiduRealtimeTranslationClient initialized: {from_lang} -> {to_lang}, "
-                   f"sample_rate={sample_rate}, return_tts={return_tts}")
-    
-    def connect(self) -> bool:
-        """建立 WebSocket 连接并发送开始报文
-        
-        Returns:
-            连接是否成功
+        self.ws_thread = None
+
+        # 回调函数
+        self.on_translation_callback: Optional[Callable] = None
+        self.on_tts_audio_callback: Optional[Callable] = None
+        self.on_error_callback: Optional[Callable] = None
+
+        # TTS 音频数据缓冲
+        self.tts_audio_buffer = b""
+
+        # 音频数据队列（外部放入，WebSocket 线程发送）
+        # 增大队列以避免丢包：500 * 3840字节 ≈ 75秒缓冲
+        self.audio_queue = queue.Queue(maxsize=500)
+
+    def set_translation_callback(self, callback: Callable):
+        """设置翻译结果回调
+
+        Args:
+            callback: 回调函数，签名: callback(text, original_text, from_lang, to_lang)
         """
-        try:
-            logger.info(f"Connecting to {self.ws_url}...")
-            # 设置 60 秒超时
-            self.ws = create_connection(self.ws_url, timeout=60)
-            
-            # 发送开始报文
-            start_msg = {
-                "type": "START",
-                "from": self.from_lang,
-                "to": self.to_lang,
-                "app_id": self.app_id,
-                "app_key": self.app_key,
-                "sampling_rate": self.sample_rate,
-                "return_target_tts": 1 if self.return_tts else 0,
-                "tts_speaker": self.tts_speaker
-            }
-            
-            logger.info(f"Sending START message: {json.dumps(start_msg)}")
-            self.ws.send(json.dumps(start_msg))
-            
-            # 等待确认（60秒超时）
-            logger.info("Waiting for START response...")
-            self.ws.settimeout(60)
-            response = self.ws.recv()
-            logger.info(f"Received START response: {response}")
-            resp_data = json.loads(response)
-            
-            if resp_data.get("code") == 0 and resp_data.get("data", {}).get("status") == "STA":
-                logger.info("WebSocket connection established, translation started")
-                self.is_connected = True
-                self.is_running = True
-                
-                # 启动接收线程
-                self.receive_thread = threading.Thread(target=self._receive_thread, daemon=True)
-                self.receive_thread.start()
-                
-                return True
-            else:
-                error_msg = resp_data.get("msg", "Unknown error")
-                error_code = resp_data.get("code", -1)
-                logger.error(f"Failed to start translation: code={error_code}, msg={error_msg}")
-                self.ws.close()
-                self.ws = None
-                return False
-                
-        except WebSocketException as e:
-            logger.error(f"WebSocket connection failed: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error during connection: {e}", exc_info=True)
-            return False
-    
-    def _receive_thread(self):
-        """接收服务器消息的线程"""
-        logger.info("Receive thread started")
-        
-        while self.is_running and self.is_connected:
+        self.on_translation_callback = callback
+
+    def set_tts_audio_callback(self, callback: Callable):
+        """设置 TTS 音频回调
+
+        Args:
+            callback: 回调函数，签名: callback(audio_data: bytes)
+        """
+        self.on_tts_audio_callback = callback
+
+    def set_error_callback(self, callback: Callable):
+        """设置错误回调
+
+        Args:
+            callback: 回调函数，签名: callback(error_msg: str)
+        """
+        self.on_error_callback = callback
+
+    def _get_start_frame(self) -> Dict[str, Any]:
+        """获取开始帧"""
+        return {
+            "type": "START",
+            "from": self.from_lang,
+            "to": self.to_lang,
+            "sampling_rate": self.sample_rate,
+            "return_target_tts": True,  # 返回 TTS 音频
+            "tts_speaker": "man",
+            "app_id": self.app_id,
+            "app_key": self.app_key,
+        }
+
+    def _get_finish_frame(self) -> Dict[str, Any]:
+        """获取结束帧"""
+        return {"type": "FINISH"}
+
+    def _on_open(self, ws):
+        """WebSocket 连接打开"""
+        logger.info("WebSocket connected")
+
+        # 发送开始帧
+        start_frame = self._get_start_frame()
+        body = json.dumps(start_frame)
+        ws.send(body, websocket.ABNF.OPCODE_TEXT)
+        logger.info(f"Sent START frame: {start_frame}")
+
+        # 启动音频发送线程
+        self.is_running = True
+        threading.Thread(target=self._send_audio_thread, daemon=True).start()
+
+    def _send_audio_thread(self):
+        """发送音频数据线程"""
+        # 百度 WebSocket API 缓冲区限制为 3840 字节
+        # 16kHz * 2 bytes * 1 channel * 120ms / 1000 = 3840 字节
+        chunk_ms = 120
+        chunk_len = int(self.sample_rate * 2 * self.channels * chunk_ms / 1000)
+        logger.info(f"Audio send thread started: chunk_ms={chunk_ms}, chunk_len={chunk_len}")
+
+        consecutive_empty = 0
+
+        while self.is_running:
             try:
-                if self.ws:
-                    # 设置超时，避免一直阻塞
-                    self.ws.settimeout(5.0)  # 增加到 5 秒
-                    message = self.ws.recv()
-                    
-                    if message is None:
-                        continue
-                    
-                    # 检查消息类型
-                    if isinstance(message, bytes):
-                        # 二进制消息：TTS 音频
-                        # 格式：1字节 type + payload
-                        if len(message) > 1:
-                            msg_type = message[0]
-                            audio_data = message[1:]
-                            
-                            if msg_type == 0x01:
-                                # TTS 音频
-                                logger.info(f"Received TTS audio: {len(audio_data)} bytes")
-                                # 诊断：检查音频数据格式
-                                # MP3帧同步以0xFF开头，第二字节的高3位为111表示MPEG Audio
-                                if len(audio_data) >= 2:
-                                    first_two = audio_data[:2]
-                                    # 0xFF 0xE0-0xFF 表示有效的MP3帧同步
-                                    if first_two[0] == 0xFF and (first_two[1] & 0xE0) == 0xE0:
-                                        mpeg_version = (first_two[1] >> 3) & 0x03
-                                        layer = (first_two[1] >> 1) & 0x03
-                                        version_str = {0: "MPEG-2.5", 1: "Reserved", 2: "MPEG-2", 3: "MPEG-1"}[mpeg_version]
-                                        layer_str = {0: "Reserved", 1: "Layer III", 2: "Layer II", 3: "Layer I"}[layer]
-                                        logger.info(f"TTS audio format: MP3 ({version_str}, {layer_str})")
-                                    else:
-                                        logger.warning(f"TTS audio format: Unknown (header: {first_two.hex()})")
-                                if self.on_tts_audio:
-                                    self.on_tts_audio(audio_data)
-                            else:
-                                logger.warning(f"Unknown binary message type: 0x{msg_type:02x}")
-                    else:
-                        # 文本消息：JSON 格式的翻译结果
-                        data = json.loads(message)
-                        self._handle_text_message(data)
-                        
-            except TimeoutError:
-                # 超时，继续循环（这是正常的，保持心跳）
-                continue
-            except TimeoutError as e:
-                # SSL socket 超时
-                continue
-            except OSError as e:
-                # 连接断开等 OS 错误
-                if self.is_running:
-                    logger.warning(f"Connection error in receive thread: {e}")
-                break
-            except Exception as e:
-                if self.is_running:
-                    # 检查是否是 WebSocket 超时
-                    error_str = str(e)
-                    if "timeout" in error_str.lower() or "timed out" in error_str.lower():
-                        logger.info("WebSocket receive timeout, continuing...")
-                        continue
-                    logger.error(f"Error in receive thread: {e}", exc_info=True)
-                break
-        
-        logger.info("Receive thread ended")
-    
-    def _handle_text_message(self, data: Dict):
-        """处理文本消息"""
-        code = data.get("code", -1)
-        msg = data.get("msg", "")
-        
-        if code != 0:
-            # 错误消息
-            logger.error(f"Translation error: code={code}, msg={msg}")
-            if self.on_error:
-                self.on_error(code, msg)
-            return
-        
-        # 检查状态
-        status = data.get("data", {}).get("status", "")
-        
-        if status == "TRN":
-            # 翻译结果
-            result = data.get("data", {}).get("result", {})
-            result_type = result.get("type", "")  # MID 或 FIN
-            
-            # 提取识别和翻译文本
-            asr_text = result.get("asr", "") or result.get("sentence", "")
-            trans_text = result.get("asr_trans", "") or result.get("sentence_trans", "")
-            is_final = (result_type == "FIN")
-            
-            if asr_text or trans_text:
-                translation_result = {
-                    "asr_text": asr_text,
-                    "translation": trans_text,
-                    "is_final": is_final,
-                    "type": result_type,
-                    "from_lang": self.from_lang,
-                    "to_lang": self.to_lang
-                }
-                
-                if is_final:
-                    logger.info(f"[FIN] ASR: '{asr_text}' -> Translation: '{trans_text}'")
+                # 从队列获取音频数据
+                try:
+                    audio_data = self.audio_queue.get(timeout=0.1)
+                except queue.Empty:
+                    consecutive_empty += 1
+                    if consecutive_empty > 50:  # 5秒没有数据
+                        # 发送静音包保持连接
+                        silence = b'\x00' * chunk_len
+                        self.ws.send(silence, websocket.ABNF.OPCODE_BINARY)
+                        consecutive_empty = 0
+                    continue
+
+                consecutive_empty = 0
+
+                # 发送音频数据（二进制）
+                if len(audio_data) >= chunk_len:
+                    # 发送完整的 chunk
+                    self.ws.send(audio_data[:chunk_len], websocket.ABNF.OPCODE_BINARY)
+                    # 把剩余的放回队列
+                    if len(audio_data) > chunk_len:
+                        remaining = audio_data[chunk_len:]
+                        try:
+                            self.audio_queue.put(remaining, block=False)
+                        except queue.Full:
+                            pass
                 else:
-                    logger.debug(f"[MID] ASR: '{asr_text}' -> Translation: '{trans_text}'")
-                
-                if self.on_translation_result:
-                    self.on_translation_result(translation_result)
-                    
-        elif status == "END":
-            # 会话结束
-            logger.info("Translation session ended")
-            self.disconnect()
-    
-    def send_audio(self, audio_data: bytes) -> bool:
-        """发送音频数据
-        
+                    # 数据不够一个 chunk，等待累积
+                    try:
+                        self.audio_queue.put(audio_data, block=False)
+                    except queue.Full:
+                        pass
+
+                # 控制发送速率
+                time.sleep(chunk_ms / 1000.0)
+
+            except Exception as e:
+                logger.error(f"Error in send_audio_thread: {e}")
+                break
+
+        logger.info("Audio send thread ended")
+
+    def _on_message(self, ws, message):
+        """收到消息"""
+        if isinstance(message, bytes):
+            # TTS 音频数据
+            # 第一个字节是 type，0x01 = TTS播报报文
+            # 后续是 MP3 格式的 TTS 音频数据
+            if len(message) > 1:
+                tts_type = message[0]
+                if tts_type == 0x01:
+                    # TTS 播报报文，payload 是 MP3 格式
+                    tts_audio = message[1:]
+                    self.tts_audio_buffer += tts_audio
+                    logger.debug(f"Received TTS MP3: {len(tts_audio)} bytes")
+
+                    if self.on_tts_audio_callback:
+                        self.on_tts_audio_callback(tts_audio)
+                else:
+                    logger.warning(f"Unknown binary message type: 0x{tts_type:02x}")
+
+        elif isinstance(message, str):
+            # JSON 消息（翻译结果）
+            try:
+                result = json.loads(message)
+                logger.debug(f"Received result: {result}")
+
+                # 处理翻译结果（根据文档格式）
+                if result.get("code") == 0 and result.get("data"):
+                    data = result.get("data", {})
+                    status = data.get("status", "")
+
+                    if status == "TRN":
+                        # 翻译结果
+                        result_obj = data.get("result", {})
+                        result_type = result_obj.get("type", "")  # MID 或 FIN
+
+                        if result_type == "FIN":
+                            # 最终结果
+                            sentence = result_obj.get("sentence", "")
+                            sentence_trans = result_obj.get("sentence_trans", "")
+
+                            if sentence_trans:
+                                logger.info(f"Translation [{result_type}]: '{sentence}' -> '{sentence_trans}'")
+                                if self.on_translation_callback:
+                                    self.on_translation_callback(
+                                        sentence_trans, sentence, self.from_lang, self.to_lang
+                                    )
+                        elif result_type == "MID":
+                            # 中间结果
+                            asr = result_obj.get("asr", "")
+                            asr_trans = result_obj.get("asr_trans", "")
+
+                            if asr_trans:
+                                logger.debug(f"Translation [{result_type}]: '{asr}' -> '{asr_trans}'")
+                                if self.on_translation_callback:
+                                    self.on_translation_callback(
+                                        asr_trans, asr, self.from_lang, self.to_lang
+                                    )
+
+                    elif status == "END":
+                        logger.info("Session ended")
+
+                elif result.get("code") != 0:
+                    error_msg = result.get("msg", "Unknown error")
+                    logger.error(f"Translation error: {error_msg}")
+                    if self.on_error_callback:
+                        self.on_error_callback(error_msg)
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse message: {e}, message={message}")
+
+    def _on_error(self, ws, error):
+        """WebSocket 错误"""
+        logger.error(f"WebSocket error: {error}")
+        if self.on_error_callback:
+            self.on_error_callback(str(error))
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        """WebSocket 关闭"""
+        logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+        self.is_running = False
+
+    def connect(self):
+        """建立 WebSocket 连接"""
+        if self.ws and self.is_running:
+            logger.warning("WebSocket already connected")
+            return
+
+        logger.info(f"Connecting to {self.WS_URL}")
+
+        self.ws = websocket.WebSocketApp(
+            self.WS_URL,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+        )
+
+        # 在单独线程中运行
+        self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
+        self.ws_thread.start()
+
+    def disconnect(self):
+        """断开 WebSocket 连接"""
+        logger.info("Disconnecting WebSocket...")
+
+        self.is_running = False
+
+        if self.ws:
+            # 发送结束帧
+            try:
+                finish_frame = self._get_finish_frame()
+                self.ws.send(json.dumps(finish_frame), websocket.ABNF.OPCODE_TEXT)
+                logger.info("Sent FINISH frame")
+            except Exception as e:
+                logger.warning(f"Failed to send FINISH frame: {e}")
+
+            # 关闭 WebSocket
+            self.ws.close()
+            self.ws = None
+
+        if self.ws_thread:
+            self.ws_thread.join(timeout=2)
+            self.ws_thread = None
+
+        logger.info("WebSocket disconnected")
+
+    def add_audio(self, audio_data: bytes):
+        """添加音频数据
+
         Args:
             audio_data: PCM 音频数据（二进制）
-            
-        Returns:
-            发送是否成功
         """
-        if not self.is_connected or not self.ws:
-            logger.warning("Not connected, cannot send audio")
-            return False
-        
-        try:
-            with self.lock:
-                self.ws.send(audio_data, opcode=2)  # Binary opcode
-            self.bytes_sent += len(audio_data)
-            # 每约1秒打印一次发送状态
-            if self.bytes_sent % 32000 < 4096:
-                logger.info(f"Audio sent: total={self.bytes_sent} bytes")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to send audio: {e}")
-            return False
-    
-    def send_audio_chunk(self, audio_chunk: bytes) -> bool:
-        """发送一个音频块（40ms）
-        
-        这是 send_audio 的别名，保持 API 一致性
-        """
-        return self.send_audio(audio_chunk)
-    
-    def disconnect(self):
-        """断开连接"""
-        logger.info("Disconnecting...")
-        self.is_running = False
-        self.is_connected = False
-        
-        try:
-            if self.ws:
-                # 发送结束报文
-                try:
-                    self.ws.settimeout(5)
-                    self.ws.send(json.dumps({"type": "FINISH"}))
-                    
-                    # 等待确认
-                    response = self.ws.recv()
-                    resp_data = json.loads(response)
-                    if resp_data.get("data", {}).get("status") == "END":
-                        logger.info("Received END confirmation")
-                except:
-                    pass
-                
-                self.ws.close()
-                self.ws = None
-        except Exception as e:
-            logger.warning(f"Error during disconnect: {e}")
-        
-        logger.info("Disconnected")
-    
-    def __del__(self):
-        """析构函数，确保断开连接"""
-        if self.is_connected:
-            self.disconnect()
+        if self.is_running:
+            try:
+                self.audio_queue.put(audio_data, block=False)
+            except queue.Full:
+                logger.warning("Audio queue full, dropping audio")
+
+    def start(self):
+        """启动连接"""
+        self.connect()
+
+    def stop(self):
+        """停止连接"""
+        self.disconnect()
 
 
 class RealtimeTranslationProcessor:
-    """实时翻译处理器
+    """实时翻译处理器（封装 BaiduRealtimeTranslationClient）
     
-    将 WebSocket 翻译客户端与音频流处理结合
+    提供音频处理、翻译回调、TTS 回调、错误回调等功能
     """
     
     def __init__(self, app_id: str, app_key: str,
                  from_lang: str = "zh", to_lang: str = "en",
-                 sample_rate: int = 16000,
-                 return_tts: bool = True,
-                 tts_speaker: str = "woman",
-                 audio_buffer_ms: int = 40):
-        """初始化
+                 sample_rate: int = 16000, channels: int = 1,
+                 return_tts: bool = True, tts_speaker: str = "woman"):
+        """初始化处理器
         
         Args:
             app_id: 百度应用 App ID
@@ -354,242 +331,144 @@ class RealtimeTranslationProcessor:
             from_lang: 源语言
             to_lang: 目标语言
             sample_rate: 采样率
+            channels: 声道数
             return_tts: 是否返回 TTS
             tts_speaker: TTS 发音人
-            audio_buffer_ms: 音频缓冲时长（毫秒），建议 40-100ms
         """
         self.app_id = app_id
         self.app_key = app_key
         self.from_lang = from_lang
         self.to_lang = to_lang
         self.sample_rate = sample_rate
+        self.channels = channels
         self.return_tts = return_tts
         self.tts_speaker = tts_speaker
         
-        # 计算每块音频大小
-        self.audio_chunk_size = int(sample_rate * 2 * audio_buffer_ms / 1000)  # 16bits * 1ch * ms
-        
-        # 翻译结果队列
-        self.translation_queue = queue.Queue(maxsize=100)
-        
-        # TTS 音频队列
-        self.tts_queue = queue.Queue(maxsize=100)
-        
-        # 音频缓冲
-        self.audio_buffer = b""
-        self.max_buffer_size = self.audio_chunk_size * 10  # 最多缓冲 10 块
-        
-        # 客户端引用
         self.client = None
+        self._connected = False
         
-        # 重连标志
-        self._needs_reconnect = False
-        
-        # 回调函数
-        def on_translation(result):
-            try:
-                self.translation_queue.put_nowait(result)
-            except queue.Full:
-                logger.warning("Translation queue full, dropping result")
-        
-        def on_tts(audio):
-            try:
-                self.tts_queue.put_nowait(audio)
-            except queue.Full:
-                logger.warning("TTS queue full, dropping audio")
-        
-        def on_error(code, msg):
-            logger.error(f"Translation error: {code} - {msg}")
-        
-        self.on_translation_callback = on_translation
-        self.on_tts_callback = on_tts
-        self.on_error_callback = on_error
+        # 回调函数（与 audio_translation_service_websocket.py 的期望一致）
+        self.on_translation_callback = None  # 回调签名: callback(result: Dict)
+        self.on_tts_callback = None         # 回调签名: callback(audio_data: bytes)
+        self.on_error_callback = None       # 回调签名: callback(code: int, msg: str)
     
     def connect(self) -> bool:
-        """连接到百度实时翻译服务"""
-        self.client = BaiduRealtimeTranslationClient(
-            app_id=self.app_id,
-            app_key=self.app_key,
-            from_lang=self.from_lang,
-            to_lang=self.to_lang,
-            sample_rate=self.sample_rate,
-            return_tts=self.return_tts,
-            tts_speaker=self.tts_speaker,
-            on_translation_result=self.on_translation_callback,
-            on_tts_audio=self.on_tts_callback,
-            on_error=self.on_error_callback
-        )
-        
-        return self.client.connect()
-    
-    def add_audio(self, audio_data: bytes):
-        """添加音频数据
-        
-        Args:
-            audio_data: PCM 音频数据
-        """
-        if not self.client or not self.client.is_connected:
-            logger.debug("Client not connected, skipping audio")
-            return
-        
-        # 添加到缓冲
-        self.audio_buffer += audio_data
-        
-        # 如果缓冲太大，丢弃最老的数据
-        if len(self.audio_buffer) > self.max_buffer_size:
-            excess = len(self.audio_buffer) - self.max_buffer_size
-            self.audio_buffer = self.audio_buffer[excess:]
-        
-        # 发送完整的音频块
-        sent_count = 0
-        while len(self.audio_buffer) >= self.audio_chunk_size:
-            chunk = self.audio_buffer[:self.audio_chunk_size]
-            self.audio_buffer = self.audio_buffer[self.audio_chunk_size:]
-            if self.client.send_audio(chunk):
-                sent_count += 1
-        
-        if sent_count > 0:
-            logger.debug(f"Sent {sent_count} audio chunks")
-    
-    def add_audio_chunk(self, chunk: bytes):
-        """添加一个音频块（直接发送，不缓冲）"""
-        if self.client and self.client.is_connected:
-            self.client.send_audio(chunk)
-    
-    def get_translation(self, timeout: float = 0.1) -> Optional[Dict]:
-        """获取翻译结果
-        
-        Args:
-            timeout: 等待超时（秒）
-            
-        Returns:
-            翻译结果字典，如果超时返回 None
-        """
+        """建立连接"""
         try:
-            return self.translation_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
-    
-    def get_tts_audio(self, timeout: float = 0.1) -> Optional[bytes]:
-        """获取 TTS 音频
-        
-        Args:
-            timeout: 等待超时（秒）
+            self.client = BaiduRealtimeTranslationClient(
+                app_id=self.app_id,
+                app_key=self.app_key,
+                from_lang=self.from_lang,
+                to_lang=self.to_lang,
+                sample_rate=self.sample_rate,
+                channels=self.channels
+            )
             
-        Returns:
-            TTS 音频数据（二进制 MP3），如果超时返回 None
-        """
-        try:
-            return self.tts_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
+            # 设置回调
+            self.client.set_translation_callback(self._on_translation)
+            self.client.set_tts_audio_callback(self._on_tts_audio)
+            self.client.set_error_callback(self._on_error)
+            
+            # 启动连接
+            self.client.start()
+            self._connected = True
+            
+            logger.info(f"RealtimeTranslationProcessor connected: {self.from_lang} -> {self.to_lang}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to connect RealtimeTranslationProcessor: {e}")
+            self._connected = False
+            return False
+    
+    def _on_translation(self, translated_text: str, original_text: str, from_lang: str, to_lang: str):
+        """翻译结果回调"""
+        # 转换为字典格式以匹配 audio_translation_service_websocket.py 的期望
+        result = {
+            "asr_text": original_text,
+            "translation": translated_text,
+            "is_final": True,
+            "from_lang": from_lang,
+            "to_lang": to_lang
+        }
+        if self.on_translation_callback:
+            self.on_translation_callback(result)
+    
+    def _on_tts_audio(self, audio_data: bytes):
+        """TTS 音频回调"""
+        if self.on_tts_callback:
+            self.on_tts_callback(audio_data)
+    
+    def _on_error(self, error_msg: str):
+        """错误回调"""
+        logger.error(f"Translation error: {error_msg}")
+        if self.on_error_callback:
+            self.on_error_callback(-1, error_msg)
     
     def disconnect(self):
         """断开连接"""
+        self._connected = False
         if self.client:
-            self.client.disconnect()
+            self.client.stop()
             self.client = None
+        logger.info("RealtimeTranslationProcessor disconnected")
+    
+    def add_audio(self, audio_data: bytes):
+        """添加音频数据"""
+        if self.client and self._connected:
+            self.client.add_audio(audio_data)
     
     def is_connected(self) -> bool:
         """检查是否已连接"""
-        return self.client is not None and self.client.is_connected
-    
-    def __del__(self):
-        """析构函数"""
-        self.disconnect()
+        return self._connected and self.client is not None and self.client.is_running
 
 
-def main():
-    """测试实时翻译"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="百度实时语音翻译 WebSocket 测试")
-    parser.add_argument("--app-id", required=True, help="百度应用 App ID")
-    parser.add_argument("--app-key", required=True, help="百度应用 App Key")
-    parser.add_argument("--from", default="zh", help="源语言 (默认: zh)")
-    parser.add_argument("--to", default="en", help="目标语言 (默认: en)")
-    parser.add_argument("--sample-rate", type=int, default=16000, help="采样率 (默认: 16000)")
-    parser.add_argument("--no-tts", action="store_true", help="不返回 TTS 音频")
-    parser.add_argument("--speaker", default="woman", choices=["man", "woman"], help="TTS 发音人")
-    parser.add_argument("--test-file", help="测试音频文件路径 (PCM 格式)")
-    
-    args = parser.parse_args()
-    
-    translations_received = 0
-    
-    def on_translation(result):
-        nonlocal translations_received
-        translations_received += 1
-        print(f"\n[{result['type']}] ASR: {result['asr_text']}")
-        print(f"[{result['type']}] Translation: {result['translation']}")
-    
-    def on_tts(audio):
-        print(f"\n[TTS] Received audio: {len(audio)} bytes")
-        # 可以保存为文件测试
-        with open("test_tts.mp3", "wb") as f:
-            f.write(audio)
-        print("[TTS] Saved to test_tts.mp3")
-    
-    def on_error(code, msg):
-        print(f"\n[ERROR] {code}: {msg}")
-    
-    # 创建客户端
-    client = BaiduRealtimeTranslationClient(
-        app_id=args.app_id,
-        app_key=args.app_key,
-        from_lang=getattr(args, 'from'),
-        to_lang=args.to,
-        sample_rate=args.sample_rate,
-        return_tts=not args.no_tts,
-        tts_speaker=args.speaker,
-        on_translation_result=on_translation,
-        on_tts_audio=on_tts,
-        on_error=on_error
-    )
-    
-    # 连接
-    print("Connecting...")
-    if not client.connect():
-        print("Failed to connect")
+def test():
+    """测试"""
+    app_id = os.getenv("BAIDU_APP_ID", "")
+    app_key = os.getenv("BAIDU_APP_KEY", "")
+
+    if not app_id or not app_key:
+        logger.error("Please set BAIDU_APP_ID and BAIDU_APP_KEY")
         return
-    
-    print("Connected! Sending audio...")
-    
-    if args.test_file:
-        # 从文件读取音频测试
-        with open(args.test_file, "rb") as f:
-            audio_data = f.read()
-        
-        # 分块发送
-        chunk_size = int(args.sample_rate * 2 * 40 / 1000)  # 40ms
-        for i in range(0, len(audio_data), chunk_size):
-            chunk = audio_data[i:i+chunk_size]
-            client.send_audio(chunk)
-            time.sleep(0.04)  # 40ms
-            
-            if not client.is_connected:
-                break
-        
-        time.sleep(2)
-    else:
-        # 模拟音频发送
-        print("No test file, simulating audio...")
-        import numpy as np
-        
-        chunk_size = int(args.sample_rate * 2 * 40 / 1000)
-        for i in range(50):  # 发送 50 块 ~2秒
-            # 生成静音（或者使用实际音频）
-            chunk = b'\x00' * chunk_size
-            client.send_audio(chunk)
-            time.sleep(0.04)
-            
-            if not client.is_connected:
-                break
-    
-    print(f"\nReceived {translations_received} translations")
-    client.disconnect()
-    print("Done")
+
+    client = BaiduRealtimeTranslationClient(
+        app_id=app_id,
+        app_key=app_key,
+        from_lang="zh",
+        to_lang="en",
+        sample_rate=16000,
+        channels=1
+    )
+
+    def on_translation(text, original, from_lang, to_lang):
+        logger.info(f"=== Translation: {original} -> {text}")
+
+    def on_tts(audio):
+        logger.info(f"=== TTS audio received: {len(audio)} bytes")
+
+    client.set_translation_callback(on_translation)
+    client.set_tts_audio_callback(on_tts)
+
+    # 启动
+    client.start()
+
+    # 模拟发送音频（从文件）
+    import sys
+    if len(sys.argv) > 1:
+        audio_file = sys.argv[1]
+        with open(audio_file, 'rb') as f:
+            audio = f.read()
+
+        logger.info(f"Sending audio file: {audio_file}, size={len(audio)}")
+        client.add_audio(audio)
+
+    # 等待一段时间
+    time.sleep(10)
+
+    # 停止
+    client.stop()
 
 
 if __name__ == "__main__":
-    main()
+    test()

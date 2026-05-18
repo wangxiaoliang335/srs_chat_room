@@ -70,7 +70,7 @@ class WebSocketClient:
         初始化 WebSocket 客户端
         
         Args:
-            url: WebSocket 服务器地址，如 ws://localhost:8085
+            url: WebSocket 服务器地址，如 ws://localhost:8086
             user_id: 用户ID（可选）
             room_id: 房间ID（可选）
             auto_reconnect: 是否自动重连
@@ -392,7 +392,7 @@ def test_client():
     import argparse
     
     parser = argparse.ArgumentParser(description='WebSocket Client Test')
-    parser.add_argument('--url', default='ws://localhost:8085', help='WebSocket URL')
+    parser.add_argument('--url', default='ws://localhost:8086', help='WebSocket URL')
     parser.add_argument('--user-id', default='test_user', help='User ID')
     parser.add_argument('--room-id', default='test_room', help='Room ID')
     args = parser.parse_args()
