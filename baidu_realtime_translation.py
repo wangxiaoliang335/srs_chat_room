@@ -230,15 +230,40 @@ class BaiduRealtimeTranslationClient:
         logger.info(f"Audio send thread started 111: chunk_ms={chunk_ms}, chunk_len={chunk_len}")
 
         consecutive_empty = 0
+        # 累积缓冲区，不够 chunk_len 时先存这里
+        accumulated = b''
 
         while self.is_running:
             try:
-                # 从队列获取音频数据
+                # 先从缓冲区凑够一个 chunk
+                if len(accumulated) >= chunk_len:
+                    to_send = accumulated[:chunk_len]
+                    accumulated = accumulated[chunk_len:]
+                    
+                    # 发送
+                    self.ws.send(to_send, websocket.ABNF.OPCODE_BINARY)
+                    
+                    # 保存本地（如果启用）
+                    if self.input_save_enabled:
+                        self._write_input_audio(to_send)
+                    
+                    # 控制发送速率
+                    time.sleep(chunk_ms / 1000.0)
+                    continue
+                
+                # 缓冲区不够，从队列获取数据
                 try:
-                    audio_data = self.audio_queue.get(timeout=0.1)
+                    audio_data = self.audio_queue.get(timeout=0.05)
                 except queue.Empty:
                     consecutive_empty += 1
-                    if consecutive_empty > 50:  # 5秒没有数据
+                    queue_size = self.audio_queue.qsize()
+                    if consecutive_empty % 10 == 0 and consecutive_empty > 0:
+                        logger.debug(f"[{self.request_id}] Queue empty for {consecutive_empty}, queue_size={queue_size}")
+                    
+                    if len(accumulated) > 0:
+                        # 有累积数据但不够一个 chunk，等待更多（不sleep，只继续循环）
+                        continue
+                    elif consecutive_empty > 50:
                         # 发送静音包保持连接
                         silence = b'\x00' * chunk_len
                         self.ws.send(silence, websocket.ABNF.OPCODE_BINARY)
@@ -246,34 +271,10 @@ class BaiduRealtimeTranslationClient:
                     continue
 
                 consecutive_empty = 0
-
-                # 发送音频数据（二进制）
-                if len(audio_data) >= chunk_len:
-                    # 发送完整的 chunk
-                    self.ws.send(audio_data[:chunk_len], websocket.ABNF.OPCODE_BINARY)
-
-                    # 发送成功后才保存到本地
-                    logger.info(f"input_save_enabled={self.input_save_enabled}")
-                    if self.input_save_enabled:
-                        logger.info(f"Saving to local: chunk_len={chunk_len}, audio_size={len(audio_data[:chunk_len])}")
-                        self._write_input_audio(audio_data[:chunk_len])
-
-                    # 把剩余的放回队列
-                    if len(audio_data) > chunk_len:
-                        remaining = audio_data[chunk_len:]
-                        try:
-                            self.audio_queue.put(remaining, block=False)
-                        except queue.Full:
-                            pass
-                else:
-                    # 数据不够一个 chunk，等待累积
-                    try:
-                        self.audio_queue.put(audio_data, block=False)
-                    except queue.Full:
-                        pass
-
-                # 控制发送速率
-                time.sleep(chunk_ms / 1000.0)
+                accumulated += audio_data
+                queue_size = self.audio_queue.qsize()
+                if queue_size > 0 and queue_size % 20 == 0:
+                    logger.info(f"[{self.request_id}] Queue size: queue_size={queue_size}")
 
             except Exception as e:
                 logger.error(f"Error in send_audio_thread: {e}")
@@ -368,7 +369,33 @@ class BaiduRealtimeTranslationClient:
 
     def _on_close(self, ws, close_status_code, close_msg):
         """WebSocket 关闭"""
-        logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+        # 解析常见关闭码的含义
+        close_reasons = {
+            1000: "Normal closure",
+            1001: "Endpoint going away",
+            1002: "Protocol error",
+            1003: "Unsupported data",
+            1005: "No status received",
+            1006: "Abnormal closure (连接异常断开)",
+            1007: "Invalid frame payload data",
+            1008: "Policy violation",
+            1009: "Message too big",
+            1010: "Required extension missing",
+            1011: "Internal server error",
+            1012: "Service restart",
+            1013: "Try again later",
+        }
+        
+        reason = close_reasons.get(close_status_code, "Unknown")
+        hex_code = f"{close_status_code:04X}" if close_status_code is not None else "N/A"
+        logger.info(f"WebSocket closed: code={close_status_code} (0x{hex_code}), msg='{close_msg}', reason='{reason}'")
+        
+        # 如果是异常断开，记录更多调试信息
+        if close_status_code == 1006:
+            logger.warning(f"[{self.request_id}] Abnormal closure detected - possible network issue or server rejection")
+        elif close_status_code is None:
+            logger.warning(f"[{self.request_id}] Connection lost without close frame - possible network issue")
+            
         self.is_running = False
 
     def connect(self):
@@ -425,8 +452,14 @@ class BaiduRealtimeTranslationClient:
         if self.is_running:
             try:
                 self.audio_queue.put(audio_data, block=False)
+                queue_size = self.audio_queue.qsize()
+                # 每10个数据包打印一次队列大小变化
+                if queue_size % 10 == 0:
+                    logger.debug(f"[{self.request_id}] Audio queued: size={len(audio_data)} bytes, queue_size={queue_size}")
+                if queue_size > 400:  # 队列积压超过80%
+                    logger.warning(f"[{self.request_id}] Audio queue backlog: queue_size={queue_size}/500 (80%+)")
             except queue.Full:
-                logger.warning("Audio queue full, dropping audio")
+                logger.warning(f"[{self.request_id}] Audio queue FULL, dropping {len(audio_data)} bytes")
 
     def start(self):
         """启动连接"""
@@ -471,6 +504,12 @@ class RealtimeTranslationProcessor:
         self.client = None
         self._connected = False
         
+        # 保存配置
+        self.input_save_enabled = False
+        self.input_save_dir = "input_recordings"
+        self.tts_save_enabled = False
+        self.tts_save_dir = "tts_recordings"
+        
         # 回调函数（与 audio_translation_service_websocket.py 的期望一致）
         self.on_translation_callback = None  # 回调签名: callback(result: Dict)
         self.on_tts_callback = None         # 回调签名: callback(audio_data: bytes)
@@ -483,6 +522,8 @@ class RealtimeTranslationProcessor:
             enabled: 是否启用保存
             save_dir: 保存目录
         """
+        self.tts_save_enabled = enabled
+        self.tts_save_dir = save_dir
         if self.client:
             self.client.set_tts_save_config(enabled, save_dir)
 
@@ -494,6 +535,8 @@ class RealtimeTranslationProcessor:
             save_dir: 保存目录
         """
         logger.info(f"RealtimeTranslationProcessor.set_input_save_config called: enabled={enabled}, save_dir={save_dir}")
+        self.input_save_enabled = enabled
+        self.input_save_dir = save_dir
         if self.client:
             self.client.set_input_save_config(enabled, save_dir)
 
@@ -513,6 +556,12 @@ class RealtimeTranslationProcessor:
             self.client.set_translation_callback(self._on_translation)
             self.client.set_tts_audio_callback(self._on_tts_audio)
             self.client.set_error_callback(self._on_error)
+            
+            # 应用保存配置
+            if self.input_save_enabled:
+                self.client.set_input_save_config(self.input_save_enabled, self.input_save_dir)
+            if self.tts_save_enabled:
+                self.client.set_tts_save_config(self.tts_save_enabled, self.tts_save_dir)
             
             # 启动连接
             self.client.start()

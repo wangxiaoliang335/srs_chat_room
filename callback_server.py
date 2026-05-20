@@ -500,6 +500,16 @@ def start_translation_service(request_id: str, room_id: str, source_user: str, t
             env['BAIDU_APP_ID'] = env_values['BAIDU_APP_ID']
         if env_values.get('BAIDU_APP_KEY'):
             env['BAIDU_APP_KEY'] = env_values['BAIDU_APP_KEY']
+        # 输入音频保存配置
+        if env_values.get('INPUT_SAVE_ENABLED'):
+            env['INPUT_SAVE_ENABLED'] = env_values['INPUT_SAVE_ENABLED']
+        if env_values.get('INPUT_SAVE_DIR'):
+            env['INPUT_SAVE_DIR'] = env_values['INPUT_SAVE_DIR']
+        # PCM 保存配置
+        if env_values.get('PCM_SAVE_ENABLED'):
+            env['PCM_SAVE_ENABLED'] = env_values['PCM_SAVE_ENABLED']
+        if env_values.get('PCM_SAVE_DIR'):
+            env['PCM_SAVE_DIR'] = env_values['PCM_SAVE_DIR']
     
     try:
         # WebSocket 翻译服务需要 Python 3.7+（requests 库要求）

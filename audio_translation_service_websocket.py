@@ -100,8 +100,8 @@ class RealtimeTranslationService:
         self._tts_save_dir = "tts_recordings"
         
         # 输入音频保存配置（发送给百度的原始语音）
-        self._input_save_enabled = False
-        self._input_save_dir = "input_recordings"
+        self._input_save_enabled = os.getenv("INPUT_SAVE_ENABLED", "false").lower() == "true"
+        self._input_save_dir = os.getenv("INPUT_SAVE_DIR", "input_recordings")
         
         # 统计数据
         self.stats = {
@@ -323,6 +323,42 @@ class AudioStreamProcessorWebSocket:
         self.last_audio_time = time.time()
         # 上次发送心跳的时间
         self.last_heartbeat_time = time.time()
+        
+        # PCM 保存配置（FFmpeg 转换后、发送给百度前）
+        self.pcm_save_enabled = os.getenv("PCM_SAVE_ENABLED", "true").lower() == "true"
+        self.pcm_save_dir = os.getenv("PCM_SAVE_DIR", "pcm_recordings")
+        self.pcm_save_file = None
+        if self.pcm_save_enabled:
+            os.makedirs(self.pcm_save_dir, exist_ok=True)
+    
+    def _start_new_pcm_file(self):
+        """创建新的 PCM 保存文件"""
+        if not self.pcm_save_enabled:
+            return
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        microseconds = int(time.time() * 1000000) % 1000000
+        filename = f"pcm_{timestamp}_{microseconds:06d}.pcm"
+        filepath = os.path.join(self.pcm_save_dir, filename)
+        self.pcm_save_file = open(filepath, 'wb')
+        logger.info(f"[{self.request_id}] Started PCM save: {filepath}")
+    
+    def _write_pcm_audio(self, audio_data: bytes):
+        """写入 PCM 音频数据到文件"""
+        if not self.pcm_save_enabled:
+            return
+        if not self.pcm_save_file:
+            self._start_new_pcm_file()
+        self.pcm_save_file.write(audio_data)
+    
+    def _close_pcm_file(self):
+        """关闭 PCM 保存文件"""
+        if self.pcm_save_file:
+            try:
+                self.pcm_save_file.close()
+                logger.info(f"[{self.request_id}] Closed PCM save file")
+            except Exception as e:
+                logger.warning(f"[{self.request_id}] Failed to close PCM save file: {e}")
+            self.pcm_save_file = None
     
     def _get_stream_vhost(self) -> str:
         """从 SRS API 获取流的 vhost"""
@@ -395,24 +431,28 @@ class AudioStreamProcessorWebSocket:
         # 使用动态获取的 vhost (格式: rtmp://ip:port/app?vhost=xxx/stream_key)
         rtmp_url = f"rtmp://127.0.0.1:1935/live?vhost={self.stream_vhost}/{self.room_id}_{self.source_user}"
         
-        # 尝试 RTMP 协议（更稳定）
-        # 优化：减少probesize和分析时间以加快启动速度
+        # 优化：增加线程数、减少分析开销、增大缓冲区
+        # 关键优化：
+        # - threads=4: 多线程解码，解决 speed 太慢的问题
+        # - 最小化 probesize/analyzeduration: 减少启动延迟
+        # - 禁用不必要的解码选项
         ffmpeg_input_cmd = [
             ffmpeg_bin,
+            "-threads", "4",              # 多线程解码，解决 speed 太慢的问题
             "-fflags", "nobuffer",
             "-flags", "low_delay",
             "-rtmp_live", "live",
-            "-analyzeduration", "100000",    # 减少到100ms
-            "-probesize", "100000",          # 减少到100KB
-            "-max_delay", "1000000",         # 减少到1s
-            "-flush_packets", "1",           # 立即刷新包
+            "-analyzeduration", "50000",  # 减少到50ms，加快启动
+            "-probesize", "50000",        # 减少到50KB
+            "-max_delay", "500000",        # 减少到0.5s
+            "-flush_packets", "1",
             "-i", rtmp_url,
             "-vn",
             "-acodec", "pcm_s16le",
             "-ar", str(self.sample_rate),
             "-ac", str(self.channels),
             "-f", "s16le",
-            "-thread_queue_size", "256",    # 减少队列大小
+            "-thread_queue_size", "512",  # 增大队列缓冲
             "-nostdin",
             "-y",
             "-"
@@ -620,6 +660,9 @@ class AudioStreamProcessorWebSocket:
                     if total_bytes_read <= 65536:
                         logger.info(f"[{self.request_id}] Received audio chunk: {len(audio_chunk)} bytes, total={total_bytes_read}")
                     
+                    # FFmpeg 转换后立即保存 PCM（发送给百度之前）
+                    self._write_pcm_audio(audio_chunk)
+                    
                     # 发送到实时翻译服务
                     if self.realtime_service:
                         self.realtime_service.add_audio(audio_chunk)
@@ -632,6 +675,9 @@ class AudioStreamProcessorWebSocket:
                 if self.is_running:
                     # FFmpeg 退出或出错，重启
                     logger.info(f"[{self.request_id}] Audio read loop ended, total={total_bytes_read} bytes, will retry...")
+                    
+                    # 关闭 PCM 文件
+                    self._close_pcm_file()
                     
                     # 清理资源，准备重试
                     if self.ffmpeg_process:
@@ -913,6 +959,9 @@ class AudioStreamProcessorWebSocket:
     def stop(self):
         """停止音频流处理"""
         self.is_running = False
+        
+        # 关闭 PCM 文件
+        self._close_pcm_file()
         
         if self.realtime_service:
             self.realtime_service.disconnect()

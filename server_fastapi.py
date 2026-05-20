@@ -653,6 +653,10 @@ def start_translation_service(request_id: str, srs_url: str):
     env['TARGET_USER'] = req.target_user
     env['STREAM_NAME'] = stream_name
     env['SRS_URL'] = srs_url
+    
+    # 输入音频保存配置
+    env['INPUT_SAVE_ENABLED'] = os.getenv('INPUT_SAVE_ENABLED', 'true')
+    env['INPUT_SAVE_DIR'] = os.getenv('INPUT_SAVE_DIR', 'input_recordings')
 
     try:
         log_file = f"translation_{request_id}.log"
