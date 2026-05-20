@@ -172,11 +172,13 @@ class BaiduRealtimeTranslationClient:
     def _write_tts_audio(self, audio_data: bytes):
         """写入 TTS 音频数据到文件"""
         if not self.tts_save_enabled or not self.tts_save_file:
-            return
+            return 0
         try:
             self.tts_save_file.write(audio_data)
+            return len(audio_data)
         except Exception as e:
             logger.error(f"[{self.request_id}] Error writing TTS audio: {e}")
+            return 0
 
     def _close_tts_file(self):
         """关闭当前的 TTS 保存文件"""
@@ -294,13 +296,19 @@ class BaiduRealtimeTranslationClient:
                     # TTS 播报报文，payload 是 MP3 格式
                     tts_audio = message[1:]
                     self.tts_audio_buffer += tts_audio
-                    logger.debug(f"Received TTS MP3: {len(tts_audio)} bytes")
-
+                    
                     # 保存到本地文件
-                    self._write_tts_audio(tts_audio)
-
+                    saved = self._write_tts_audio(tts_audio)
+                    
+                    # 触发回调
                     if self.on_tts_audio_callback:
-                        self.on_tts_audio_callback(tts_audio)
+                        try:
+                            self.on_tts_audio_callback(tts_audio)
+                            logger.info(f"[{self.request_id}] TTS callback triggered: {len(tts_audio)} bytes, saved={saved}")
+                        except Exception as e:
+                            logger.error(f"[{self.request_id}] TTS callback error: {e}")
+                    else:
+                        logger.warning(f"[{self.request_id}] TTS callback is None! Audio dropped: {len(tts_audio)} bytes")
                 else:
                     logger.warning(f"Unknown binary message type: 0x{tts_type:02x}")
 
