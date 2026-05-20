@@ -227,7 +227,7 @@ class BaiduRealtimeTranslationClient:
         # 16kHz * 2 bytes * 1 channel * 120ms / 1000 = 3840 字节
         chunk_ms = 120
         chunk_len = int(self.sample_rate * 2 * self.channels * chunk_ms / 1000)
-        logger.info(f"Audio send thread started: chunk_ms={chunk_ms}, chunk_len={chunk_len}")
+        logger.info(f"Audio send thread started 111: chunk_ms={chunk_ms}, chunk_len={chunk_len}")
 
         consecutive_empty = 0
 

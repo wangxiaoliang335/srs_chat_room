@@ -144,7 +144,7 @@ class RealtimeTranslationService:
         # 120ms 发送一次：3840 bytes / 120ms = 32KB/s，与采样率匹配
         chunk_ms = 120
         chunk_len = int(self.sample_rate * 2 * self.channels * chunk_ms / 1000)
-        logger.info(f"[{self.request_id}] Audio send thread started: chunk_ms={chunk_ms}, chunk_len={chunk_len}")
+        logger.info(f"[{self.request_id}] Audio send thread started 222: chunk_ms={chunk_ms}, chunk_len={chunk_len}")
 
         while self.is_running:
             try:
