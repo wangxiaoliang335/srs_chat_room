@@ -480,7 +480,7 @@ def start_translation_service(request_id: str, room_id: str, source_user: str, t
     env['TARGET_USER'] = target_user  # 添加目标用户
     env['STREAM_NAME'] = stream_name
     env['SRS_URL'] = SRS_URL
-    env['TEXT_SERVER_URL'] = os.getenv("TEXT_SERVER_URL", "http://localhost:8086")  # 文本推送服务地址
+    env['TEXT_SERVER_URL'] = os.getenv("TEXT_SERVER_URL", "http://localhost:8085")  # 文本推送服务地址
     
     # 从.env文件加载百度API密钥
     from dotenv import dotenv_values

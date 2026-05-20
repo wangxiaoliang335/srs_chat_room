@@ -94,6 +94,14 @@ class RealtimeTranslationService:
         
         # TTS 音频队列
         self.tts_queue = queue.Queue(maxsize=100)
+
+        # TTS 保存配置
+        self._tts_save_enabled = False
+        self._tts_save_dir = "tts_recordings"
+        
+        # 输入音频保存配置（发送给百度的原始语音）
+        self._input_save_enabled = False
+        self._input_save_dir = "input_recordings"
         
         # 统计数据
         self.stats = {
@@ -139,7 +147,31 @@ class RealtimeTranslationService:
         logger.error(f"[{self.request_id}] Translation error: code={code}, msg={msg}")
         # 标记需要重连
         self._needs_reconnect = True
-    
+
+    def set_tts_save_config(self, enabled: bool, save_dir: str = "tts_recordings"):
+        """配置 TTS 音频保存
+
+        Args:
+            enabled: 是否启用保存
+            save_dir: 保存目录
+        """
+        self._tts_save_enabled = enabled
+        self._tts_save_dir = save_dir
+        if self.processor:
+            self.processor.set_tts_save_config(enabled, save_dir)
+
+    def set_input_save_config(self, enabled: bool, save_dir: str = "input_recordings"):
+        """配置输入音频保存（发送给百度的原始语音）
+
+        Args:
+            enabled: 是否启用保存
+            save_dir: 保存目录
+        """
+        self._input_save_enabled = enabled
+        self._input_save_dir = save_dir
+        if self.processor:
+            self.processor.set_input_save_config(enabled, save_dir)
+
     def connect(self) -> bool:
         """连接到百度实时翻译服务"""
         self.processor = RealtimeTranslationProcessor(
@@ -156,7 +188,15 @@ class RealtimeTranslationService:
         self.processor.on_translation_callback = self._on_translation_result
         self.processor.on_tts_callback = self._on_tts_audio
         self.processor.on_error_callback = self._on_error
+
+        # 应用 TTS 保存配置
+        if self._tts_save_enabled:
+            self.processor.set_tts_save_config(True, self._tts_save_dir)
         
+        # 应用输入音频保存配置
+        if self._input_save_enabled:
+            self.processor.set_input_save_config(True, self._input_save_dir)
+
         if not self.processor.connect():
             logger.error(f"[{self.request_id}] Failed to connect to Baidu realtime translation")
             return False
@@ -217,7 +257,7 @@ class RealtimeTranslationService:
         """推送翻译文本给客户端"""
         target_user = os.getenv("TARGET_USER", "")
         room_id = os.getenv("ROOM_ID", "")
-        text_server_url = os.getenv("TEXT_SERVER_URL", "http://localhost:8086")
+        text_server_url = os.getenv("TEXT_SERVER_URL", "http://localhost:8085")
         
         if not target_user:
             return
@@ -352,8 +392,8 @@ class AudioStreamProcessorWebSocket:
         """启动 FFmpeg 输入进程"""
         ffmpeg_bin = os.environ.get("FFMPEG_BIN", "/usr/bin/ffmpeg")
         
-        # 使用动态获取的 vhost
-        rtmp_url = f"rtmp://127.0.0.1:1935/live/{self.room_id}_{self.source_user}?vhost={self.stream_vhost}"
+        # 使用动态获取的 vhost (格式: rtmp://ip:port/app?vhost=xxx/stream_key)
+        rtmp_url = f"rtmp://127.0.0.1:1935/live?vhost={self.stream_vhost}/{self.room_id}_{self.source_user}"
         
         # 尝试 RTMP 协议（更稳定）
         # 优化：减少probesize和分析时间以加快启动速度
@@ -452,7 +492,17 @@ class AudioStreamProcessorWebSocket:
                         return_tts=True,
                         tts_speaker="woman"
                     )
-                    
+
+                    # 启用 TTS 音频保存
+                    tts_save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts_recordings")
+                    self.realtime_service.set_tts_save_config(enabled=True, save_dir=tts_save_dir)
+                    logger.info(f"[{self.request_id}] TTS recording enabled: {tts_save_dir}")
+
+                    # 启用输入音频保存
+                    input_save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input_recordings")
+                    self.realtime_service.set_input_save_config(enabled=True, save_dir=input_save_dir)
+                    logger.info(f"[{self.request_id}] Input recording enabled: {input_save_dir}")
+
                     if not self.realtime_service.connect():
                         logger.error(f"[{self.request_id}] Failed to connect to Baidu realtime service")
                         time.sleep(retry_interval)
@@ -499,7 +549,15 @@ class AudioStreamProcessorWebSocket:
                             return_tts=True,
                             tts_speaker="woman"
                         )
-                        
+
+                        # 启用 TTS 音频保存
+                        tts_save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts_recordings")
+                        self.realtime_service.set_tts_save_config(enabled=True, save_dir=tts_save_dir)
+
+                        # 启用输入音频保存
+                        input_save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input_recordings")
+                        self.realtime_service.set_input_save_config(enabled=True, save_dir=input_save_dir)
+
                         if not self.realtime_service.connect():
                             logger.error(f"[{self.request_id}] Baidu reconnection failed")
                             time.sleep(0.5)  # 减少重连延迟
@@ -558,6 +616,10 @@ class AudioStreamProcessorWebSocket:
                     total_bytes_read += len(audio_chunk)
                     last_audio_time = current_time
                     
+                    # 调试：检查音频数据内容
+                    if total_bytes_read <= 65536:
+                        logger.info(f"[{self.request_id}] Received audio chunk: {len(audio_chunk)} bytes, total={total_bytes_read}")
+                    
                     # 发送到实时翻译服务
                     if self.realtime_service:
                         self.realtime_service.add_audio(audio_chunk)
@@ -604,13 +666,12 @@ class AudioStreamProcessorWebSocket:
         
         # 使用标准 RTMP URL 格式: rtmp://host/vhost/app/stream
         # 注意: vhost 名称需要与 SRS 配置一致
-        # 使用与源流相同的 vhost
-        vhost = getattr(self, 'stream_vhost', '__defaultVhost__')
-        # 如果是 vid-xxx 格式，保留原样，因为 SRS 配置中就是这样的 vhost
-        # __defaultVhost__ 用于没有特定vhost的场景
+        # 翻译流始终使用 __defaultVhost__，因为只有它配置了 http_remux
+        vhost = "__defaultVhost__"
         # 流名称添加 .flv 后缀，因为客户端通过 HTTP-FLV 播放，需要带 .flv 扩展名
         output_stream_name = f"{self.stream_name}.flv"
-        rtmp_url = f"rtmp://{srs_host}:{srs_port}/live/{output_stream_name}?vhost={vhost}"
+        # RTMP URL 格式: rtmp://ip:port/app?vhost=xxx/stream_key
+        rtmp_url = f"rtmp://{srs_host}:{srs_port}/live?vhost={vhost}/{output_stream_name}"
         logger.info(f"[{self.request_id}] TTS output stream: {rtmp_url}")
 
         # FFmpeg 命令（接收 MP3 音频）
@@ -626,9 +687,12 @@ class AudioStreamProcessorWebSocket:
             "-c:a", "aac",           # 转码为 AAC
             "-b:a", "64k",
             "-f", "flv",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-max_delay", "5000000",  # 最大延迟 5 秒
             "-reconnect", "1",        # 自动重连
             "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "2",
+            "-reconnect_delay_max", "5",
             rtmp_url
         ]
         

@@ -57,8 +57,8 @@ class TranslationManager:
         
         # 心跳超时配置（秒）
         self.heartbeat_timeout = 15  # 拉流者心跳超时时间
-        self.source_stream_timeout = 300  # 源流检测超时时间（5分钟）
-        self.no_puller_stop_delay = 300  # 无拉流者多久后停止翻译（5分钟）
+        self.source_stream_timeout = 1800  # 源流检测超时时间（30分钟）
+        self.no_puller_stop_delay = 300  # 无拉流者多久后停止翻译（已废弃，不再使用）
         
         logger.info("[TranslationManager] Initialized with fault tolerance support")
 
@@ -363,13 +363,9 @@ class TranslationManager:
                         needs_stop = True
                         cleanup_info["stop_reason"] = "source_stream_timeout"
                 
-                # 条件B: 没有拉流者了
-                if not needs_stop and len(request.pullers) == 0:
-                    if request._no_puller_since is None:
-                        request._no_puller_since = now
-                    elif now - request._no_puller_since > self.no_puller_stop_delay:
-                        needs_stop = True
-                        cleanup_info["stop_reason"] = "no_pullers_timeout"
+                # 注意：不再因为无拉流者而停止翻译
+                # 翻译流应该一直存在，直到源流停止才停止
+                # 这样客户端可以随时连接播放
                 
                 if needs_stop and request.status != TranslationStatus.STOPPED:
                     request.status = TranslationStatus.STOPPED

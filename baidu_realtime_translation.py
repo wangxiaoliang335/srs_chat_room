@@ -14,6 +14,7 @@ import threading
 import time
 import queue
 from typing import Optional, Dict, Any, Callable
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +55,21 @@ class BaiduRealtimeTranslationClient:
         # TTS 音频数据缓冲
         self.tts_audio_buffer = b""
 
+        # TTS 音频保存设置
+        self.tts_save_dir = "tts_recordings"
+        self.tts_save_enabled = False
+        self.tts_save_file = None
+        self.tts_save_count = 0
+
+        # 输入音频保存设置（发送给百度的原始语音）
+        self.input_save_dir = "input_recordings"
+        self.input_save_enabled = False
+        self.input_save_file = None
+        self.input_save_count = 0
+
+        # 请求标识（用于日志）
+        self.request_id = "baidu"
+
         # 音频数据队列（外部放入，WebSocket 线程发送）
         # 增大队列以避免丢包：500 * 3840字节 ≈ 75秒缓冲
         self.audio_queue = queue.Queue(maxsize=500)
@@ -81,6 +97,98 @@ class BaiduRealtimeTranslationClient:
             callback: 回调函数，签名: callback(error_msg: str)
         """
         self.on_error_callback = callback
+
+    def set_tts_save_config(self, enabled: bool, save_dir: str = "tts_recordings"):
+        """配置 TTS 音频保存
+
+        Args:
+            enabled: 是否启用保存
+            save_dir: 保存目录
+        """
+        self.tts_save_enabled = enabled
+        self.tts_save_dir = save_dir
+        if enabled and not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
+            logger.info(f"Created TTS save directory: {save_dir}")
+
+    def set_input_save_config(self, enabled: bool, save_dir: str = "input_recordings"):
+        """配置输入音频保存（发送给百度的原始语音）
+
+        Args:
+            enabled: 是否启用保存
+            save_dir: 保存目录
+        """
+        self.input_save_enabled = enabled
+        self.input_save_dir = save_dir
+        if enabled and not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
+            logger.info(f"Created input save directory: {save_dir}")
+
+    def _start_new_input_file(self):
+        """开始一个新的输入音频保存文件"""
+        if not self.input_save_enabled:
+            return
+        self.input_save_count += 1
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"input_{timestamp}.pcm"
+        filepath = os.path.join(self.input_save_dir, filename)
+        self.input_save_file = open(filepath, 'wb')
+        logger.info(f"[{self.request_id}] Started input save: {filepath}")
+
+    def _write_input_audio(self, audio_data: bytes):
+        """写入输入音频数据到文件"""
+        if not self.input_save_enabled:
+            return
+        if not self.input_save_file:
+            self._start_new_input_file()
+        try:
+            self.input_save_file.write(audio_data)
+        except Exception as e:
+            logger.error(f"[{self.request_id}] Error writing input audio: {e}")
+
+    def _close_input_file(self):
+        """关闭当前的输入音频保存文件"""
+        if not self.input_save_enabled or not self.input_save_file:
+            return
+        try:
+            if self.input_save_file:
+                self.input_save_file.close()
+                logger.info(f"[{self.request_id}] Input file saved: {self.input_save_file.name}")
+                self.input_save_file = None
+        except Exception as e:
+            logger.error(f"[{self.request_id}] Error closing input file: {e}")
+
+    def _start_new_tts_file(self):
+        """开始一个新的 TTS 保存文件"""
+        if not self.tts_save_enabled:
+            return
+        self.tts_save_count += 1
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"tts_{timestamp}.mp3"
+        filepath = os.path.join(self.tts_save_dir, filename)
+        self.tts_save_file = open(filepath, 'wb')
+        logger.info(f"[{self.request_id}] Started TTS save: {filepath}")
+
+    def _write_tts_audio(self, audio_data: bytes):
+        """写入 TTS 音频数据到文件"""
+        if not self.tts_save_enabled or not self.tts_save_file:
+            return
+        try:
+            self.tts_save_file.write(audio_data)
+        except Exception as e:
+            logger.error(f"[{self.request_id}] Error writing TTS audio: {e}")
+
+    def _close_tts_file(self):
+        """关闭当前的 TTS 保存文件"""
+        if not self.tts_save_enabled or not self.tts_save_file:
+            return
+        try:
+            if self.tts_save_file:
+                self.tts_save_file.close()
+                logger.info(f"[{self.request_id}] TTS file saved: {self.tts_save_file.name}")
+                self.tts_save_file = None
+        except Exception as e:
+            logger.error(f"[{self.request_id}] Error closing TTS file: {e}")
 
     def _get_start_frame(self) -> Dict[str, Any]:
         """获取开始帧"""
@@ -180,6 +288,9 @@ class BaiduRealtimeTranslationClient:
                     self.tts_audio_buffer += tts_audio
                     logger.debug(f"Received TTS MP3: {len(tts_audio)} bytes")
 
+                    # 保存到本地文件
+                    self._write_tts_audio(tts_audio)
+
                     if self.on_tts_audio_callback:
                         self.on_tts_audio_callback(tts_audio)
                 else:
@@ -206,6 +317,9 @@ class BaiduRealtimeTranslationClient:
                             sentence = result_obj.get("sentence", "")
                             sentence_trans = result_obj.get("sentence_trans", "")
 
+                            # 每收到最终结果，开启新的TTS保存文件
+                            self._start_new_tts_file()
+
                             if sentence_trans:
                                 logger.info(f"Translation [{result_type}]: '{sentence}' -> '{sentence_trans}'")
                                 if self.on_translation_callback:
@@ -225,6 +339,9 @@ class BaiduRealtimeTranslationClient:
                                     )
 
                     elif status == "END":
+                        # 会话结束，关闭TTS文件和输入文件
+                        self._close_tts_file()
+                        self._close_input_file()
                         logger.info("Session ended")
 
                 elif result.get("code") != 0:
@@ -299,6 +416,10 @@ class BaiduRealtimeTranslationClient:
             audio_data: PCM 音频数据（二进制）
         """
         if self.is_running:
+            # 保存输入音频（在放入队列前保存）
+            if self.input_save_enabled:
+                self._write_input_audio(audio_data)
+            
             try:
                 self.audio_queue.put(audio_data, block=False)
             except queue.Full:
@@ -352,6 +473,27 @@ class RealtimeTranslationProcessor:
         self.on_tts_callback = None         # 回调签名: callback(audio_data: bytes)
         self.on_error_callback = None       # 回调签名: callback(code: int, msg: str)
     
+    def set_tts_save_config(self, enabled: bool, save_dir: str = "tts_recordings"):
+        """配置 TTS 音频保存
+
+        Args:
+            enabled: 是否启用保存
+            save_dir: 保存目录
+        """
+        if self.client:
+            self.client.set_tts_save_config(enabled, save_dir)
+
+    def set_input_save_config(self, enabled: bool, save_dir: str = "input_recordings"):
+        """配置输入音频保存（发送给百度的原始语音）
+
+        Args:
+            enabled: 是否启用保存
+            save_dir: 保存目录
+        """
+        logger.info(f"RealtimeTranslationProcessor.set_input_save_config called: enabled={enabled}, save_dir={save_dir}")
+        if self.client:
+            self.client.set_input_save_config(enabled, save_dir)
+
     def connect(self) -> bool:
         """建立连接"""
         try:
