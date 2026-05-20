@@ -253,6 +253,7 @@ class BaiduRealtimeTranslationClient:
                     self.ws.send(audio_data[:chunk_len], websocket.ABNF.OPCODE_BINARY)
 
                     # 发送成功后才保存到本地
+                    logger.info(f"input_save_enabled={self.input_save_enabled}")
                     if self.input_save_enabled:
                         logger.info(f"Saving to local: chunk_len={chunk_len}, audio_size={len(audio_data[:chunk_len])}")
                         self._write_input_audio(audio_data[:chunk_len])
