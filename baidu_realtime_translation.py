@@ -251,6 +251,11 @@ class BaiduRealtimeTranslationClient:
                 if len(audio_data) >= chunk_len:
                     # 发送完整的 chunk
                     self.ws.send(audio_data[:chunk_len], websocket.ABNF.OPCODE_BINARY)
+
+                    # 发送成功后才保存到本地
+                    if self.input_save_enabled:
+                        self._write_input_audio(audio_data[:chunk_len])
+
                     # 把剩余的放回队列
                     if len(audio_data) > chunk_len:
                         remaining = audio_data[chunk_len:]
@@ -416,10 +421,6 @@ class BaiduRealtimeTranslationClient:
             audio_data: PCM 音频数据（二进制）
         """
         if self.is_running:
-            # 保存输入音频（在放入队列前保存）
-            if self.input_save_enabled:
-                self._write_input_audio(audio_data)
-            
             try:
                 self.audio_queue.put(audio_data, block=False)
             except queue.Full:
