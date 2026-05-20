@@ -138,8 +138,14 @@ class RealtimeTranslationService:
         # 将 TTS 音频放入队列
         try:
             self.tts_queue.put_nowait(audio_data)
+            queue_size = self.tts_queue.qsize()
+            # 每10个TTS包打印一次队列状态
+            if self.stats["tts_received"] % 10 == 0:
+                logger.info(f"[{self.request_id}] TTS received: size={len(audio_data)} bytes, queue_size={queue_size}")
+            if queue_size > 80:  # 队列积压超过80%
+                logger.warning(f"[{self.request_id}] TTS queue backlog: queue_size={queue_size}/100 (80%+)")
         except queue.Full:
-            logger.warning(f"[{self.request_id}] TTS queue full, dropping audio")
+            logger.warning(f"[{self.request_id}] TTS queue FULL, dropping {len(audio_data)} bytes")
     
     def _on_error(self, code: int, msg: str):
         """错误回调"""
@@ -862,8 +868,9 @@ class AudioStreamProcessorWebSocket:
                     realtime_connected = self.realtime_service.is_connected() if self.realtime_service else False
                     output_running = self.output_process.poll() is None if self.output_process else False
                     output_exists = self.output_process is not None
-                    tts_queue_size = len(self.realtime_service._tts_queue) if self.realtime_service and hasattr(self.realtime_service, '_tts_queue') else 0
-                    logger.info(f"[{self.request_id}] TTS Status: realtime_connected={realtime_connected}, output_exists={output_exists}, output_running={output_running}, tts_queue_size={tts_queue_size}")
+                    tts_queue_size = self.realtime_service.tts_queue.qsize() if self.realtime_service else 0
+                    queue_warning = " [WARNING: queue backlog!]" if tts_queue_size > 80 else ""
+                    logger.info(f"[{self.request_id}] TTS Status: realtime_connected={realtime_connected}, output_exists={output_exists}, output_running={output_running}, tts_queue_size={tts_queue_size}{queue_warning}")
                 
                 # 写入音频数据
                 if tts_audio:
@@ -879,7 +886,11 @@ class AudioStreamProcessorWebSocket:
                                 audio_processed = getattr(self, '_audio_processed', 0) + len(tts_audio)
                                 setattr(self, '_audio_processed', audio_processed)
                                 
-                                logger.info(f"[{self.request_id}] TTS audio written to FFmpeg: {len(tts_audio)} bytes, total_processed={audio_processed}")
+                                # 减少日志频率，每10个TTS包打印一次
+                                tts_write_count = getattr(self, '_tts_write_count', 0) + 1
+                                setattr(self, '_tts_write_count', tts_write_count)
+                                if tts_write_count % 10 == 0:
+                                    logger.info(f"[{self.request_id}] TTS written: size={len(tts_audio)} bytes, total={audio_processed}, writes={tts_write_count}")
                             else:
                                 logger.warning(f"[{self.request_id}] FFmpeg stdin invalid: stdin={stdin_valid}, running={process_running}")
                         except (BrokenPipeError, OSError, IOError) as e:
