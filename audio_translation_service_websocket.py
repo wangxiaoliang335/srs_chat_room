@@ -21,6 +21,7 @@ import queue
 import time
 import signal
 import fcntl
+import select
 import requests
 from typing import Optional, Dict, Any
 
@@ -733,8 +734,9 @@ class AudioStreamProcessorWebSocket:
         ffmpeg_output_cmd = [
             ffmpeg_bin,
             "-hide_banner",           # 隐藏 banner 信息
-            "-loglevel", "error",     # 只显示错误
+            "-loglevel", "info",     # 改为 info 以便查看更多日志
             "-i", "-",               # 从 stdin 读取，让 FFmpeg 自动检测格式
+            "-rw_timeout", "10000000",  # IO 超时 10 秒（微秒）- 更快检测连接问题
             "-af", "aresample=16000:filter_size=64:cutoff=0.95,pan=mono|c0=c0",  # 强制重采样为 16kHz 单声道
             "-c:a", "aac",           # 转码为 AAC
             "-b:a", "64k",
@@ -784,6 +786,8 @@ class AudioStreamProcessorWebSocket:
                     # 记录重试信息
                     if retry_count > 0:
                         logger.info(f"[{self.request_id}] FFmpeg restart attempt {retry_count}/{max_retries}, elapsed={elapsed:.1f}s")
+                        if stderr_text:
+                            logger.info(f"[{self.request_id}] Previous FFmpeg stderr: {stderr_text[:300]}")
                     
                     retry_count += 1
                     stderr_buffer = []
@@ -797,6 +801,12 @@ class AudioStreamProcessorWebSocket:
                             bufsize=0
                         )
                         
+                        # 设置 stdin 为非阻塞模式
+                        import errno
+                        stdin_fd = self.output_process.stdin.fileno()
+                        flags = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
+                        fcntl.fcntl(stdin_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                        
                         # 启动 stderr 读取线程
                         stderr_thread = threading.Thread(
                             target=self._read_ffmpeg_stderr,
@@ -806,6 +816,9 @@ class AudioStreamProcessorWebSocket:
                         stderr_thread.start()
                         
                         logger.info(f"[{self.request_id}] FFmpeg output started, PID={self.output_process.pid}")
+                        
+                        # 记录 FFmpeg 启动时间，用于诊断
+                        self._ffmpeg_last_start_time = time.time()
                     except Exception as e:
                         logger.error(f"[{self.request_id}] Failed to start FFmpeg: {e}")
                         time.sleep(retry_interval)
@@ -870,7 +883,13 @@ class AudioStreamProcessorWebSocket:
                     output_exists = self.output_process is not None
                     tts_queue_size = self.realtime_service.tts_queue.qsize() if self.realtime_service else 0
                     queue_warning = " [WARNING: queue backlog!]" if tts_queue_size > 80 else ""
-                    logger.info(f"[{self.request_id}] TTS Status: realtime_connected={realtime_connected}, output_exists={output_exists}, output_running={output_running}, tts_queue_size={tts_queue_size}{queue_warning}")
+                    
+                    # 追踪 FFmpeg 进程状态
+                    ffmpeg_age = ""
+                    if hasattr(self, '_ffmpeg_last_start_time'):
+                        ffmpeg_age = f", ffmpeg_age={current_time - self._ffmpeg_last_start_time:.1f}s"
+                    
+                    logger.info(f"[{self.request_id}] TTS Status: realtime_connected={realtime_connected}, output_exists={output_exists}, output_running={output_running}, tts_queue_size={tts_queue_size}{queue_warning}{ffmpeg_age}")
                 
                 # 写入音频数据
                 if tts_audio:
@@ -880,8 +899,23 @@ class AudioStreamProcessorWebSocket:
                             process_running = self.output_process.poll() is None
                             
                             if stdin_valid and process_running:
-                                self.output_process.stdin.write(tts_audio)
-                                self.output_process.stdin.flush()
+                                try:
+                                    # 非阻塞写入，如果管道满会抛出 EAGAIN
+                                    self.output_process.stdin.write(tts_audio)
+                                    self.output_process.stdin.flush()
+                                except (BrokenPipeError, OSError, IOError) as write_err:
+                                    import errno
+                                    if isinstance(write_err, OSError) and getattr(write_err, 'errno', None) == errno.EAGAIN:
+                                        logger.error(f"[{self.request_id}] FFmpeg stdin buffer full, restarting...")
+                                    else:
+                                        logger.error(f"[{self.request_id}] Broken pipe/IO error writing to FFmpeg: {write_err}")
+                                    if self.output_process:
+                                        try:
+                                            self.output_process.terminate()
+                                        except:
+                                            pass
+                                    self.output_process = None
+                                    break
                                 
                                 audio_processed = getattr(self, '_audio_processed', 0) + len(tts_audio)
                                 setattr(self, '_audio_processed', audio_processed)
@@ -901,14 +935,30 @@ class AudioStreamProcessorWebSocket:
                                 except:
                                     pass
                             self.output_process = None
+                            # 立即退出循环以重启 FFmpeg
+                            break
                     else:
                         # FFmpeg 进程不存在或已退出，打印诊断信息
                         if not self.output_process:
                             logger.warning(f"[{self.request_id}] FFmpeg output process is None (TTS audio dropped: {len(tts_audio)} bytes)")
                         elif self.output_process.poll() is not None:
                             logger.warning(f"[{self.request_id}] FFmpeg output process exited with code: {self.output_process.poll()} (TTS audio dropped: {len(tts_audio)} bytes)")
-                else:
-                    # 没有 TTS 音频时短暂休眠
+                
+                # 定期检查 FFmpeg 进程状态（每 30 秒）
+                if not hasattr(self, '_last_ffmpeg_check_time'):
+                    self._last_ffmpeg_check_time = time.time()
+                current_time = time.time()
+                if current_time - self._last_ffmpeg_check_time >= 30.0:
+                    self._last_ffmpeg_check_time = current_time
+                    if self.output_process:
+                        poll_result = self.output_process.poll()
+                        if poll_result is not None:
+                            logger.error(f"[{self.request_id}] FFmpeg output process unexpectedly exited with code: {poll_result}, will restart")
+                            # 退出循环以重启 FFmpeg
+                            break
+                
+                # 没有 TTS 音频时短暂休眠
+                if not tts_audio:
                     time.sleep(0.01)
             
             # 正常退出时打印统计
