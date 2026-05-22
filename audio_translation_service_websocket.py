@@ -23,9 +23,38 @@ import signal
 import fcntl
 import select
 import requests
+import errno
 from typing import Optional, Dict, Any
 
 from baidu_realtime_translation import BaiduRealtimeTranslationClient, RealtimeTranslationProcessor
+
+def check_process_alive(process: subprocess.Popen) -> bool:
+    """正确检测子进程是否存活（包括正确识别僵尸进程）"""
+    if process is None:
+        return False
+    # 使用 os.waitpid 检测僵尸进程，WNOHANG 表示非阻塞
+    try:
+        pid, status = os.waitpid(process.pid, os.WNOHANG)
+        if pid == 0:
+            # 进程还在运行
+            return True
+        else:
+            # 进程已退出（僵尸进程或已回收）
+            # 如果还没有回收，设置 returncode
+            if process.returncode is None:
+                if os.WIFEXITED(status):
+                    process._returncode = os.WEXITSTATUS(status)
+                elif os.WIFSIGNALED(status):
+                    process._returncode = -os.WTERMSIG(status)
+            return False
+    except ChildProcessError:
+        # 进程不存在
+        return False
+    except OSError as e:
+        if e.errno == errno.ECHILD:
+            # 没有这个子进程
+            return False
+        raise
 
 # 配置日志：同时输出到控制台和文件
 log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audio_translation_websocket.log')
@@ -775,7 +804,7 @@ class AudioStreamProcessorWebSocket:
                     retry_count = 0
                 
                 # 检查是否需要启动/重启 ffmpeg
-                if not self.output_process or self.output_process.poll() is not None:
+                if not self.output_process or not check_process_alive(self.output_process):
                     # 关闭之前的进程（如果存在）
                     if self.output_process:
                         try:
@@ -827,9 +856,12 @@ class AudioStreamProcessorWebSocket:
                 
                 # 检查 FFmpeg 进程状态
                 if self.output_process:
-                    poll_result = self.output_process.poll()
-                    
-                    # 如果进程已退出
+                    # 先用 check_process_alive 检测，避免僵尸进程问题
+                    if not check_process_alive(self.output_process):
+                        # 进程已退出，获取退出码
+                        poll_result = self.output_process.poll()
+                        
+                        # 如果进程已退出
                     if poll_result is not None:
                         # 获取 stderr 内容
                         if stderr_thread:
@@ -886,7 +918,7 @@ class AudioStreamProcessorWebSocket:
                 if current_time - self._last_tts_diag_time >= 2.0:
                     self._last_tts_diag_time = current_time
                     realtime_connected = self.realtime_service.is_connected() if self.realtime_service else False
-                    output_running = self.output_process.poll() is None if self.output_process else False
+                    output_running = check_process_alive(self.output_process) if self.output_process else False
                     output_exists = self.output_process is not None
                     tts_queue_size = self.realtime_service.tts_queue.qsize() if self.realtime_service else 0
                     queue_warning = " [WARNING: queue backlog!]" if tts_queue_size > 80 else ""
@@ -900,9 +932,9 @@ class AudioStreamProcessorWebSocket:
                 
                 # 写入音频数据
                 if tts_audio:
-                    if self.output_process and self.output_process.poll() is None:
+                    if self.output_process and check_process_alive(self.output_process):
                         stdin_valid = self.output_process.stdin is not None
-                        process_running = self.output_process.poll() is None
+                        process_running = check_process_alive(self.output_process)
                         
                         if stdin_valid and process_running:
                             # 使用 select 检测管道是否可写（100ms超时）
@@ -944,9 +976,9 @@ class AudioStreamProcessorWebSocket:
                             else:
                                 # 管道不可写，FFmpeg 缓冲区满或进程阻塞
                                 logger.warning(f"[{self.request_id}] FFmpeg stdin not writable (select returned False), checking process...")
-                                # 检查进程是否还在运行
-                                poll_result = self.output_process.poll()
-                                if poll_result is not None:
+                                # 检查进程是否还在运行（使用 check_process_alive 避免僵尸进程问题）
+                                if not check_process_alive(self.output_process):
+                                    poll_result = self.output_process.poll() if self.output_process else None
                                     logger.error(f"[{self.request_id}] FFmpeg process died with code {poll_result}, will restart")
                                     self.output_process = None
                                     break
@@ -969,8 +1001,9 @@ class AudioStreamProcessorWebSocket:
                         # FFmpeg 进程不存在或已退出，打印诊断信息
                         if not self.output_process:
                             logger.warning(f"[{self.request_id}] FFmpeg output process is None (TTS audio dropped: {len(tts_audio)} bytes)")
-                        elif self.output_process.poll() is not None:
-                            logger.warning(f"[{self.request_id}] FFmpeg output process exited with code: {self.output_process.poll()} (TTS audio dropped: {len(tts_audio)} bytes)")
+                        elif not check_process_alive(self.output_process):
+                            poll_result = self.output_process.poll()
+                            logger.warning(f"[{self.request_id}] FFmpeg output process exited with code: {poll_result} (TTS audio dropped: {len(tts_audio)} bytes)")
                         # 重置不可写计数器
                         if hasattr(self, '_not_writable_count'):
                             delattr(self, '_not_writable_count')
@@ -981,12 +1014,11 @@ class AudioStreamProcessorWebSocket:
                 current_time = time.time()
                 if current_time - self._last_ffmpeg_check_time >= 30.0:
                     self._last_ffmpeg_check_time = current_time
-                    if self.output_process:
+                    if self.output_process and not check_process_alive(self.output_process):
                         poll_result = self.output_process.poll()
-                        if poll_result is not None:
-                            logger.error(f"[{self.request_id}] FFmpeg output process unexpectedly exited with code: {poll_result}, will restart")
-                            # 退出循环以重启 FFmpeg
-                            break
+                        logger.error(f"[{self.request_id}] FFmpeg output process unexpectedly exited with code: {poll_result}, will restart")
+                        # 退出循环以重启 FFmpeg
+                        break
                 
                 # 没有 TTS 音频时短暂休眠
                 if not tts_audio:
@@ -1024,8 +1056,8 @@ class AudioStreamProcessorWebSocket:
                     except (OSError, ValueError):
                         break
                 else:
-                    # 超时，检查进程是否还在运行
-                    if self.output_process and self.output_process.poll() is not None:
+                    # 超时，检查进程是否还在运行（使用 check_process_alive 避免僵尸进程问题）
+                    if self.output_process and not check_process_alive(self.output_process):
                         # 进程已退出，尝试读取剩余的 stderr
                         try:
                             import fcntl
