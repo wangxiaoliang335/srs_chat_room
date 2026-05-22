@@ -907,6 +907,14 @@ class AudioStreamProcessorWebSocket:
                         if stdin_valid and process_running:
                             # 使用 select 检测管道是否可写（100ms超时）
                             _, writable, _ = select.select([], [self.output_process.stdin], [], 0.1)
+                            
+                            # 每5秒打印一次 select 状态
+                            if not hasattr(self, '_last_select_log_time'):
+                                self._last_select_log_time = time.time()
+                            if current_time - self._last_select_log_time >= 5.0:
+                                self._last_select_log_time = current_time
+                                logger.info(f"[{self.request_id}] Select status: writable={bool(writable)}, ffmpeg_age={current_time - getattr(self, '_ffmpeg_last_start_time', current_time):.1f}s")
+                            
                             if writable:
                                 try:
                                     self.output_process.stdin.write(tts_audio)
@@ -923,6 +931,10 @@ class AudioStreamProcessorWebSocket:
                                 
                                 audio_processed = getattr(self, '_audio_processed', 0) + len(tts_audio)
                                 setattr(self, '_audio_processed', audio_processed)
+                                
+                                # 重置不可写计数
+                                if hasattr(self, '_not_writable_count'):
+                                    delattr(self, '_not_writable_count')
                                 
                                 # 减少日志频率，每10个TTS包打印一次
                                 tts_write_count = getattr(self, '_tts_write_count', 0) + 1
