@@ -906,7 +906,27 @@ class AudioStreamProcessorWebSocket:
                 # 获取 TTS 音频
                 tts_audio = None
                 if self.realtime_service:
-                    tts_audio = self.realtime_service.get_tts_audio(timeout=0.1)
+                    # 检查百度连接状态
+                    baidu_connected = self.realtime_service.is_connected()
+                    
+                    # 如果百度断开了，使用静音数据保持推流
+                    if not baidu_connected:
+                        # 生成静音 MP3 数据（如果还没有的话）
+                        if not hasattr(self, '_silent_mp3'):
+                            # 生成 1 秒静音 MP3（16kHz AAC 编码约 2KB）
+                            import subprocess
+                            result = subprocess.run([
+                                '/usr/bin/ffmpeg', '-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono',
+                                '-t', '1', '-c:a', 'libmp3lame', '-b:a', '16k', '-f', 'mp3', '-'
+                            ], capture_output=True, timeout=5)
+                            self._silent_mp3 = result.stdout if result.returncode == 0 else b''
+                            self._silent_mp3_len = len(self._silent_mp3)
+                        # 使用静音数据
+                        tts_audio = self._silent_mp3
+                    else:
+                        tts_audio = self.realtime_service.get_tts_audio(timeout=0.1)
+                else:
+                    tts_audio = None
                 
                 # 诊断日志：每 2 秒打印一次状态
                 if not hasattr(self, '_last_tts_diag_time'):
