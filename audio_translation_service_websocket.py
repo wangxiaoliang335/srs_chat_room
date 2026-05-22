@@ -764,9 +764,8 @@ class AudioStreamProcessorWebSocket:
             ffmpeg_bin,
             "-hide_banner",           # 隐藏 banner 信息
             "-loglevel", "info",     # 改为 info 以便查看更多日志
-            "-re",                    # 按实时速度输出，避免缓冲区堆积
             "-i", "-",               # 从 stdin 读取，让 FFmpeg 自动检测格式
-            "-rw_timeout", "10000000",  # IO 超时 10 秒（微秒）
+            "-rw_timeout", "30000000",  # IO 超时 30 秒（微秒）
             "-af", "aresample=16000:filter_size=64:cutoff=0.95,pan=mono|c0=c0",  # 强制重采样为 16kHz 单声道
             "-c:a", "aac",           # 转码为 AAC
             "-b:a", "64k",
