@@ -905,6 +905,7 @@ class AudioStreamProcessorWebSocket:
                 
                 # 获取 TTS 音频
                 tts_audio = None
+                is_silent_audio = False  # 标记是否为静音数据
                 if self.realtime_service:
                     # 检查百度连接状态
                     baidu_connected = self.realtime_service.is_connected()
@@ -913,16 +914,28 @@ class AudioStreamProcessorWebSocket:
                     if not baidu_connected:
                         # 生成静音 MP3 数据（如果还没有的话）
                         if not hasattr(self, '_silent_mp3'):
-                            # 生成 1 秒静音 MP3（16kHz AAC 编码约 2KB）
+                            logger.warning(f"[{self.request_id}] Baidu disconnected, generating silent MP3...")
                             import subprocess
                             result = subprocess.run([
                                 '/usr/bin/ffmpeg', '-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono',
                                 '-t', '1', '-c:a', 'libmp3lame', '-b:a', '16k', '-f', 'mp3', '-'
                             ], capture_output=True, timeout=5)
-                            self._silent_mp3 = result.stdout if result.returncode == 0 else b''
-                            self._silent_mp3_len = len(self._silent_mp3)
+                            if result.returncode == 0:
+                                self._silent_mp3 = result.stdout
+                                self._silent_mp3_len = len(self._silent_mp3)
+                                logger.info(f"[{self.request_id}] Silent MP3 generated: {self._silent_mp3_len} bytes")
+                            else:
+                                self._silent_mp3 = b''
+                                self._silent_mp3_len = 0
+                                logger.error(f"[{self.request_id}] Failed to generate silent MP3: {result.stderr[:200]}")
                         # 使用静音数据
                         tts_audio = self._silent_mp3
+                        is_silent_audio = True
+                        if not hasattr(self, '_silent_audio_count'):
+                            self._silent_audio_count = 0
+                        self._silent_audio_count += 1
+                        if self._silent_audio_count % 20 == 1:  # 每20次打印一次
+                            logger.info(f"[{self.request_id}] Using silent audio #{self._silent_audio_count}, size={len(tts_audio)} bytes")
                     else:
                         tts_audio = self.realtime_service.get_tts_audio(timeout=0.1)
                 else:
@@ -945,7 +958,12 @@ class AudioStreamProcessorWebSocket:
                     if hasattr(self, '_ffmpeg_last_start_time'):
                         ffmpeg_age = f", ffmpeg_age={current_time - self._ffmpeg_last_start_time:.1f}s"
                     
-                    logger.info(f"[{self.request_id}] TTS Status: realtime_connected={realtime_connected}, output_exists={output_exists}, output_running={output_running}, tts_queue_size={tts_queue_size}{queue_warning}{ffmpeg_age}")
+                    # 静音数据统计
+                    silent_info = ""
+                    if hasattr(self, '_silent_audio_count'):
+                        silent_info = f", silent_pkts={self._silent_audio_count}"
+                    
+                    logger.info(f"[{self.request_id}] TTS Status: realtime_connected={realtime_connected}, output_exists={output_exists}, output_running={output_running}, tts_queue_size={tts_queue_size}{queue_warning}{ffmpeg_age}{silent_info}")
                 
                 # 写入音频数据
                 if tts_audio:
@@ -968,6 +986,18 @@ class AudioStreamProcessorWebSocket:
                                 try:
                                     self.output_process.stdin.write(tts_audio)
                                     self.output_process.stdin.flush()
+                                    
+                                    # 写入成功后记录统计
+                                    audio_processed = getattr(self, '_audio_processed', 0) + len(tts_audio)
+                                    setattr(self, '_audio_processed', audio_processed)
+                                    
+                                    # 如果是静音数据，打印日志
+                                    if is_silent_audio:
+                                        if not hasattr(self, '_silent_write_count'):
+                                            self._silent_write_count = 0
+                                        self._silent_write_count += 1
+                                        if self._silent_write_count % 50 == 1:  # 每50次打印一次
+                                            logger.info(f"[{self.request_id}] Silent audio written #{self._silent_write_count}: size={len(tts_audio)} bytes")
                                 except (BrokenPipeError, OSError, IOError) as write_err:
                                     logger.error(f"[{self.request_id}] Write error to FFmpeg: {write_err}")
                                     if self.output_process:
@@ -977,9 +1007,6 @@ class AudioStreamProcessorWebSocket:
                                             pass
                                     self.output_process = None
                                     break
-                                
-                                audio_processed = getattr(self, '_audio_processed', 0) + len(tts_audio)
-                                setattr(self, '_audio_processed', audio_processed)
                                 
                                 # 重置不可写计数
                                 if hasattr(self, '_not_writable_count'):
