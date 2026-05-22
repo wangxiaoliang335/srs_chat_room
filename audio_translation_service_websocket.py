@@ -835,6 +835,12 @@ class AudioStreamProcessorWebSocket:
                             stderr_thread.join(timeout=1)
                         stderr_text = "".join(stderr_buffer)
                         
+                        # 详细记录进程退出信息
+                        exit_info = f"FFmpeg process exited: pid={self.output_process.pid if hasattr(self.output_process, 'pid') else 'N/A'}, code={poll_result}, age={time.time() - getattr(self, '_ffmpeg_last_start_time', time.time()):.1f}s"
+                        if stderr_text:
+                            exit_info += f", stderr={stderr_text[:300]}"
+                        logger.error(f"[{self.request_id}] {exit_info}")
+                        
                         # 分类错误类型
                         if "Unknown encoder" in stderr_text or "codec not found" in stderr_text:
                             error_type = "AAC encoder not found"
@@ -848,10 +854,10 @@ class AudioStreamProcessorWebSocket:
                         elif "Invalid data" in stderr_text:
                             error_type = "Invalid input data"
                             logger.error(f"[{self.request_id}] Invalid input data format!")
+                        elif "Error" in stderr_text or "error" in stderr_text:
+                            error_type = f"FFmpeg error: {stderr_text[:100]}"
                         elif poll_result != 0:
                             error_type = f"FFmpeg exited with code {poll_result}"
-                            if stderr_text:
-                                logger.error(f"[{self.request_id}] FFmpeg stderr: {stderr_text[:500]}")
                         else:
                             error_type = "Unknown"
                             if stderr_text:
