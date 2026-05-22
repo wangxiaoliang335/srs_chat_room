@@ -894,21 +894,18 @@ class AudioStreamProcessorWebSocket:
                 # 写入音频数据
                 if tts_audio:
                     if self.output_process and self.output_process.poll() is None:
-                        try:
-                            stdin_valid = self.output_process.stdin is not None
-                            process_running = self.output_process.poll() is None
-                            
-                            if stdin_valid and process_running:
+                        stdin_valid = self.output_process.stdin is not None
+                        process_running = self.output_process.poll() is None
+                        
+                        if stdin_valid and process_running:
+                            # 使用 select 检测管道是否可写（100ms超时）
+                            _, writable, _ = select.select([], [self.output_process.stdin], [], 0.1)
+                            if writable:
                                 try:
-                                    # 非阻塞写入，如果管道满会抛出 EAGAIN
                                     self.output_process.stdin.write(tts_audio)
                                     self.output_process.stdin.flush()
                                 except (BrokenPipeError, OSError, IOError) as write_err:
-                                    import errno
-                                    if isinstance(write_err, OSError) and getattr(write_err, 'errno', None) == errno.EAGAIN:
-                                        logger.error(f"[{self.request_id}] FFmpeg stdin buffer full, restarting...")
-                                    else:
-                                        logger.error(f"[{self.request_id}] Broken pipe/IO error writing to FFmpeg: {write_err}")
+                                    logger.error(f"[{self.request_id}] Write error to FFmpeg: {write_err}")
                                     if self.output_process:
                                         try:
                                             self.output_process.terminate()
@@ -926,17 +923,16 @@ class AudioStreamProcessorWebSocket:
                                 if tts_write_count % 10 == 0:
                                     logger.info(f"[{self.request_id}] TTS written: size={len(tts_audio)} bytes, total={audio_processed}, writes={tts_write_count}")
                             else:
-                                logger.warning(f"[{self.request_id}] FFmpeg stdin invalid: stdin={stdin_valid}, running={process_running}")
-                        except (BrokenPipeError, OSError, IOError) as e:
-                            logger.error(f"[{self.request_id}] Broken pipe/IO error writing to FFmpeg: {e}")
-                            if self.output_process:
-                                try:
-                                    self.output_process.terminate()
-                                except:
-                                    pass
-                            self.output_process = None
-                            # 立即退出循环以重启 FFmpeg
-                            break
+                                # 管道不可写，FFmpeg 缓冲区满或进程阻塞
+                                logger.warning(f"[{self.request_id}] FFmpeg stdin not writable, checking process...")
+                                # 检查进程是否还在运行
+                                if self.output_process.poll() is not None:
+                                    logger.error(f"[{self.request_id}] FFmpeg process died, will restart")
+                                    self.output_process = None
+                                    break
+                                # 否则跳过这次写入，稍后重试
+                        else:
+                            logger.warning(f"[{self.request_id}] FFmpeg stdin invalid: stdin={stdin_valid}, running={process_running}")
                     else:
                         # FFmpeg 进程不存在或已退出，打印诊断信息
                         if not self.output_process:
