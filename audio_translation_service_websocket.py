@@ -861,8 +861,6 @@ class AudioStreamProcessorWebSocket:
                         # 进程已退出，获取退出码
                         poll_result = self.output_process.poll()
                         
-                        # 如果进程已退出
-                    if poll_result is not None:
                         # 获取 stderr 内容
                         if stderr_thread:
                             stderr_thread.join(timeout=1)
@@ -871,7 +869,7 @@ class AudioStreamProcessorWebSocket:
                         # 详细记录进程退出信息
                         exit_info = f"FFmpeg process exited: pid={self.output_process.pid if hasattr(self.output_process, 'pid') else 'N/A'}, code={poll_result}, age={time.time() - getattr(self, '_ffmpeg_last_start_time', time.time()):.1f}s"
                         if stderr_text:
-                            exit_info += f", stderr={stderr_text[:300]}"
+                            exit_info += f", stderr={stderr_text[:500]}"
                         logger.error(f"[{self.request_id}] {exit_info}")
                         
                         # 分类错误类型
