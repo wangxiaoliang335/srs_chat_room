@@ -930,13 +930,26 @@ class AudioStreamProcessorWebSocket:
                                     logger.info(f"[{self.request_id}] TTS written: size={len(tts_audio)} bytes, total={audio_processed}, writes={tts_write_count}")
                             else:
                                 # 管道不可写，FFmpeg 缓冲区满或进程阻塞
-                                logger.warning(f"[{self.request_id}] FFmpeg stdin not writable, checking process...")
+                                logger.warning(f"[{self.request_id}] FFmpeg stdin not writable (select returned False), checking process...")
                                 # 检查进程是否还在运行
-                                if self.output_process.poll() is not None:
-                                    logger.error(f"[{self.request_id}] FFmpeg process died, will restart")
+                                poll_result = self.output_process.poll()
+                                if poll_result is not None:
+                                    logger.error(f"[{self.request_id}] FFmpeg process died with code {poll_result}, will restart")
                                     self.output_process = None
                                     break
                                 # 否则跳过这次写入，稍后重试
+                                # 添加计数器，连续不可写超过3次则强制重启
+                                not_writable_count = getattr(self, '_not_writable_count', 0) + 1
+                                setattr(self, '_not_writable_count', not_writable_count)
+                                if not_writable_count >= 3:
+                                    logger.error(f"[{self.request_id}] FFmpeg stdin not writable {not_writable_count} times, forcing restart")
+                                    if self.output_process:
+                                        try:
+                                            self.output_process.terminate()
+                                        except:
+                                            pass
+                                    self.output_process = None
+                                    break
                         else:
                             logger.warning(f"[{self.request_id}] FFmpeg stdin invalid: stdin={stdin_valid}, running={process_running}")
                     else:
@@ -945,6 +958,9 @@ class AudioStreamProcessorWebSocket:
                             logger.warning(f"[{self.request_id}] FFmpeg output process is None (TTS audio dropped: {len(tts_audio)} bytes)")
                         elif self.output_process.poll() is not None:
                             logger.warning(f"[{self.request_id}] FFmpeg output process exited with code: {self.output_process.poll()} (TTS audio dropped: {len(tts_audio)} bytes)")
+                        # 重置不可写计数器
+                        if hasattr(self, '_not_writable_count'):
+                            delattr(self, '_not_writable_count')
                 
                 # 定期检查 FFmpeg 进程状态（每 30 秒）
                 if not hasattr(self, '_last_ffmpeg_check_time'):
