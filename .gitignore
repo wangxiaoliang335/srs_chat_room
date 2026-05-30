@@ -1,0 +1,41 @@
+# 日志文件
+*.log
+logs/
+
+# Python 字节码
+__pycache__/
+*.py[cod]
+
+# 音频录制文件
+tts_recordings/
+input_recordings/
+pcm_recordings/
+
+# 临时文件
+*.tmp
+*.temp
+*.core
+core-*
+
+# 视频文件
+*.flv
+*.mp4
+*.aac
+*.mp3
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# SRS 源码（不提交）
+trunk/
+3rdparty/
+*.so
+objs/
+
+# 其他
+srs/
+android_socketio_example/
+nginx_cors.conf
+realtime_trans_python3/
+srs-stream-test/

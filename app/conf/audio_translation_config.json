@@ -1,0 +1,23 @@
+{
+  "baidu": {
+    "api_key": "",
+    "secret_key": "",
+    "translation_url": "wss://tsn.baidu.com/text2audio"
+  },
+  "srs": {
+    "url": "http://localhost:8080",
+    "rtmp_url": "rtmp://localhost/live"
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "format": "pcm_s16le",
+    "chunk_size_ms": 200,
+    "asr_format": "pcm",
+    "input_format": null,
+    "http_flv_port": 8080,
+    "http_flv_vhost": "__defaultVhost__",
+    "srs_api_url": "http://127.0.0.1:1985"
+  },
+  "rooms": []
+}
