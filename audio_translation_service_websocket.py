@@ -124,6 +124,10 @@ class RealtimeTranslationService:
         
         # TTS 音频队列
         self.tts_queue = queue.Queue(maxsize=100)
+        
+        # TTS 缓冲机制：只等句子完整（FIN）才播放
+        self._tts_buffer = []  # 缓冲 MID 的 TTS
+        self._current_sentence_fin = ""  # 当前正在缓冲的句子
 
         # TTS 保存配置
         self._tts_save_enabled = False

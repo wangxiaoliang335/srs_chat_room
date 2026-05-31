@@ -54,6 +54,11 @@ class BaiduRealtimeTranslationClient:
 
         # TTS 音频数据缓冲
         self.tts_audio_buffer = b""
+        
+        # TTS 发送策略：只在 FIN 时发送完整句子
+        # 避免播放一句话时中间被新的 TTS 打断
+        self._tts_buffer_enabled = True  # 是否启用缓冲
+        self._pending_tts_audio = b""   # 累积的 TTS 音频
 
         # TTS 音频保存设置
         self.tts_save_dir = "tts_recordings"
@@ -300,15 +305,11 @@ class BaiduRealtimeTranslationClient:
                     # 保存到本地文件
                     saved = self._write_tts_audio(tts_audio)
                     
-                    # 触发回调
-                    if self.on_tts_audio_callback:
-                        try:
-                            self.on_tts_audio_callback(tts_audio)
-                            logger.info(f"[{self.request_id}] TTS callback triggered: {len(tts_audio)} bytes, saved={saved}")
-                        except Exception as e:
-                            logger.error(f"[{self.request_id}] TTS callback error: {e}")
-                    else:
-                        logger.warning(f"[{self.request_id}] TTS callback is None! Audio dropped: {len(tts_audio)} bytes")
+                    # 缓冲 TTS 音频，不立即发送
+                    # 只有收到 FIN（整句结束）时才发送
+                    self._pending_tts_audio += tts_audio
+                    
+                    logger.debug(f"[{self.request_id}] TTS buffered: {len(tts_audio)} bytes, total_pending={len(self._pending_tts_audio)}")
                 else:
                     logger.warning(f"Unknown binary message type: 0x{tts_type:02x}")
 
@@ -329,12 +330,25 @@ class BaiduRealtimeTranslationClient:
                         result_type = result_obj.get("type", "")  # MID 或 FIN
 
                         if result_type == "FIN":
-                            # 最终结果
+                            # 最终结果 - 发送累积的 TTS 音频
                             sentence = result_obj.get("sentence", "")
                             sentence_trans = result_obj.get("sentence_trans", "")
 
                             # 每收到最终结果，开启新的TTS保存文件
                             self._start_new_tts_file()
+                            
+                            # 清空 TTS 缓冲前，先发送累积的音频
+                            if self._pending_tts_audio:
+                                logger.info(f"[{self.request_id}] FIN received, sending {len(self._pending_tts_audio)} bytes of buffered TTS")
+                                if self.on_tts_audio_callback:
+                                    try:
+                                        self.on_tts_audio_callback(self._pending_tts_audio)
+                                    except Exception as e:
+                                        logger.error(f"[{self.request_id}] TTS callback error: {e}")
+                                # 清空缓冲
+                                self._pending_tts_audio = b""
+                            else:
+                                logger.debug(f"[{self.request_id}] FIN received but no pending TTS audio")
 
                             if sentence_trans:
                                 logger.info(f"Translation [{result_type}]: '{sentence}' -> '{sentence_trans}'")
@@ -343,7 +357,7 @@ class BaiduRealtimeTranslationClient:
                                         sentence_trans, sentence, self.from_lang, self.to_lang
                                     )
                         elif result_type == "MID":
-                            # 中间结果
+                            # 中间结果 - 只缓冲 TTS 音频，不发送
                             asr = result_obj.get("asr", "")
                             asr_trans = result_obj.get("asr_trans", "")
 
