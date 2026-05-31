@@ -1050,6 +1050,12 @@ class AudioStreamProcessorWebSocket:
                             logger.info(f"[{self.request_id}] Using silent audio #{self._silent_audio_count}, size={len(tts_audio)} bytes")
                     else:
                         tts_audio = self.realtime_service.get_tts_audio(timeout=0.1)
+                        # 记录 TTS 包间隔
+                        if tts_audio is not None:
+                            now = time.time()
+                            if hasattr(self, '_last_tts_recv_time'):
+                                self._last_tts_interval = now - self._last_tts_recv_time
+                            self._last_tts_recv_time = now
                 else:
                     tts_audio = None
                 
@@ -1064,18 +1070,23 @@ class AudioStreamProcessorWebSocket:
                     output_exists = self.output_process is not None
                     tts_queue_size = self.realtime_service.tts_queue.qsize() if self.realtime_service else 0
                     queue_warning = " [WARNING: queue backlog!]" if tts_queue_size > 80 else ""
-                    
+
                     # 追踪 FFmpeg 进程状态
                     ffmpeg_age = ""
                     if hasattr(self, '_ffmpeg_last_start_time'):
                         ffmpeg_age = f", ffmpeg_age={current_time - self._ffmpeg_last_start_time:.1f}s"
-                    
+
                     # 静音数据统计
                     silent_info = ""
                     if hasattr(self, '_silent_audio_count'):
                         silent_info = f", silent_pkts={self._silent_audio_count}"
-                    
-                    logger.info(f"[{self.request_id}] TTS Status: realtime_connected={realtime_connected}, output_exists={output_exists}, output_running={output_running}, tts_queue_size={tts_queue_size}{queue_warning}{ffmpeg_age}{silent_info}")
+
+                    # 记录上次 TTS 包间隔
+                    last_interval = ""
+                    if hasattr(self, '_last_tts_interval'):
+                        last_interval = f", last_tts_interval={self._last_tts_interval*1000:.0f}ms"
+
+                    logger.info(f"[{self.request_id}] TTS Status: realtime_connected={realtime_connected}, output_exists={output_exists}, output_running={output_running}, tts_queue_size={tts_queue_size}{queue_warning}{ffmpeg_age}{silent_info}{last_interval}")
                 
                 # 写入音频数据
                 if tts_audio:
