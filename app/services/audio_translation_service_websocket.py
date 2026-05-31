@@ -542,10 +542,25 @@ class AudioStreamProcessorWebSocket:
         
         # 重试配置：直到用户停止才退出
         max_retries = 600          # 最多重试 600 次
-        retry_interval = 1         # 每次重试间隔 1 秒
+        retry_interval = 1         # 每次重试间隔（秒）
+        base_retry_interval = 1    # 基础重试间隔
+        max_retry_interval = 30    # 最大重试间隔（秒）- 指数退避上限
         retry_count = 0
         start_time = time.time()
         last_error_type = None
+        consecutive_failures = 0    # 连续失败次数，用于指数退避
+        source_stream_lost_time = None  # 源流丢失开始时间
+        max_source_lost_seconds = 1200  # 源流丢失后最多重试 20 分钟
+        
+        # SRS 健康检查
+        def check_srs_healthy():
+            """检查 SRS 是否健康"""
+            try:
+                import requests as http_requests
+                response = http_requests.get("http://127.0.0.1:1985/api/v1/info", timeout=2)
+                return response.status_code == 200
+            except:
+                return False
         
         # 百度翻译服务重连相关
         baidu_reconnect_count = 0
@@ -566,10 +581,40 @@ class AudioStreamProcessorWebSocket:
                 # 等待源流就绪
                 stream_ready = self._wait_for_stream_ready()
                 if not stream_ready:
-                    logger.warning(f"[{self.request_id}] Stream not ready, retry={retry_count}/{max_retries}")
+                    # 记录源流丢失开始时间
+                    if source_stream_lost_time is None:
+                        source_stream_lost_time = time.time()
+                        logger.warning(f"[{self.request_id}] Source stream lost, starting 20min timeout...")
+                    
+                    # 检查是否超过20分钟
+                    elapsed_without_stream = time.time() - source_stream_lost_time
+                    if elapsed_without_stream >= max_source_lost_seconds:
+                        logger.warning(f"[{self.request_id}] Source stream timeout after {elapsed_without_stream/60:.1f} minutes, exiting...")
+                        self.is_running = False
+                        break
+                    
+                    logger.warning(f"[{self.request_id}] Stream not ready, retry={retry_count}/{max_retries}, elapsed={elapsed_without_stream:.0f}s")
                     retry_count += 1
+                    
+                    # 指数退避：连续失败时增加等待时间
+                    consecutive_failures += 1
+                    retry_interval = min(base_retry_interval * (2 ** min(consecutive_failures, 5)), max_retry_interval)
+                    
+                    # 如果 SRS 不健康，等待更长时间
+                    if not check_srs_healthy():
+                        logger.warning(f"[{self.request_id}] SRS not healthy, increasing wait time")
+                        time.sleep(retry_interval * 3)
+                        continue
+                    
                     time.sleep(retry_interval)
                     continue
+                
+                # SRS 健康且流就绪，重置连续失败计数
+                if source_stream_lost_time is not None:
+                    logger.info(f"[{self.request_id}] Source stream recovered after {time.time() - source_stream_lost_time:.0f}s")
+                    source_stream_lost_time = None
+                consecutive_failures = 0
+                retry_interval = base_retry_interval
                 
                 # 连接实时翻译服务
                 if not self.realtime_service:
@@ -603,6 +648,12 @@ class AudioStreamProcessorWebSocket:
                 
                 # 启动 ffmpeg 输入进程
                 if not self.ffmpeg_process:
+                    # 检查 SRS 健康状态
+                    if not check_srs_healthy():
+                        logger.warning(f"[{self.request_id}] SRS not healthy, waiting before starting FFmpeg...")
+                        time.sleep(retry_interval * 2)
+                        continue
+                    
                     self._start_ffmpeg_input(http_flv_url)
                     logger.info(f"[{self.request_id}] FFmpeg input started with PID: {self.ffmpeg_process.pid}")
                 
@@ -746,8 +797,16 @@ class AudioStreamProcessorWebSocket:
                             pass
                         self.ffmpeg_process = None
                     
-                    # 短暂等待后重试
-                    time.sleep(retry_interval)
+                    # 指数退避等待后再重试
+                    consecutive_failures += 1
+                    retry_interval = min(base_retry_interval * (2 ** min(consecutive_failures, 5)), max_retry_interval)
+                    
+                    # SRS 不健康时增加等待时间
+                    if not check_srs_healthy():
+                        logger.warning(f"[{self.request_id}] SRS not healthy after FFmpeg exit, waiting {retry_interval * 3}s before retry")
+                        time.sleep(retry_interval * 3)
+                    else:
+                        time.sleep(retry_interval)
                     
             except Exception as e:
                 logger.error(f"[{self.request_id}] Error in audio read thread: {e}", exc_info=True)
@@ -803,12 +862,25 @@ class AudioStreamProcessorWebSocket:
         
         logger.info(f"[{self.request_id}] Starting FFmpeg output process: {' '.join(ffmpeg_output_cmd)}")
         
+        # SRS 健康检查函数
+        def check_srs_healthy():
+            """检查 SRS 是否健康"""
+            try:
+                import requests as http_requests
+                response = http_requests.get("http://127.0.0.1:1985/api/v1/info", timeout=2)
+                return response.status_code == 200
+            except:
+                return False
+        
         # 重试配置：直到用户停止或源流停止才退出
         max_retries = 600          # 最多重试 600 次
-        retry_interval = 1         # 每次重试间隔 1 秒
+        base_retry_interval = 1    # 基础重试间隔
+        max_retry_interval = 30    # 最大重试间隔
+        retry_interval = 1
         retry_count = 0
         start_time = time.time()
         last_error_type = None
+        consecutive_failures = 0   # 连续失败次数，用于指数退避
         
         # stderr buffer 用于存储 ffmpeg 错误信息
         stderr_buffer = []
@@ -843,8 +915,16 @@ class AudioStreamProcessorWebSocket:
                     
                     retry_count += 1
                     stderr_buffer = []
+                    consecutive_failures += 1
+                    retry_interval = min(base_retry_interval * (2 ** min(consecutive_failures, 5)), max_retry_interval)
                     
                     try:
+                        # 检查 SRS 健康状态
+                        if not check_srs_healthy():
+                            logger.warning(f"[{self.request_id}] SRS not healthy, waiting {retry_interval * 2}s before retry...")
+                            time.sleep(retry_interval * 2)
+                            continue
+                        
                         # 使用 PIPE 捕获 stderr，并设置 bufsize=0 以立即写入
                         self.output_process = subprocess.Popen(
                             ffmpeg_output_cmd,
