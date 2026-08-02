@@ -969,12 +969,45 @@
 
 ---
 
-## 十、WebSocket 接口
+## 十、WebSocket / Socket.IO 实时对接说明
 
-### 37. 订阅房间
-- **路径**: `/api/v1/ws/subscribe`
-- **方法**: POST
-- **描述**: 获取 WebSocket 连接地址
+本章描述当前代码中真实可用的实时对接方式。当前服务同时支持：
+
+1. **Socket.IO 房间订阅与事件广播**（推荐客户端优先使用）
+2. **原生 WebSocket 房间订阅与事件广播**（兼容方案）
+3. **服务端内部/管理用途的 HTTP 广播接口**（通常不是业务客户端直接调用）
+
+### 37. 获取当前正在说话的用户列表
+- **路径**: `/api/v1/room/<room_id>/speaking`
+- **方法**: GET
+- **描述**: 获取房间内当前处于“说话中”状态的用户列表。该状态基于服务端收到的推流开始/停止回调维护，不是逐帧静音检测（VAD）。
+
+**路径参数**:
+- `room_id`: 房间 ID
+
+**响应** (200):
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "room_id": "room_123",
+    "speaking_users": ["user_001", "user_002"]
+  }
+}
+```
+
+---
+
+## 10.1 Socket.IO 实时接口（推荐）
+
+### 38. Socket.IO 连接
+- **连接地址**: `http://<server-host>:8085`
+- **说明**: 客户端建立 Socket.IO 连接后，再通过 `subscribe` 事件加入指定房间。
+
+### 39. Socket.IO 房间订阅
+- **事件名**: `subscribe`
+- **描述**: 客户端连接 Socket.IO 后，发送该事件订阅指定房间的广播事件。
 
 **请求体**:
 ```json
@@ -984,50 +1017,315 @@
 }
 ```
 
-**响应** (200):
+**成功响应事件**: `subscribed`
 ```json
 {
-  "code": 0,
-  "message": "success",
+  "type": "subscribed",
+  "room_id": "room_123",
+  "user_id": "user_001"
+}
+```
+
+**错误响应事件**: `error`
+```json
+{
+  "message": "Missing room_id"
+}
+```
+
+### 40. Socket.IO 取消订阅
+- **事件名**: `unsubscribe`
+- **描述**: 客户端取消订阅房间广播。
+
+**请求体**:
+```json
+{
+  "room_id": "room_123"
+}
+```
+
+**成功响应事件**: `unsubscribed`
+```json
+{
+  "type": "unsubscribed",
+  "room_id": "room_123"
+}
+```
+
+### 41. Socket.IO 心跳
+- **事件名**: `ping`
+- **描述**: 客户端主动发送心跳，服务端返回 `pong`。
+
+**请求体**:
+```json
+{}
+```
+
+**成功响应事件**: `pong`
+```json
+{
+  "type": "pong"
+}
+```
+
+### 42. Socket.IO 房间广播事件
+- **监听事件名**: `room_event`
+- **描述**: 客户端订阅房间成功后，会在该事件中收到房间内的各种广播通知，包括成员变更、翻译状态、说话状态等。
+
+#### 42.1 消息封装格式
+当前 Socket.IO 广播消息统一为以下结构：
+
+```json
+{
+  "type": "<event_type>",
   "data": {
-    "ws_url": "ws://localhost:8085/ws?room=room_123&user=user_001",
+    "event_id": "a1b2c3d4",
     "room_id": "room_123",
-    "user_id": "user_001"
+    "user_id": "user_001",
+    "operator_id": "",
+    "target_user_id": "",
+    "data": {},
+    "timestamp": "2026-06-07 10:10:10",
+    "type": "<event_type>"
   }
 }
 ```
 
----
+说明：
+- 外层 `type` 是事件类型，便于客户端快速分发。
+- 内层 `data.type` 与外层 `type` 一致。
+- 内层 `data.data` 为该事件的业务数据。
 
-### 38. WebSocket 状态
-- **路径**: `/api/v1/ws/status`
-- **方法**: GET
-- **描述**: 获取 WebSocket 连接状态
+#### 42.2 公共字段说明
+无论是 Socket.IO 的 `room_event`，还是原生 WebSocket 的平铺事件，房间事件主体字段含义基本一致：
 
-**响应** (200):
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `event_id` | string | 事件唯一标识，用于客户端去重或排查日志 |
+| `room_id` | string | 房间 ID |
+| `user_id` | string | 事件关联的主要用户 ID。对说话事件来说，就是开始/停止说话的用户 |
+| `operator_id` | string | 操作者用户 ID。只有管理员操作类事件通常会有值 |
+| `target_user_id` | string | 事件关联的目标用户 ID。定向事件中可能使用 |
+| `data` | object | 事件业务字段，不同事件内容不同 |
+| `timestamp` | string | 服务端生成的事件时间，格式 `YYYY-MM-DD HH:MM:SS` |
+| `type` | string | 事件类型 |
+
+对于 Socket.IO：
+- 外层 `type`：事件类型，便于客户端分发
+- 外层 `data`：上表这些公共字段的集合
+- 真正业务字段位于 `data.data`
+
+#### 42.3 用户开始说话 `user_speaking_start`
+说明：当服务端收到某用户音频流开始发布时，向房间内订阅者广播。该事件语义是“开始推流”，不是逐帧 VAD 检测。
+
+**消息示例**:
 ```json
 {
-  "code": 0,
-  "message": "success",
+  "type": "user_speaking_start",
   "data": {
-    "total_connections": 10,
-    "active_rooms": 3,
-    "ws_port": 8085
+    "event_id": "a1b2c3d4",
+    "room_id": "room_123",
+    "user_id": "user_001",
+    "operator_id": "",
+    "target_user_id": "",
+    "data": {
+      "stream_url": "http://<srs-host>/live/room_123_user_001"
+    },
+    "timestamp": "2026-06-07 10:10:10",
+    "type": "user_speaking_start"
   }
+}
+```
+
+#### 42.4 用户停止说话 `user_speaking_stop`
+说明：当服务端收到某用户音频流停止发布时，向房间内订阅者广播。
+
+**消息示例**:
+```json
+{
+  "type": "user_speaking_stop",
+  "data": {
+    "event_id": "e5f6g7h8",
+    "room_id": "room_123",
+    "user_id": "user_001",
+    "operator_id": "",
+    "target_user_id": "",
+    "data": {},
+    "timestamp": "2026-06-07 10:12:30",
+    "type": "user_speaking_stop"
+  }
+}
+```
+
+#### 42.5 其他常见房间广播事件
+以下事件类型也会通过 `room_event` 下发，结构同上：
+
+- `member_joined`
+- `member_left`
+- `member_kicked`
+- `member_role_changed`
+- `member_muted`
+- `member_unmuted`
+- `member_mic_disabled`
+- `member_mic_enabled`
+- `room_muted_all`
+- `room_unmuted_all`
+- `room_created`
+- `room_deleted`
+- `room_knock`
+- `room_knock_accepted`
+- `room_knock_rejected`
+- `translation_started`
+- `translation_stopped`
+- `original_speech_text`
+
+说明：
+- `translation_text` 除了可能广播到房间外，还会定向发送给目标用户。
+- 不同事件的业务字段位于内层 `data.data` 中。
+
+---
+
+## 10.2 原生 WebSocket 实时接口（兼容）
+
+### 43. 原生 WebSocket 连接
+- **连接地址**: `ws://<server-host>:8086/ws?room=<room_id>&user=<user_id>`
+- **描述**: 原生 WebSocket 接入方式，适用于不使用 Socket.IO 的客户端。
+
+**连接成功后服务端主动发送**:
+```json
+{
+  "type": "connected",
+  "room_id": "room_123",
+  "user_id": "user_001",
+  "room_info": {
+    "online_users": 2,
+    "translation_status": "idle"
+  }
+}
+```
+
+### 44. 原生 WebSocket 心跳
+- **消息类型**: `ping`
+- **描述**: 客户端发送心跳，服务端返回 `pong`。
+
+**客户端发送**:
+```json
+{
+  "type": "ping"
+}
+```
+
+**服务端返回**:
+```json
+{
+  "type": "pong"
+}
+```
+
+### 45. 原生 WebSocket 订阅/切换房间
+- **消息类型**: `subscribe`
+- **描述**: 已连接客户端切换到新的房间并接收该房间广播。
+
+**客户端发送**:
+```json
+{
+  "type": "subscribe",
+  "room_id": "room_456"
+}
+```
+
+**服务端返回**:
+```json
+{
+  "type": "subscribed",
+  "room_id": "room_456"
+}
+```
+
+### 46. 原生 WebSocket 房间广播事件
+- **描述**: 原生 WebSocket 收到的房间广播为平铺 JSON 结构，不像 Socket.IO 那样额外包一层 `data`。
+
+#### 46.1 消息封装格式
+```json
+{
+  "event_id": "a1b2c3d4",
+  "room_id": "room_123",
+  "user_id": "user_001",
+  "operator_id": "",
+  "target_user_id": "",
+  "data": {},
+  "timestamp": "2026-06-07 10:10:10",
+  "type": "<event_type>"
+}
+```
+
+#### 46.2 用户开始说话 `user_speaking_start`
+```json
+{
+  "event_id": "a1b2c3d4",
+  "room_id": "room_123",
+  "user_id": "user_001",
+  "operator_id": "",
+  "target_user_id": "",
+  "data": {
+    "stream_url": "http://<srs-host>/live/room_123_user_001"
+  },
+  "timestamp": "2026-06-07 10:10:10",
+  "type": "user_speaking_start"
+}
+```
+
+#### 46.3 用户停止说话 `user_speaking_stop`
+```json
+{
+  "event_id": "e5f6g7h8",
+  "room_id": "room_123",
+  "user_id": "user_001",
+  "operator_id": "",
+  "target_user_id": "",
+  "data": {},
+  "timestamp": "2026-06-07 10:12:30",
+  "type": "user_speaking_stop"
 }
 ```
 
 ---
 
-### 39. 广播消息
-- **路径**: `/api/v1/ws/broadcast`
+## 10.3 服务端内部/管理用途 HTTP 推送接口
+
+以下接口在当前实现中存在，但更适合作为服务端内部调用或管理用途，不建议普通业务客户端把它当成主要实时接入方式。
+
+### 47. 原生 WebSocket 广播 HTTP 接口
+- **路径**: `/broadcast`
 - **方法**: POST
-- **描述**: 通过 WebSocket 向房间广播消息
+- **描述**: 向指定房间的原生 WebSocket 连接广播一段已序列化消息。
 
 **请求体**:
 ```json
 {
   "room_id": "room_123",
+  "message": "{\"type\":\"custom_event\",\"data\":{}}"
+}
+```
+
+**响应** (200):
+```json
+{
+  "status": "ok",
+  "sent": true
+}
+```
+
+### 48. 原生 WebSocket 发送/广播兼容接口
+- **路径**: `/ws/send`
+- **方法**: POST
+- **描述**: 向指定用户发送消息，或在 `user_id` 为空时广播到指定房间。该接口主要用于兼容旧逻辑。
+
+**请求体**:
+```json
+{
+  "room_id": "room_123",
+  "user_id": "user_001",
   "type": "notification",
   "data": {
     "message": "hello"
@@ -1035,37 +1333,15 @@
 }
 ```
 
-**响应** (200):
-```json
-{
-  "code": 0,
-  "message": "broadcast sent"
-}
-```
-
----
-
-### 40. 发送私人消息
-- **路径**: `/api/v1/ws/send`
-- **方法**: POST
-- **描述**: 向指定用户发送私人消息
-
-**请求体**:
-```json
-{
-  "user_id": "user_001",
-  "type": "notification",
-  "data": {
-    "message": "private message"
-  }
-}
-```
+说明：
+- `room_id` 必填
+- `user_id` 非空时，优先发送给指定用户
+- `user_id` 为空时，广播到 `room_id`
 
 **响应** (200):
 ```json
 {
-  "code": 0,
-  "message": "message sent"
+  "status": "ok"
 }
 ```
 
@@ -1073,7 +1349,7 @@
 
 ## 十一、系统接口
 
-### 41. 健康检查
+### 49. 健康检查
 - **路径**: `/health`
 - **方法**: GET
 - **描述**: 服务健康检查
@@ -1087,28 +1363,62 @@
 
 ---
 
-## WebSocket 消息类型
+## WebSocket / Socket.IO 消息类型
 
-客户端通过 WebSocket 连接可接收以下类型的消息：
+以下为当前实时通道中常见且真实存在的消息类型。不同接入方式的消息封装略有不同：
 
-| 消息类型 | 说明 | 数据字段 |
-|----------|------|----------|
-| `connected` | 连接成功 | client_id, user_id |
-| `subscribed` | 订阅成功 | room_id, type |
-| `user_joined` | 用户加入 | room_id, user_id |
-| `user_left` | 用户离开 | room_id, user_id |
-| `user_speaking_start` | 用户开始说话 | room_id, user_id, stream_url |
-| `user_speaking_stop` | 用户停止说话 | room_id, user_id |
-| `muted` | 用户被禁言 | room_id, user_id, operator_id |
-| `unmuted` | 用户被解除禁言 | room_id, user_id, operator_id |
-| `kicked` | 用户被踢出 | room_id, user_id, operator_id |
-| `knock` | 有人敲门 | room_id, knocker_id |
-| `knock_accepted` | 敲门被接受 | room_id, knocker_id |
-| `knock_rejected` | 敲门被拒绝 | room_id, knocker_id, reason |
-| `translation_text` | 翻译文本 | room_id, source_user, original_text, translated_text |
-| `translation_started` | 翻译开始 | room_id, source_user, to_lang |
-| `translation_stopped` | 翻译停止 | room_id, source_user, to_lang |
-| `error` | 错误消息 | message |
+- **Socket.IO**: 主要监听 `room_event`，外层结构通常为 `{ "type": "<event_type>", "data": {...} }`
+- **原生 WebSocket**: 直接接收平铺结构消息，通常为 `{ "type": "<event_type>", ... }`
+
+### 1. 连接与控制类消息
+
+| 消息类型 | 适用通道 | 说明 | 主要字段 |
+|----------|----------|------|----------|
+| `connected` | 原生 WebSocket | 连接建立后服务端主动发送 | `room_id`, `user_id`, `room_info` |
+| `subscribed` | Socket.IO / 原生 WebSocket | 订阅房间成功 | `room_id`, `user_id`（Socket.IO） |
+| `unsubscribed` | Socket.IO | 取消订阅成功 | `room_id` |
+| `pong` | Socket.IO / 原生 WebSocket | 心跳响应 | `type` |
+| `error` | Socket.IO | 订阅参数错误等异常提示 | `message` |
+
+### 2. 房间事件类消息
+
+以下事件会广播给房间内订阅者：
+
+| 消息类型 | 说明 | 主要业务字段位置 |
+|----------|------|------------------|
+| `member_joined` | 用户加入房间 | `data.data`（Socket.IO） / `data`（原生 WS） |
+| `member_left` | 用户离开房间 | 同上 |
+| `member_kicked` | 用户被踢出 | 同上 |
+| `member_role_changed` | 用户角色变更 | 同上 |
+| `member_muted` | 用户被禁言 | 同上 |
+| `member_unmuted` | 用户被解除禁言 | 同上 |
+| `member_mic_disabled` | 用户被禁麦 | 同上 |
+| `member_mic_enabled` | 用户被解除禁麦 | 同上 |
+| `room_muted_all` | 全体禁言 | 同上 |
+| `room_unmuted_all` | 解除全体禁言 | 同上 |
+| `room_created` | 房间创建 | 同上 |
+| `room_deleted` | 房间删除 | 同上 |
+| `room_knock` | 有人敲门 | 同上 |
+| `room_knock_accepted` | 敲门被接受 | 同上 |
+| `room_knock_rejected` | 敲门被拒绝 | 同上 |
+| `user_speaking_start` | 用户开始说话（开始推流） | 同上 |
+| `user_speaking_stop` | 用户停止说话（停止推流） | 同上 |
+| `translation_started` | 翻译开始 | 同上 |
+| `translation_stopped` | 翻译停止 | 同上 |
+| `original_speech_text` | 原语音识别文字 | 同上 |
+
+### 3. 翻译文本消息
+
+| 消息类型 | 说明 | 备注 |
+|----------|------|------|
+| `translation_text` | 翻译文本消息 | 当前实现中既可能定向发送给目标用户，也可能广播到房间，客户端应按 `type` 分发处理 |
+
+### 4. 对接注意事项
+
+1. `user_speaking_start` / `user_speaking_stop` 的语义是**推流开始 / 推流停止**，不是逐帧 VAD。
+2. Socket.IO 下建议客户端统一监听 `room_event`，再根据外层 `type` 进行分发。
+3. 原生 WebSocket 下建议直接根据收到消息的 `type` 字段分发。
+4. 如果客户端需要初始化当前说话状态，请先调用 `GET /api/v1/room/<room_id>/speaking`，再开始监听实时事件。
 
 ---
 
@@ -1125,7 +1435,7 @@
 | 翻译管理 | 8 | 翻译请求、心跳、拉流者管理 |
 | 翻译文本 | 2 | 推送翻译文本和原音识别文本 |
 | SRS回调 | 5 | 流发布/停止、播放/停止、状态 |
-| WebSocket | 4 | 订阅、状态、广播、私信 |
+| 实时通信 | 12 | Socket.IO、原生 WebSocket、内部广播接口 |
 | 系统 | 1 | 健康检查 |
 
-**总计**: 40 个 API 接口 + WebSocket 实时消息
+**总计**: 49 个 HTTP 接口/说明项 + WebSocket / Socket.IO 实时消息
