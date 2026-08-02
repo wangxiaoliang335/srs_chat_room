@@ -12,6 +12,7 @@ SRS HTTP回调服务器 - FastAPI版本
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -44,6 +45,12 @@ from auth import user_store, issue_token, verify_token, AuthError, JWT_TTL_SECON
 from sync_client import sync
 from invitation_store import invitation_store
 from share_manager import share_manager, SHARE_DOMAIN
+from user_name_resolver import (
+    validate_user_name,
+    resolve_display_name,
+    invalidate_user_name_cache,
+    UserNameInvalidError as UserNameError,
+)
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -244,9 +251,14 @@ class ApiAuthMiddleware(BaseHTTPMiddleware):
         # 注入业务可用的当前用户身份（实时同步自 user_store / user_manager）
         username = payload.get("sub", "")
         user_id = payload.get("uid", "")
+        # JWT 的 name claim（客户端登录时传入的 user_name），WebSocket 事件直接读取
+        name = payload.get("name", "") or username
         # role 优先以 user_store 中记录的为准（owner 可随时改 admin/member，无需重新登录）
         account = user_store.get_by_username(username) if username else None
         live_role = (account.get("role") if account else None) or payload.get("role", "member")
+        # 优先使用 user_store 中实时的 username（避免 JWT 中 name claim 与库不一致时显示错）
+        if account and (account.get("username") or ""):
+            name = account["username"]
         # room_id 优先以 user_manager 中的实时房间为准（覆盖 JWT 中过期的 room 字段）
         live_room_id = user_manager.find_room_for_user(user_id)
         # 如果实时查不到（用户已离线/未进房），保留 JWT 中的 room 字段；否则以实时为准
@@ -257,6 +269,7 @@ class ApiAuthMiddleware(BaseHTTPMiddleware):
             room_id_final = (account.get("room_id") if account else None) or payload.get("room")
 
         request.state.username = username
+        request.state.name = name
         request.state.user_id = user_id
         request.state.room_id = room_id_final
         request.state.role = live_role
@@ -704,6 +717,10 @@ class LoginRequest(BaseModel):
     # 兼容旧模式（内部账号，直接验用户名密码）
     username: Optional[str] = None
     password: Optional[str] = None
+    # 客户端传入的"显示名"（与 username 解耦，存到 users.username，
+    # 写入 JWT name claim，用于房间内成员名/敲门/说话事件显示）
+    # 可选；不带时沿用业务后端返回的 nickname 或 user_id 兜底（向后兼容）
+    user_name: Optional[str] = None
 
 
 @app.post("/api/v1/auth/register")
@@ -748,7 +765,8 @@ async def auth_login(req: LoginRequest):
     logger.info(
         f"[Auth] /auth/login 入口: mode=external "
         f"external_token_len={len(req.external_token) if req.external_token else 0} "
-        f"external_token_prefix={req.external_token[:8] if req.external_token else None}"
+        f"external_token_prefix={req.external_token[:8] if req.external_token else None} "
+        f"user_name={req.user_name!r}"
     )
     if req.external_token:
         try:
@@ -768,22 +786,53 @@ async def auth_login(req: LoginRequest):
             logger.error(f"[Auth] 业务后端用户信息缺身份字段: data_keys={list(ext_data.keys())}")
             return api_err(500, "业务后端返回的用户信息缺少身份字段")
 
+        # 校验 client 传入的 user_name（可选）。
+        try:
+            client_user_name = validate_user_name(req.user_name or "")
+        except UserNameError as e:
+            return api_err(e.code, e.message)
+
         # 用 user_store 做"注册或取记录"：username 存在则取，不存在则自动创建
         # 这样同一个业务后端用户每次登录都映射到同一个 user_id
         record = user_store.get_or_create_from_external(username, ext_data)
 
+        # 需求 §2.3 优先级：1) 请求体 user_name  2) 业务后端 nickname  3) user_id 兜底
+        biz_user_name = (
+            ext_data.get("nickname")
+            or ext_data.get("username")
+            or ""
+        ).strip()
+        final_user_name = client_user_name or biz_user_name or record["user_id"]
+
+        # 需求 §2.7：若 client 带 user_name 且与库中不同 → 更新库
+        if final_user_name and (record.get("username") or "") != final_user_name:
+            ok = user_store.update_username(record["user_id"], final_user_name)
+            if ok:
+                record["username"] = final_user_name
+                invalidate_user_name_cache(record["user_id"])
+                logger.info(
+                    f"[Auth] 更新 username: user_id={record['user_id']} "
+                    f"old={record.get('username')!r} new={final_user_name!r}"
+                )
+
+        # 发 token 时把 name 写入 JWT，便于 WebSocket 事件直接读
         token, _jti, exp = issue_token(
             username=record["username"],
             user_id=record["user_id"],
             room_id=record.get("room_id"),
             role=record.get("role", "member"),
+            name=final_user_name,
         )
-        logger.info(f"[Auth] 三方登录成功: username={username} user_id={record['user_id']}")
+        logger.info(
+            f"[Auth] 三方登录成功: username={record['username']} "
+            f"user_id={record['user_id']} name={final_user_name!r}"
+        )
         return {
             "code": 0,
             "message": "success",
             "data": {
-                "username": record["username"],
+                "username": record["username"],  # 与库中一致（含更新后的显示名）
+                "name": final_user_name,         # 实际生效的"显示名"，便于客户端核对
                 "user_id": record["user_id"],
                 "room_id": record.get("room_id"),
                 "role": record.get("role", "member"),
@@ -796,7 +845,8 @@ async def auth_login(req: LoginRequest):
     # ---------- 模式2：内部账号（兼容旧客户端） ----------
     logger.info(
         f"[Auth] /auth/login 入口: mode=internal username={req.username!r} "
-        f"password_len={len(req.password) if req.password else 0}"
+        f"password_len={len(req.password) if req.password else 0} "
+        f"user_name={req.user_name!r}"
     )
     if not req.username or not req.password:
         return api_err(400, "需要提供 external_token 或 username+password")
@@ -806,17 +856,39 @@ async def auth_login(req: LoginRequest):
         logger.warning(f"[Auth] 内部账号校验失败: username={req.username!r} code={e.code} message={e.message}")
         return api_err(e.code, e.message)
 
+    # 校验 client 传入的 user_name（可选）
+    try:
+        client_user_name = validate_user_name(req.user_name or "")
+    except UserNameError as e:
+        return api_err(e.code, e.message)
+
+    # 内部账号模式下，user_name 是显示名；若 client 传了就更新库 + 缓存
+    if client_user_name and (record.get("username") or "") != client_user_name:
+        # 注意：内部账号模式下 _users 的 key 就是 username，不能改 key
+        # 这里只更新 record["username"] 字段语义为"显示名"，但保持 key 不变
+        # → 需求 §2.7：重复登录带 user_name → 更新库中 username（按 record.username 字段）
+        old = record.get("username", "")
+        record["username"] = client_user_name
+        with user_store._lock:
+            user_store._flush()
+        invalidate_user_name_cache(record["user_id"])
+        logger.info(f"[Auth] 内部账号更新 username: user_id={record['user_id']} old={old!r} new={client_user_name!r}")
+
+    final_user_name = client_user_name or record["username"] or record["user_id"]
+
     token, _jti, exp = issue_token(
         username=record["username"],
         user_id=record["user_id"],
         room_id=record.get("room_id"),
         role=record.get("role", "member"),
+        name=final_user_name,
     )
     return {
         "code": 0,
         "message": "success",
         "data": {
             "username": record["username"],
+            "name": final_user_name,
             "user_id": record["user_id"],
             "room_id": record.get("room_id"),
             "role": record.get("role", "member"),
@@ -987,6 +1059,96 @@ async def room_health(room_id: str):
         })
     except Exception as e:
         logger.error(f"[API] room_health error: {e}")
+        return api_err(500, str(e))
+
+
+# ==============================================================================
+# § 用户名查询接口（按 user_id 取 username / 批量）
+# ==============================================================================
+_USER_ID_RE = re.compile(r"^user_[A-Za-z0-9]{12}$")
+
+
+@app.get("/api/v1/users/{user_id}/name")
+async def get_user_name(request: Request, user_id: str):
+    """按 user_id 查询用户名。
+
+    鉴权：需 Authorization: Bearer <chat_token>
+    响应：data = {user_id, username, avatar=null}
+    """
+    try:
+        # 鉴权
+        jwt_user_id = getattr(request.state, "user_id", None)
+        if not jwt_user_id:
+            return api_err(401, "token 无效或已过期")
+
+        # 格式校验
+        if not _USER_ID_RE.match(user_id or ""):
+            return JSONResponse(
+                status_code=400,
+                content={"code": 400, "message": "user_id 格式非法"},
+            )
+
+        # 查记录
+        rec = user_store.get_by_user_id(user_id)
+        if not rec:
+            return JSONResponse(
+                status_code=404,
+                content={"code": 404, "message": "user not found", "data": None},
+            )
+
+        username = resolve_display_name(user_id, user_store=user_store, fallback=user_id)
+        return api_ok({
+            "user_id": user_id,
+            "username": username,
+            "avatar": None,
+        })
+    except Exception as e:
+        logger.error(f"[API] get_user_name error: {e}")
+        return api_err(500, str(e))
+
+
+class BatchUserNamesRequest(BaseModel):
+    user_ids: List[str]
+
+
+@app.post("/api/v1/users/names")
+async def batch_get_user_names(request: Request, req: BatchUserNamesRequest):
+    """批量按 user_id 查询用户名（房间成员列表渲染用）。
+
+    鉴权：需 Authorization: Bearer <chat_token>
+    请求：data.user_ids: [user_id, ...]  ≤100
+    响应：data.users: [{user_id, username, avatar}, ...]  不存在的 user_id 省略
+    """
+    try:
+        jwt_user_id = getattr(request.state, "user_id", None)
+        if not jwt_user_id:
+            return api_err(401, "token 无效或已过期")
+
+        ids = req.user_ids or []
+        if len(ids) > 100:
+            return api_err(400, "user_ids 长度不能超过 100")
+
+        # 去重 + 过滤非法
+        seen = []
+        for uid in ids:
+            if isinstance(uid, str) and _USER_ID_RE.match(uid) and uid not in seen:
+                seen.append(uid)
+
+        users_out = []
+        for uid in seen:
+            rec = user_store.get_by_user_id(uid)
+            if not rec:
+                continue
+            username = resolve_display_name(uid, user_store=user_store, fallback=uid)
+            users_out.append({
+                "user_id": uid,
+                "username": username,
+                "avatar": None,
+            })
+
+        return api_ok({"users": users_out})
+    except Exception as e:
+        logger.error(f"[API] batch_get_user_names error: {e}")
         return api_err(500, str(e))
 
 
@@ -1256,7 +1418,7 @@ async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
                 "room_id": actual_room_id,
                 "data": {
                     "owner_id": jwt_user_id,
-                    "owner_name": jwt_user_id,
+                    "owner_name": getattr(request.state, "name", "") or jwt_user_id,
                     "timestamp": int(time.time())
                 }
             }, exclude_user_ids={jwt_user_id})
@@ -1265,7 +1427,11 @@ async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
         await manager.broadcast_to_room_with_timestamp(actual_room_id, {
             "type": "member_joined",
             "room_id": actual_room_id,
-            "user_id": jwt_user_id
+            "user_id": jwt_user_id,
+            "data": {
+                "name": getattr(request.state, "name", "") or jwt_user_id,
+                "role": role.value,
+            }
         })
 
         logger.info(f"[API] User {jwt_user_id} joined room {actual_room_id}")
@@ -1307,16 +1473,17 @@ async def leave_room(request: Request, room_id: str, req: RoomLeaveRequest):
 
         if was_owner:
             # 房主离开：广播 owner_offline 给其他成员（不包含房主自己）
+            owner_name = resolve_display_name(jwt_user_id, user_store=user_store, fallback=jwt_user_id)
             await manager.broadcast_to_room_exclude(room_id, {
                 "type": "owner_offline",
                 "room_id": room_id,
                 "data": {
                     "owner_id": jwt_user_id,
-                    "owner_name": jwt_user_id,
+                    "owner_name": owner_name,
                     "timestamp": int(time.time())
                 }
             }, exclude_user_ids={jwt_user_id})
-            logger.info(f"[API] Owner {jwt_user_id} left room {room_id}, broadcast owner_offline")
+            logger.info(f"[API] Owner {jwt_user_id} (name={owner_name!r}) left room {room_id}, broadcast owner_offline")
         else:
             await manager.broadcast_to_room_with_timestamp(room_id, {
                 "type": "member_left",
@@ -1400,15 +1567,21 @@ async def knock_door(request: Request, room_id: str, req: KnockRequest):
             "timestamp": _get_timestamp()
         }
 
+        # 取敲门者的"显示名"：优先 JWT 中的 name claim，兜底 user_id
+        knocker_name = getattr(request.state, "name", "") or knocker_id
+
         # 通知房主
         await manager.send_to_user_with_timestamp(room.owner_id, {
             "type": "room_knock",
             "room_id": room_id,
             "knocker_id": knocker_id,
-            "data": {"message": req.message}
+            "data": {
+                "message": req.message,
+                "name": knocker_name,
+            }
         })
 
-        logger.info(f"[API] Knock from {knocker_id} on room {room_id}")
+        logger.info(f"[API] Knock from {knocker_id} (name={knocker_name!r}) on room {room_id}")
         return api_ok({
             "room_id": room_id,
             "owner_id": room.owner_id,
@@ -2362,19 +2535,27 @@ async def broadcast_speaking_event(room_id: str, request: Request):
         if not user_id:
             return api_err(400, "user_id is required")
 
+        # 取说话者的显示名（user_id 是说话者；这里没鉴权，从 user_store 取）
+        speaker_name = resolve_display_name(user_id, user_store=user_store, fallback=user_id)
+
         if event_type == "start":
             msg = {
                 "type": "user_speaking_start",
                 "room_id": room_id,
                 "user_id": user_id,
-                "data": {"stream_url": stream_url}
+                "data": {
+                    "stream_url": stream_url,
+                    "user_name": speaker_name,
+                }
             }
         elif event_type == "stop":
             msg = {
                 "type": "user_speaking_stop",
                 "room_id": room_id,
                 "user_id": user_id,
-                "data": {}
+                "data": {
+                    "user_name": speaker_name,
+                }
             }
         else:
             return api_err(400, "type must be 'start' or 'stop'")

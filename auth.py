@@ -156,6 +156,50 @@ class UserStore:
         with self._lock:
             return self._users.get(username)
 
+    def get_by_user_id(self, user_id: str) -> Optional[dict]:
+        """按 user_id 查记录（扫描 _user_id_to_name → username → record）"""
+        with self._lock:
+            name = self._user_id_to_name.get(user_id)
+            if name:
+                rec = self._users.get(name)
+                if rec:
+                    return rec
+            # 兜底：兼容早期没有 _user_id_to_name 的情况（直接扫描）
+            for name, rec in self._users.items():
+                if rec.get("user_id") == user_id:
+                    return rec
+            return None
+
+    def update_username(self, user_id: str, new_username: str) -> bool:
+        """更新库中 username。user_id 决定唯一记录，new_username 是新的显示名。
+
+        行为：
+          - 若 user_id 不存在 → 返回 False（不抛错）。
+          - 同步维护 _user_id_to_name 索引（删除旧的 username 映射）。
+          - 落盘到 users.json。
+        """
+        new_username = (new_username or "").strip()
+        with self._lock:
+            rec = None
+            old_username = ""
+            for name, r in self._users.items():
+                if r.get("user_id") == user_id:
+                    rec = r
+                    old_username = name
+                    break
+            if rec is None:
+                return False
+            if old_username == new_username:
+                return True
+            # 注意：_users 的 key 是 username，但 get_or_create_from_external
+            # 用 username 当唯一键。改名时不应改 key，否则会破坏按 username 的索引。
+            # 改的是 record["username"] 字段（外部读取时使用的"显示名"），
+            # 而不是 _users 的 key。
+            rec["username"] = new_username
+            rec["updated_at"] = int(time.time())
+            self._flush()
+            return True
+
     def set_room(self, username: str, room_id: Optional[str]) -> None:
         """登录进房后回填 / 离开房间后清空"""
         with self._lock:
@@ -230,9 +274,14 @@ def issue_token(
     user_id: str = "",
     room_id: Optional[str] = None,
     role: str = "member",
+    name: Optional[str] = None,
 ) -> Tuple[str, str, int]:
     """签发 JWT。返回 (token, jti, expires_at_unix)。
     同时把 jti 注册到 revocation.active_jtis，供后续 logout-all 使用。
+
+    name: 用户在聊天室内显示的"显示名"（与 username 不同：username 是 user_store._users 的 key，
+          通常是业务后端 identity；name 是客户端登录时通过 user_name 传入或兜底取的"显示名"）。
+          写入 JWT 的 `name` claim，便于 WebSocket 事件直接读取，避免每次查库。
     """
     now = int(time.time())
     exp = now + JWT_TTL_SECONDS
@@ -240,6 +289,8 @@ def issue_token(
     payload = {
         "sub": username,
         "uid": user_id,
+        # name 默认等于 username（向后兼容）
+        "name": (name or username or ""),
         "room": room_id,
         "role": role,
         "jti": jti,
