@@ -76,3 +76,45 @@ translation_trans_*.log
 callback_server.log
 *.zip
 *.tar.gz
+
+# =============================================================================
+# 运行时数据 / 密钥 / 临时文件（绝对不要 commit）
+# =============================================================================
+
+# JWT / 密钥 / 服务端配置
+.jwt_secret
+*.pem
+*.key
+
+# 用户与运行时状态数据
+users.json
+users.json.*
+invitations.json
+invitations.json.*
+invitations_active.json
+invitations_archive.json
+invitations.json.legacy
+revoked_tokens.json
+
+# 音频 / 录制临时数据
+input_recordings/
+pcm_recordings/
+tts_recordings/
+*.wav
+*.mp3
+test_tts_output.mp3
+
+# 编辑器 / 备份文件
+*.bak
+*.bak.*
+*.tmp
+*.swp
+*.swo
+*~
+__MACOSX/
+.DS_Store
+
+# 客户端 demo 与第三方示例（不属于主仓）
+android_socketio_example/
+srs-stream-test/
+realtime_trans_python3/
