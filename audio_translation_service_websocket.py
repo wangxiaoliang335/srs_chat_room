@@ -24,7 +24,7 @@ import fcntl
 import select
 import requests
 import errno
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 from baidu_realtime_translation import BaiduRealtimeTranslationClient, RealtimeTranslationProcessor
 
@@ -168,14 +168,18 @@ class RealtimeTranslationService:
         """TTS 音频回调"""
         self.stats["tts_received"] += 1
         self.stats["last_tts_size"] = len(audio_data)
+
+        logger.info(
+            f"[{self.request_id}] Outer TTS callback received: packet={self.stats['tts_received']}, bytes={len(audio_data)}"
+        )
         
         # 将 TTS 音频放入队列
         try:
             self.tts_queue.put_nowait(audio_data)
             queue_size = self.tts_queue.qsize()
-            # 每10个TTS包打印一次队列状态
-            if self.stats["tts_received"] % 10 == 0:
-                logger.info(f"[{self.request_id}] TTS received: size={len(audio_data)} bytes, queue_size={queue_size}")
+            logger.info(
+                f"[{self.request_id}] Outer TTS queued: bytes={len(audio_data)}, queue_size={queue_size}"
+            )
             if queue_size > 80:  # 队列积压超过80%
                 logger.warning(f"[{self.request_id}] TTS queue backlog: queue_size={queue_size}/100 (80%+)")
         except queue.Full:
@@ -226,8 +230,17 @@ class RealtimeTranslationService:
         
         # 设置回调
         self.processor.on_translation_callback = self._on_translation_result
+        self.processor.on_tts_audio_callback = self._on_tts_audio
         self.processor.on_tts_callback = self._on_tts_audio
         self.processor.on_error_callback = self._on_error
+
+        logger.info(
+            f"[{self.request_id}] Processor callbacks bound: "
+            f"translation={self.processor.on_translation_callback is not None}, "
+            f"tts_audio={self.processor.on_tts_audio_callback is not None}, "
+            f"tts_legacy={self.processor.on_tts_callback is not None}, "
+            f"error={self.processor.on_error_callback is not None}"
+        )
 
         # 应用 TTS 保存配置
         if self._tts_save_enabled:
@@ -329,17 +342,29 @@ class AudioStreamProcessorWebSocket:
     def __init__(self, srs_url: str, room_id: str, source_user: str, to_lang: str,
                  stream_name: str, app_id: str, app_key: str,
                  audio_config: Optional[Dict[str, Any]] = None,
-                 from_lang: str = "auto"):
+                 from_lang: str = "zh"):
         self.srs_url = srs_url
         self.room_id = room_id
         self.source_user = source_user
         self.to_lang = to_lang
+        
+        # 百度不支持 auto，需要使用具体语言代码
+        # 如果是 auto，根据目标语言推断源语言
+        if from_lang == "auto":
+            if to_lang == "en":
+                from_lang = "zh"  # 中文 -> 英文
+            elif to_lang == "zh":
+                from_lang = "en"  # 英文 -> 中文
+            else:
+                from_lang = "zh"  # 默认中文
+        
         self.from_lang = from_lang  # 源语言
         self.stream_name = stream_name
         self.app_id = app_id
         self.app_key = app_key
         self.ffmpeg_process = None
         self.output_process = None
+        self.tts_decode_process = None
         self.is_running = False
         self.request_id = os.getenv("REQUEST_ID", "unknown")
         self.stream_vhost = "__defaultVhost__"  # 默认 vhost
@@ -463,10 +488,13 @@ class AudioStreamProcessorWebSocket:
     def start(self):
         """启动音频流处理"""
         self.is_running = True
-        
-        # 先获取流的 vhost
-        self.stream_vhost = self._get_stream_vhost()
-        
+
+        # 先等待源流就绪，确保 stream_vhost 被正确设置（与源流同 vhost，推到 SRS 才不会被拒）
+        # wait_for_stream_ready 内部会回填 self.stream_vhost
+        if not self._wait_for_stream_ready(max_wait_time=15):
+            logger.warning(f"[{self.request_id}] Source stream not ready within 15s, "
+                           f"will retry vhost lookup in TTS push thread. Current vhost={self.stream_vhost}")
+
         # 启动音频读取线程
         threading.Thread(target=self._read_audio_thread, daemon=True).start()
         logger.info(f"[{self.request_id}] Audio read thread started")
@@ -554,7 +582,7 @@ class AudioStreamProcessorWebSocket:
         last_error_type = None
         consecutive_failures = 0    # 连续失败次数，用于指数退避
         source_stream_lost_time = None  # 源流丢失开始时间
-        max_source_lost_seconds = 1200  # 源流丢失后最多重试 20 分钟
+        max_source_lost_seconds = 120  # 源流丢失后最多重试 2 分钟
         
         # SRS 健康检查
         def check_srs_healthy():
@@ -588,7 +616,7 @@ class AudioStreamProcessorWebSocket:
                     # 记录源流丢失开始时间
                     if source_stream_lost_time is None:
                         source_stream_lost_time = time.time()
-                        logger.warning(f"[{self.request_id}] Source stream lost, starting 20min timeout...")
+                        logger.warning(f"[{self.request_id}] Source stream lost, starting 2min timeout...")
                     
                     # 检查是否超过20分钟
                     elapsed_without_stream = time.time() - source_stream_lost_time
@@ -830,41 +858,69 @@ class AudioStreamProcessorWebSocket:
         # SRS 地址 - 优先使用内网地址，如果连接失败再用公网地址
         srs_host = os.environ.get("SRS_HOST", "127.0.0.1")
         srs_port = os.environ.get("SRS_PORT", "1935")
-        
-        # 使用标准 RTMP URL 格式: rtmp://host/vhost/app/stream
-        # 注意: vhost 名称需要与 SRS 配置一致
-        # 翻译流始终使用 __defaultVhost__，因为只有它配置了 http_remux
-        vhost = "__defaultVhost__"
-        # 流名称添加 .flv 后缀，因为客户端通过 HTTP-FLV 播放，需要带 .flv 扩展名
-        output_stream_name = f"{self.stream_name}.flv"
-        # RTMP URL 格式: rtmp://ip:port/app?vhost=xxx/stream_key
-        rtmp_url = f"rtmp://{srs_host}:{srs_port}/live?vhost={vhost}/{output_stream_name}"
-        logger.info(f"[{self.request_id}] TTS output stream: {rtmp_url}")
 
-        # FFmpeg 命令（接收 MP3 音频）
-        # 百度TTS返回16kHz采样率的MP3，需要转码为AAC才能推流到SRS
-        # 注意：必须使用 -af 音频过滤器强制重采样，-ar 和 -ac 只是输入格式声明
+        # 翻译流推流 vhost 必须与源流一致（动态获取），避免 SRS 出现 vhost 路由不一致 / pattern duplicated 问题
+        vhost = self.stream_vhost
+        # RTMP 推流使用纯流名；HTTP-FLV 播放时再由客户端追加 .flv 后缀
+        output_stream_name = self.stream_name
+        # 使用标准 RTMP URL 结构：rtmp://host/app/stream?vhost=xxx
+        rtmp_url = f"rtmp://{srs_host}:{srs_port}/live/{output_stream_name}?vhost={vhost}"
+        logger.info(f"[{self.request_id}] TTS output stream: {rtmp_url} (vhost={vhost} 来自源流)")
+
+        # 推流前再次确认 vhost 与源流一致：start() 时源流可能还没订阅者，
+        # _get_stream_vhost() 会回退到 __defaultVhost__，导致推到错的 vhost 被 SRS 拒收。
+        # 这里最多等 30 秒，每 2 秒重查一次；查不到时打印强警告。
+        vhost_confirmed = False
+        for _ in range(15):
+            fresh_vhost = self._get_stream_vhost()
+            if fresh_vhost and fresh_vhost != "__defaultVhost__":
+                if fresh_vhost != self.stream_vhost:
+                    logger.info(f"[{self.request_id}] vhost updated: {self.stream_vhost} -> {fresh_vhost}")
+                    self.stream_vhost = fresh_vhost
+                    vhost = fresh_vhost
+                    rtmp_url = f"rtmp://{srs_host}:{srs_port}/live/{output_stream_name}?vhost={vhost}"
+                vhost_confirmed = True
+                break
+            time.sleep(2)
+
+        if not vhost_confirmed:
+            logger.error(f"[{self.request_id}] CRITICAL: Cannot confirm source stream vhost! "
+                         f"Will push to {vhost} (likely __defaultVhost__). "
+                         f"This usually means the source stream {self.room_id}_{self.source_user} "
+                         f"has no active subscribers on SRS, or vhost detection failed. "
+                         f"Check SRS API: curl -s http://127.0.0.1:1985/api/v1/streams/")
+
+        # FFmpeg 命令（接收 PCM 音频）
+        # 先将百度返回的 MP3 解码成 16kHz 单声道 PCM，再由这里统一编码为 AAC 推流到 SRS
+        # 显式声明输入格式为 MP3，避免 FFmpeg 自动探测失败
         # -re 参数：以实时速率读取输入，确保播放速度正确
         ffmpeg_bin = os.environ.get("FFMPEG_BIN", "/usr/bin/ffmpeg")
         ffmpeg_output_cmd = [
             ffmpeg_bin,
-            "-hide_banner",           # 隐藏 banner 信息
-            "-loglevel", "info",     # 改为 info 以便查看更多日志
-            "-re",                    # 以实时速率读取输入，确保播放速度正确
-            "-i", "-",               # 从 stdin 读取，让 FFmpeg 自动检测格式
-            "-rw_timeout", "30000000",  # IO 超时 30 秒（微秒）
-            "-af", "aresample=16000:filter_size=64:cutoff=0.95,pan=mono|c0=c0",  # 强制重采样为 16kHz 单声道
-            "-c:a", "aac",           # 转码为 AAC
-            "-b:a", "64k",
-            "-f", "flv",
+            "-hide_banner",
+            "-loglevel", "info",
             "-fflags", "nobuffer",
             "-flags", "low_delay",
-            "-max_delay", "5000000",  # 最大延迟 5 秒
-            "-reconnect", "1",        # 自动重连
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
+            "-thread_queue_size", "1024",
+            "-f", "s16le",
+            "-ar", "16000",
+            "-ac", "1",
+            "-i", "-",
+            "-af", "aresample=16000:filter_size=64:cutoff=0.95,pan=mono|c0=c0",
+            "-c:a", "aac",
+            "-b:a", "64k",
+            "-f", "flv",
+            "-flush_packets", "1",
+            "-muxdelay", "0",
+            "-muxpreload", "0",
+            "-max_delay", "5000000",
             rtmp_url
         ]
+
+        ffmpeg_output_log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'audio_translation_ffmpeg_output_websocket.log'
+        )
         
         logger.info(f"[{self.request_id}] Starting FFmpeg output process: {' '.join(ffmpeg_output_cmd)}")
         
@@ -893,9 +949,10 @@ class AudioStreamProcessorWebSocket:
         tts_send_interval = 0.04  # 每包间隔 40ms
         last_tts_send_time = time.time() - tts_send_interval  # 初始时间
         
-        # stderr buffer 用于存储 ffmpeg 错误信息
+        # stderr buffer 用于兼容现有重试日志逻辑
         stderr_buffer = []
-        stderr_thread = None
+        pcm_frame_bytes = 16000 * 2 * 1 // 25  # 40ms of 16kHz mono s16le = 1280 bytes
+        decoded_pcm_buffer = bytearray()
         
         try:
             while self.is_running:
@@ -935,38 +992,54 @@ class AudioStreamProcessorWebSocket:
                             logger.warning(f"[{self.request_id}] SRS not healthy, waiting {retry_interval * 2}s before retry...")
                             time.sleep(retry_interval * 2)
                             continue
-                        
-                        # 使用 PIPE 捕获 stderr，并设置 bufsize=0 以立即写入
+
+                        stderr_file = open(ffmpeg_output_log_path, 'ab', buffering=0)
+                        self._ffmpeg_output_stderr_file = stderr_file
+
+                        # 使用阻塞 stdin 写入，避免非阻塞管道的半写/丢写问题
                         self.output_process = subprocess.Popen(
                             ffmpeg_output_cmd,
                             stdin=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
+                            stderr=stderr_file,
                             bufsize=0
                         )
-                        
-                        # 设置 stdin 为非阻塞模式
-                        import errno
-                        stdin_fd = self.output_process.stdin.fileno()
-                        flags = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
-                        fcntl.fcntl(stdin_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                        
-                        # 启动 stderr 读取线程
-                        stderr_thread = threading.Thread(
-                            target=self._read_ffmpeg_stderr,
-                            args=(self.output_process.stderr, stderr_buffer),
-                            daemon=True
+
+                        decode_stderr_target = subprocess.DEVNULL
+                        self.tts_decode_process = subprocess.Popen(
+                            [
+                                ffmpeg_bin,
+                                "-hide_banner",
+                                "-loglevel", "error",
+                                "-fflags", "nobuffer",
+                                "-flags", "low_delay",
+                                "-f", "mp3",
+                                "-i", "-",
+                                "-f", "s16le",
+                                "-acodec", "pcm_s16le",
+                                "-ar", "16000",
+                                "-ac", "1",
+                                "-"
+                            ],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=decode_stderr_target,
+                            bufsize=0
                         )
-                        stderr_thread.start()
-                        
-                        logger.info(f"[{self.request_id}] FFmpeg output started, PID={self.output_process.pid}")
-                        
+
+                        logger.info(
+                            f"[{self.request_id}] TTS decode FFmpeg started, PID={self.tts_decode_process.pid}"
+                        )
+
                         # 重置发送时间，确保速率控制正确
                         last_tts_send_time = time.time()
-                        
+
                         # 记录 FFmpeg 启动时间，用于诊断
                         self._ffmpeg_last_start_time = time.time()
                     except Exception as e:
                         logger.error(f"[{self.request_id}] Failed to start FFmpeg: {e}")
+                        stderr_file = getattr(self, '_ffmpeg_output_stderr_file', None)
+                        if stderr_file:
+                            self._close_ffmpeg_output_stderr_file()
                         time.sleep(retry_interval)
                         continue
                 
@@ -976,18 +1049,19 @@ class AudioStreamProcessorWebSocket:
                     if not check_process_alive(self.output_process):
                         # 进程已退出，获取退出码
                         poll_result = self.output_process.poll()
-                        
-                        # 获取 stderr 内容
-                        if stderr_thread:
-                            stderr_thread.join(timeout=1)
-                        stderr_text = "".join(stderr_buffer)
-                        
+                        stderr_text = ""
+                        try:
+                            with open(ffmpeg_output_log_path, 'rb') as stderr_file:
+                                stderr_text = stderr_file.read()[-4096:].decode('utf-8', errors='replace')
+                        except Exception:
+                            stderr_text = ""
+
                         # 详细记录进程退出信息
                         exit_info = f"FFmpeg process exited: pid={self.output_process.pid if hasattr(self.output_process, 'pid') else 'N/A'}, code={poll_result}, age={time.time() - getattr(self, '_ffmpeg_last_start_time', time.time()):.1f}s"
                         if stderr_text:
-                            exit_info += f", stderr={stderr_text[:500]}"
+                            exit_info += f", stderr_tail={stderr_text[:500]}"
                         logger.error(f"[{self.request_id}] {exit_info}")
-                        
+
                         # 分类错误类型
                         if "Unknown encoder" in stderr_text or "codec not found" in stderr_text:
                             error_type = "AAC encoder not found"
@@ -1009,14 +1083,17 @@ class AudioStreamProcessorWebSocket:
                             error_type = "Unknown"
                             if stderr_text:
                                 logger.warning(f"[{self.request_id}] FFmpeg stderr: {stderr_text[:200]}")
-                        
+
                         # 只在错误类型变化时打印警告
                         if error_type != last_error_type:
                             logger.warning(f"[{self.request_id}] FFmpeg output error: {error_type}, retry={retry_count}/{max_retries}, elapsed={elapsed:.1f}s")
                             last_error_type = error_type
-                        
+
                         # 关闭进程引用
                         self.output_process = None
+                        stderr_file_handle = getattr(self, '_ffmpeg_output_stderr_file', None)
+                        if stderr_file_handle:
+                            self._close_ffmpeg_output_stderr_file()
                         time.sleep(retry_interval)
                         continue
                 
@@ -1029,23 +1106,23 @@ class AudioStreamProcessorWebSocket:
                     
                     # 如果百度断开了，使用静音数据保持推流
                     if not baidu_connected:
-                        # 生成静音 MP3 数据（如果还没有的话）
-                        if not hasattr(self, '_silent_mp3'):
-                            logger.warning(f"[{self.request_id}] Baidu disconnected, generating silent MP3...")
+                        # 生成静音 PCM 数据（如果还没有的话）
+                        if not hasattr(self, '_silent_pcm'):
+                            logger.warning(f"[{self.request_id}] Baidu disconnected, generating silent PCM...")
                             result = subprocess.run([
                                 '/usr/bin/ffmpeg', '-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono',
-                                '-t', '1', '-c:a', 'libmp3lame', '-b:a', '16k', '-f', 'mp3', '-'
+                                '-t', '1', '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-'
                             ], capture_output=True, timeout=5)
                             if result.returncode == 0:
-                                self._silent_mp3 = result.stdout
-                                self._silent_mp3_len = len(self._silent_mp3)
-                                logger.info(f"[{self.request_id}] Silent MP3 generated: {self._silent_mp3_len} bytes")
+                                self._silent_pcm = result.stdout
+                                self._silent_pcm_len = len(self._silent_pcm)
+                                logger.info(f"[{self.request_id}] Silent PCM generated: {self._silent_pcm_len} bytes")
                             else:
-                                self._silent_mp3 = b''
-                                self._silent_mp3_len = 0
-                                logger.error(f"[{self.request_id}] Failed to generate silent MP3: {result.stderr[:200]}")
+                                self._silent_pcm = b''
+                                self._silent_pcm_len = 0
+                                logger.error(f"[{self.request_id}] Failed to generate silent PCM: {result.stderr[:200]}")
                         # 使用静音数据
-                        tts_audio = self._silent_mp3
+                        tts_audio = self._silent_pcm
                         is_silent_audio = True
                         if not hasattr(self, '_silent_audio_count'):
                             self._silent_audio_count = 0
@@ -1094,97 +1171,123 @@ class AudioStreamProcessorWebSocket:
                 
                 # 写入音频数据
                 if tts_audio:
-                    if self.output_process and check_process_alive(self.output_process):
+                    pcm_chunks_to_write = []
+                    if is_silent_audio:
+                        # 静音数据也要分割成标准大小的 chunks
+                        chunk_size = pcm_frame_bytes  # 8192 bytes
+                        for i in range(0, len(tts_audio), chunk_size):
+                            pcm_chunks_to_write.append(tts_audio[i:i+chunk_size])
+                    else:
+                        decoder_ready = (
+                            self.tts_decode_process
+                            and check_process_alive(self.tts_decode_process)
+                            and self.tts_decode_process.stdin is not None
+                            and self.tts_decode_process.stdout is not None
+                        )
+
+                        if decoder_ready:
+                            try:
+                                self.tts_decode_process.stdin.write(tts_audio)
+                                self.tts_decode_process.stdin.flush()
+
+                                decode_fd = self.tts_decode_process.stdout.fileno()
+                                decode_flags = fcntl.fcntl(decode_fd, fcntl.F_GETFL)
+                                fcntl.fcntl(decode_fd, fcntl.F_SETFL, decode_flags | os.O_NONBLOCK)
+
+                                empty_polls = 0
+                                while empty_polls < 4:
+                                    ready, _, _ = select.select([decode_fd], [], [], 0.03)
+                                    if not ready:
+                                        empty_polls += 1
+                                        continue
+                                    chunk = os.read(decode_fd, 65536)
+                                    if not chunk:
+                                        empty_polls += 1
+                                        continue
+                                    decoded_pcm_buffer.extend(chunk)
+                                    empty_polls = 0
+
+                                while len(decoded_pcm_buffer) >= pcm_frame_bytes:
+                                    pcm_chunks_to_write.append(bytes(decoded_pcm_buffer[:pcm_frame_bytes]))
+                                    del decoded_pcm_buffer[:pcm_frame_bytes]
+
+                                if decoded_pcm_buffer:
+                                    logger.info(
+                                        f"[{self.request_id}] Decoder buffered PCM remains: available={len(decoded_pcm_buffer)} bytes, writes_ready={len(pcm_chunks_to_write)}"
+                                    )
+                            except (BrokenPipeError, OSError, IOError) as decode_err:
+                                logger.error(f"[{self.request_id}] TTS decode error: {decode_err}")
+                                if self.tts_decode_process:
+                                    try:
+                                        self.tts_decode_process.terminate()
+                                    except Exception:
+                                        pass
+                                self.tts_decode_process = None
+                        else:
+                            logger.warning(f"[{self.request_id}] TTS decode process unavailable, dropping {len(tts_audio)} bytes")
+
+                    if pcm_chunks_to_write and self.output_process and check_process_alive(self.output_process):
                         stdin_valid = self.output_process.stdin is not None
                         process_running = check_process_alive(self.output_process)
-                        
+
                         if stdin_valid and process_running:
-                            # 使用 select 检测管道是否可写（100ms超时）
-                            _, writable, _ = select.select([], [self.output_process.stdin], [], 0.1)
-                            
-                            # 每5秒打印一次 select 状态
-                            if not hasattr(self, '_last_select_log_time'):
-                                self._last_select_log_time = time.time()
-                            if current_time - self._last_select_log_time >= 5.0:
-                                self._last_select_log_time = current_time
-                                logger.info(f"[{self.request_id}] Select status: writable={bool(writable)}, ffmpeg_age={current_time - getattr(self, '_ffmpeg_last_start_time', current_time):.1f}s")
-                            
-                            if writable:
-                                # 速率控制：确保按实时速率发送
-                                now = time.time()
-                                time_since_last = now - last_tts_send_time
-                                if time_since_last < tts_send_interval:
-                                    time.sleep(tts_send_interval - time_since_last)
-                                last_tts_send_time = time.time()
-                                
-                                try:
-                                    self.output_process.stdin.write(tts_audio)
+                            try:
+                                for audio_to_write in pcm_chunks_to_write:
+                                    # 速率控制：确保按实时速率发送
+                                    now = time.time()
+                                    time_since_last = now - last_tts_send_time
+                                    if time_since_last < tts_send_interval:
+                                        time.sleep(tts_send_interval - time_since_last)
+                                    last_tts_send_time = time.time()
+
+                                    self.output_process.stdin.write(audio_to_write)
                                     self.output_process.stdin.flush()
-                                    
+
                                     # 写入成功后记录统计
-                                    audio_processed = getattr(self, '_audio_processed', 0) + len(tts_audio)
+                                    audio_processed = getattr(self, '_audio_processed', 0) + len(audio_to_write)
                                     setattr(self, '_audio_processed', audio_processed)
-                                    
+
                                     # 如果是静音数据，打印日志
                                     if is_silent_audio:
                                         if not hasattr(self, '_silent_write_count'):
                                             self._silent_write_count = 0
                                         self._silent_write_count += 1
                                         if self._silent_write_count % 50 == 1:  # 每50次打印一次
-                                            logger.info(f"[{self.request_id}] Silent audio written #{self._silent_write_count}: size={len(tts_audio)} bytes")
-                                except (BrokenPipeError, OSError, IOError) as write_err:
-                                    logger.error(f"[{self.request_id}] Write error to FFmpeg: {write_err}")
-                                    if self.output_process:
-                                        try:
-                                            self.output_process.terminate()
-                                        except:
-                                            pass
-                                    self.output_process = None
-                                    break
-                                
-                                # 重置不可写计数
-                                if hasattr(self, '_not_writable_count'):
-                                    delattr(self, '_not_writable_count')
-                                
-                                # 减少日志频率，每10个TTS包打印一次
-                                tts_write_count = getattr(self, '_tts_write_count', 0) + 1
-                                setattr(self, '_tts_write_count', tts_write_count)
-                                if tts_write_count % 10 == 0:
-                                    logger.info(f"[{self.request_id}] TTS written: size={len(tts_audio)} bytes, total={audio_processed}, writes={tts_write_count}")
-                            else:
-                                # 管道不可写，FFmpeg 缓冲区满或进程阻塞
-                                logger.warning(f"[{self.request_id}] FFmpeg stdin not writable (select returned False), checking process...")
-                                # 检查进程是否还在运行（使用 check_process_alive 避免僵尸进程问题）
-                                if not check_process_alive(self.output_process):
-                                    poll_result = self.output_process.poll() if self.output_process else None
-                                    logger.error(f"[{self.request_id}] FFmpeg process died with code {poll_result}, will restart")
-                                    self.output_process = None
-                                    break
-                                # 否则跳过这次写入，稍后重试
-                                # 添加计数器，连续不可写超过3次则强制重启
-                                not_writable_count = getattr(self, '_not_writable_count', 0) + 1
-                                setattr(self, '_not_writable_count', not_writable_count)
-                                if not_writable_count >= 3:
-                                    logger.error(f"[{self.request_id}] FFmpeg stdin not writable {not_writable_count} times, forcing restart")
-                                    if self.output_process:
-                                        try:
-                                            self.output_process.terminate()
-                                        except:
-                                            pass
-                                    self.output_process = None
-                                    break
+                                            logger.info(f"[{self.request_id}] Silent audio written #{self._silent_write_count}: size={len(audio_to_write)} bytes")
+                                    elif not hasattr(self, '_logged_first_tts_write'):
+                                        self._logged_first_tts_write = True
+                                        logger.info(
+                                            f"[{self.request_id}] First TTS PCM write succeeded: size={len(audio_to_write)} bytes"
+                                        )
+
+                                    # 减少日志频率，每10个TTS包打印一次
+                                    tts_write_count = getattr(self, '_tts_write_count', 0) + 1
+                                    setattr(self, '_tts_write_count', tts_write_count)
+                                    if tts_write_count % 10 == 0:
+                                        logger.info(
+                                            f"[{self.request_id}] TTS written as PCM: size={len(audio_to_write)} bytes, total={audio_processed}, writes={tts_write_count}"
+                                        )
+                            except (BrokenPipeError, OSError, IOError) as write_err:
+                                logger.error(f"[{self.request_id}] Write error to FFmpeg: {write_err}")
+                                if self.output_process:
+                                    try:
+                                        self.output_process.terminate()
+                                    except Exception:
+                                        pass
+                                self.output_process = None
+                                stderr_file_handle = getattr(self, '_ffmpeg_output_stderr_file', None)
+                                if stderr_file_handle:
+                                    self._close_ffmpeg_output_stderr_file()
+                                break
                         else:
                             logger.warning(f"[{self.request_id}] FFmpeg stdin invalid: stdin={stdin_valid}, running={process_running}")
-                    else:
+                    elif tts_audio:
                         # FFmpeg 进程不存在或已退出，打印诊断信息
                         if not self.output_process:
-                            logger.warning(f"[{self.request_id}] FFmpeg output process is None (TTS audio dropped: {len(tts_audio)} bytes)")
+                            logger.warning(f"[{self.request_id}] FFmpeg output process is None (TTS audio dropped: {sum(len(x) for x in pcm_chunks_to_write) if pcm_chunks_to_write else 0} bytes)")
                         elif not check_process_alive(self.output_process):
                             poll_result = self.output_process.poll()
-                            logger.warning(f"[{self.request_id}] FFmpeg output process exited with code: {poll_result} (TTS audio dropped: {len(tts_audio)} bytes)")
-                        # 重置不可写计数器
-                        if hasattr(self, '_not_writable_count'):
-                            delattr(self, '_not_writable_count')
+                            logger.warning(f"[{self.request_id}] FFmpeg output process exited with code: {poll_result} (TTS audio dropped: {sum(len(x) for x in pcm_chunks_to_write) if pcm_chunks_to_write else 0} bytes)")
                 
                 # 定期检查 FFmpeg 进程状态（每 30 秒）
                 if not hasattr(self, '_last_ffmpeg_check_time'):
@@ -1210,12 +1313,19 @@ class AudioStreamProcessorWebSocket:
             logger.error(f"[{self.request_id}] Error in TTS push thread: {e}", exc_info=True)
         finally:
             # 确保进程被正确关闭
+            if self.tts_decode_process:
+                try:
+                    self.tts_decode_process.terminate()
+                    self.tts_decode_process.wait(timeout=2)
+                except:
+                    pass
             if self.output_process:
                 try:
                     self.output_process.terminate()
                     self.output_process.wait(timeout=2)
                 except:
                     pass
+            self._close_ffmpeg_output_stderr_file()
     
     def _read_ffmpeg_stderr(self, stderr_pipe, buffer: list):
         """读取 FFmpeg stderr 的线程函数"""
@@ -1257,6 +1367,95 @@ class AudioStreamProcessorWebSocket:
         except Exception as e:
             buffer.append(f"stderr read error: {e}\n")
             logger.warning(f"[{getattr(self, 'request_id', 'unknown')}] stderr read error: {e}")
+
+    def _extract_complete_mp3_frames(self, payload: bytes) -> Tuple[bytes, bytes]:
+        """从缓冲中提取完整 MP3 帧，返回 (完整帧数据, 剩余尾部数据)"""
+        if not payload:
+            return b"", b""
+
+        def parse_frame_length(header: bytes) -> Optional[int]:
+            if len(header) < 4:
+                return None
+            b0, b1, b2, b3 = header[0], header[1], header[2], header[3]
+            if b0 != 0xFF or (b1 & 0xE0) != 0xE0:
+                return None
+
+            version_id = (b1 >> 3) & 0x03
+            layer = (b1 >> 1) & 0x03
+            bitrate_index = (b2 >> 4) & 0x0F
+            sample_rate_index = (b2 >> 2) & 0x03
+            padding = (b2 >> 1) & 0x01
+
+            if version_id == 0x01 or layer != 0x01:
+                return None
+            if bitrate_index in (0, 0x0F) or sample_rate_index == 0x03:
+                return None
+
+            bitrate_table = {
+                0x03: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0],
+                0x02: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+                0x00: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+            }
+            sample_rate_table = {
+                0x03: [44100, 48000, 32000, 0],
+                0x02: [22050, 24000, 16000, 0],
+                0x00: [11025, 12000, 8000, 0],
+            }
+
+            bitrate_kbps = bitrate_table.get(version_id, [0] * 16)[bitrate_index]
+            sample_rate = sample_rate_table.get(version_id, [0] * 4)[sample_rate_index]
+            if not bitrate_kbps or not sample_rate:
+                return None
+
+            if version_id == 0x03:
+                frame_length = int((144000 * bitrate_kbps) / sample_rate) + padding
+            else:
+                frame_length = int((72000 * bitrate_kbps) / sample_rate) + padding
+
+            return frame_length if frame_length > 4 else None
+
+        complete_parts = []
+        cursor = 0
+        payload_len = len(payload)
+        last_good_end = 0
+        dropped_prefix = 0
+
+        while cursor + 4 <= payload_len:
+            if payload[cursor] != 0xFF or (payload[cursor + 1] & 0xE0) != 0xE0:
+                cursor += 1
+                continue
+
+            frame_length = parse_frame_length(payload[cursor:cursor + 4])
+            if frame_length is None:
+                cursor += 1
+                continue
+
+            frame_end = cursor + frame_length
+            if frame_end > payload_len:
+                break
+
+            if cursor > last_good_end:
+                dropped_prefix += cursor - last_good_end
+            complete_parts.append(payload[cursor:frame_end])
+            last_good_end = frame_end
+            cursor = frame_end
+
+        if dropped_prefix:
+            logger.warning(f"[{self.request_id}] Dropped {dropped_prefix} bytes before MP3 frame sync")
+
+        complete_audio = b"".join(complete_parts)
+        remainder = payload[last_good_end:]
+        return complete_audio, remainder
+
+    def _close_ffmpeg_output_stderr_file(self):
+        """关闭输出 FFmpeg 的 stderr 日志文件句柄"""
+        stderr_file_handle = getattr(self, '_ffmpeg_output_stderr_file', None)
+        if stderr_file_handle:
+            try:
+                stderr_file_handle.close()
+            except Exception:
+                pass
+            self._ffmpeg_output_stderr_file = None
     
     def stop(self):
         """停止音频流处理"""
@@ -1265,16 +1464,31 @@ class AudioStreamProcessorWebSocket:
         # 关闭 PCM 文件
         self._close_pcm_file()
         
+        # 关闭 FFmpeg stderr 日志文件（避免 fd 泄漏）
+        self._close_ffmpeg_output_stderr_file()
+        
         if self.realtime_service:
             self.realtime_service.disconnect()
         
-        if self.ffmpeg_process:
-            self.ffmpeg_process.terminate()
-            self.ffmpeg_process.wait()
-        
-        if self.output_process:
-            self.output_process.terminate()
-            self.output_process.wait()
+        # 关闭所有子进程，加 timeout 防止永远卡住
+        for proc, name in [
+            (self.ffmpeg_process, "ffmpeg_input"),
+            (self.output_process, "ffmpeg_output"),
+            (self.tts_decode_process, "tts_decode"),
+        ]:
+            if proc:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
+
+        self.ffmpeg_process = None
+        self.output_process = None
+        self.tts_decode_process = None
 
 
 class TranslationServiceWebSocket:
@@ -1302,7 +1516,7 @@ class TranslationServiceWebSocket:
         room_id = self.config.get("room_id", "")
         source_user = self.config.get("source_user", "")
         to_lang = self.config.get("to_lang", "en")
-        from_lang = self.config.get("from_lang", "auto")  # 源语言
+        from_lang = self.config.get("from_lang", "zh")  # 源语言，默认中文
         stream_name = self.config.get("stream_name", "")
         
         app_id = self.config.get("baidu_app_id")
@@ -1334,6 +1548,7 @@ class TranslationServiceWebSocket:
         logger.info(f"[{self.request_id}] Stopping WebSocket translation service...")
         
         if self.audio_processor:
+            self.audio_processor.is_running = False
             self.audio_processor.stop()
         
         logger.info(f"[{self.request_id}] WebSocket translation service stopped")
@@ -1345,7 +1560,7 @@ def main():
     room_id = os.getenv("ROOM_ID", "")
     source_user = os.getenv("SOURCE_USER", "")
     to_lang = os.getenv("TO_LANG", "en")
-    from_lang = os.getenv("FROM_LANG", "auto")  # 源语言，默认为 auto
+    from_lang = os.getenv("FROM_LANG", "zh")  # 源语言，默认为中文
     stream_name = os.getenv("STREAM_NAME", "")
     
     # WebSocket 翻译需要 App ID 和 App Key
@@ -1395,17 +1610,74 @@ def main():
         service.initialize()
         logger.info(f"[{request_id}] Service initialized successfully")
         service.start()
-        
-        logger.info("WebSocket translation service is running. Press Ctrl+C to stop.")
-        while True:
+
+        # BUG1 修复：原 while True + time.sleep(1) 在 audio_processor 内部
+        # is_running=False 退出后仍会无限 sleep，导致进程变成孤儿。
+        # 改为：监控 audio_processor.is_running，进程自然退出
+        proc = service.audio_processor
+        if proc is None:
+            logger.error(f"[{request_id}] audio_processor not created, exiting")
+            return
+
+        # 注册 SIGTERM handler，确保父进程 kill 时能立即响应退出
+        _stop_requested = threading.Event()
+
+        def _sigterm_handler(signum, frame):
+            logger.warning(f"[{request_id}] Received SIGTERM, initiating graceful shutdown...")
+            _stop_requested.set()
+            proc.is_running = False
+
+        old_sigterm = signal.signal(signal.SIGTERM, _sigterm_handler)
+        # 如果之前已经注册过 SIGTERM handler（罕见），恢复之
+        if old_sigterm not in (signal.SIG_DFL, signal.SIG_IGN):
+            # 新 handler 已覆盖，保留原 handler 备用（理论上不会走到这里）
+            pass
+
+        # 硬性最大运行时长（防漏，防止 ffmpeg 死锁等极端情况下无限运行）
+        # 默认 24 小时，由环境变量可覆盖
+        max_runtime_seconds = int(os.getenv("TRANSLATION_MAX_RUNTIME_SECONDS", "86400"))
+        start_ts = time.time()
+        last_health_log_ts = 0
+
+        logger.info(f"[{request_id}] Main loop: monitoring audio_processor.is_running, "
+                    f"max_runtime={max_runtime_seconds}s")
+        while proc.is_running:
+            if _stop_requested.is_set():
+                logger.info(f"[{request_id}] Stop requested via SIGTERM, breaking main loop")
+                break
             time.sleep(1)
-            
+            # 每 60 秒打一次心跳，方便排查"进程还活着吗"
+            if time.time() - last_health_log_ts > 60:
+                last_health_log_ts = time.time()
+                rt = proc.realtime_service
+                logger.info(f"[{request_id}] heartbeat: is_running=True, "
+                            f"ffmpeg_alive={bool(proc.ffmpeg_process and proc.ffmpeg_process.poll() is None)}, "
+                            f"baidu={'connected' if rt and getattr(rt, 'ws', None) else 'disconnected'}, "
+                            f"elapsed={int(time.time()-start_ts)}s")
+
+            # 硬性超时
+            if time.time() - start_ts >= max_runtime_seconds:
+                logger.warning(f"[{request_id}] Hit max runtime {max_runtime_seconds}s, force exiting")
+                proc.is_running = False
+                break
+
+        logger.info(f"[{request_id}] audio_processor stopped (is_running={proc.is_running}), exiting main loop")
+
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     except Exception as e:
         logger.error(f"[{request_id}] Service error: {e}", exc_info=True)
     finally:
         service.stop()
+        # 强制再 flush 一次日志，避免子进程被杀前日志丢
+        for h in logger.handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        logger.info(f"[{request_id}] Process exiting cleanly")
+        # 显式 sys.exit 防止任何子线程 daemon 持有 fd 阻塞进程退出
+        os._exit(0)
 
 
 if __name__ == "__main__":

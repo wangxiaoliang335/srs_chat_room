@@ -72,6 +72,11 @@ from werkzeug.wrappers import Response as WerkzeugResponse
 native_ws_connections: Dict[str, Set] = {}
 native_ws_lock = threading.Lock()
 
+# 延迟停止翻译服务的定时器
+delayed_stop_timers: Dict[str, threading.Timer] = {}
+delayed_stop_lock = threading.Lock()
+DELAYED_STOP_DELAY = 30  # 延迟停止的秒数
+
 
 def ws_register_connection(room_id: str, websocket):
     """注册 WebSocket 连接"""
@@ -156,11 +161,8 @@ def add_cors_headers(response):
     response.headers['Access-Control-Max-Age'] = '3600'
     return response
 
-@app.route('/<path:path>', methods=['OPTIONS'])
-@app.route('/', methods=['OPTIONS'])
-def handle_options(path=None):
-    """处理 OPTIONS 预检请求"""
-    return '', 204
+# 通配 OPTIONS 路由必须在特定路由之后定义，或者只匹配根路径
+# @app.route('/<path:path>', methods=['OPTIONS'])  # 删除这行，它会拦截所有 API 请求
 
 # 翻译管理器
 translation_manager = TranslationManager()
@@ -546,13 +548,31 @@ def start_translation_service(request_id: str, room_id: str, source_user: str, t
         logger.error(f"Failed to start translation service for request {request_id}: {e}", exc_info=True)
 
 
-def stop_translation_service(request_id: str):
-    """停止指定翻译请求的服务"""
+def stop_translation_service(request_id: str, reason: str = "client_disconnected"):
+    """停止指定翻译请求的服务
+    
+    Args:
+        request_id: 请求ID
+        reason: 停止原因，可选值：
+            - client_disconnected: 客户端断开
+            - source_stream_stopped: 源流停止
+            - max_retries_reached: 达到最大重试次数
+            - manual_stop: 手动停止
+    """
     if request_id not in translation_processes:
         logger.warning(f"Translation service for request {request_id} is not running")
         return
     
     process = translation_processes[request_id]
+    
+    # 停止原因的中文描述
+    reason_map = {
+        "client_disconnected": "客户端断开连接",
+        "source_stream_stopped": "源流已停止",
+        "max_retries_reached": "达到最大重试次数",
+        "manual_stop": "手动停止"
+    }
+    reason_cn = reason_map.get(reason, reason)
     
     try:
         process.terminate()
@@ -564,7 +584,7 @@ def stop_translation_service(request_id: str):
             del translation_log_files[request_id]
         
         del translation_processes[request_id]
-        logger.info(f"Stopped translation service for request: {request_id}")
+        logger.info(f"[Translation] Service stopped: request_id={request_id}, reason={reason_cn}")
         
     except subprocess.TimeoutExpired:
         process.kill()
@@ -572,9 +592,9 @@ def stop_translation_service(request_id: str):
             translation_log_files[request_id].close()
             del translation_log_files[request_id]
         del translation_processes[request_id]
-        logger.warning(f"Force killed translation service for request: {request_id}")
+        logger.warning(f"[Translation] Service force killed: request_id={request_id}, reason={reason_cn}")
     except Exception as e:
-        logger.error(f"Error stopping translation service for request {request_id}: {e}")
+        logger.error(f"[Translation] Error stopping service: request_id={request_id}, error={e}")
 
 
 # ========== 房间管理接口 ==========
@@ -1910,7 +1930,7 @@ def translation_cancel():
                 }), 404
             
             # 停止翻译服务
-            stop_translation_service(request_id)
+            stop_translation_service(request_id, reason="manual_stop")
             
             # 移除请求
             translation_manager.remove_request(request_id)
@@ -1951,7 +1971,7 @@ def translation_cancel():
                 }), 404
             
             # 停止翻译服务
-            stop_translation_service(found_request.request_id)
+            stop_translation_service(found_request.request_id, reason="manual_stop")
             
             # 移除请求
             translation_manager.remove_request(found_request.request_id)
@@ -2470,20 +2490,37 @@ def on_unpublish():
     try:
         data = request.json or {}
         stream_name = data.get('stream', '')
+        client_ip = data.get('client_ip', '')
+        client_id = data.get('client_id', '')
+        
+        # SRS 可能提供的额外信息
+        duration = data.get('duration', 0)  # 连接持续时间（毫秒）
+        send_bytes = data.get('send_bytes', 0)
+        recv_bytes = data.get('recv_bytes', 0)
         
         if not stream_name:
-            logger.warning("Received on_unpublish callback without stream name")
+            logger.warning("[OnUnpublish] Received on_unpublish callback without stream name")
             return jsonify({'code': 0}), 200
         
-        logger.info(f"Received on_unpublish callback for stream: {stream_name}")
+        logger.info(f"[OnUnpublish] ===== STREAM UNPUBLISH =====")
+        logger.info(f"[OnUnpublish] stream={stream_name}, client_ip={client_ip}, client_id={client_id}")
+        logger.info(f"[OnUnpublish] duration={duration}ms, send_bytes={send_bytes}, recv_bytes={recv_bytes}")
         
         # 解析流名称
         parsed = parse_stream_name(stream_name)
+        stream_type = parsed.get('type', 'unknown')
+        room_id = parsed.get('room_id', '')
+        user_id = parsed.get('user_id', '')
+        to_lang = parsed.get('to_lang', '')
+        
+        logger.info(f"[OnUnpublish] Parsed: type={stream_type}, room={room_id}, user={user_id}, lang={to_lang}")
         
         if parsed['type'] == 'original':
-            # 原声音频流：通知用户停止说话
+            # 原声音频流：通知用户停止说话，并停止相关翻译服务
             room_id = parsed['room_id']
             user_id = parsed['user_id']
+            
+            logger.info(f"[OnUnpublish] Original stream stopped: room={room_id}, user={user_id}")
             
             if room_id and user_id:
                 with speaking_lock:
@@ -2499,18 +2536,61 @@ def on_unpublish():
                 
                 logger.info(f"[Speaking] User {user_id} stopped speaking in room {room_id}")
                 
+                # ========== 停止该用户的所有翻译服务 ==========
+                requests = translation_manager.get_all_requests()
+                logger.info(f"[OnUnpublish] Total requests to check: {len(requests)}")
+                for req in requests[:]:  # 使用切片复制避免迭代时修改
+                    if req.room_id == room_id and req.source_user == user_id:
+                        logger.info(f"[OnUnpublish] Stopping translation: request_id={req.request_id}, status={req.status}")
+                        stop_translation_service(req.request_id, reason="source_stream_stopped")
+                        translation_manager.remove_request(req.request_id)
+                
         elif parsed['type'] == 'translation':
-            # 翻译流：查找并停止翻译服务，通知目标用户
+            # 翻译流：查找并延迟停止翻译服务，通知目标用户
             user_id = parsed['user_id']
             to_lang = parsed['to_lang']
             
-            # 停止所有相关的翻译请求
+            logger.info(f"[OnUnpublish] Translation stream stopped: user={user_id}, lang={to_lang}")
+            
+            # 查找匹配的请求
             requests = translation_manager.get_all_requests()
+            logger.info(f"[OnUnpublish] Total requests to check: {len(requests)}")
             for req in requests[:]:  # 使用切片复制避免迭代时修改
-                if (req.room_id and req.source_user == user_id and req.to_lang == to_lang):
-                    stop_translation_service(req.request_id)
-                    translation_manager.remove_request(req.request_id)
-                    logger.info(f"[Translation] Stopped translation for {user_id} -> {to_lang}")
+                match = (req.room_id and req.source_user == user_id and req.to_lang == to_lang)
+                logger.info(f"[OnUnpublish] Checking: request_id={req.request_id}, room={req.room_id}, user={req.source_user}, lang={req.to_lang}, match={match}")
+                if match:
+                    # 设置延迟停止，而不是立即停止
+                    timer_key = f"{req.request_id}_stop"
+                    with delayed_stop_lock:
+                        # 如果已有定时器，取消它（避免重复停止）
+                        if timer_key in delayed_stop_timers:
+                            old_timer = delayed_stop_timers.pop(timer_key)
+                            old_timer.cancel()
+                            logger.info(f"[OnUnpublish] Cancelled existing stop timer for {req.request_id}")
+                        
+                        # 创建新的延迟停止定时器
+                        def delayed_stop(req_id, reason):
+                            def _do_stop():
+                                with delayed_stop_lock:
+                                    if req_id in delayed_stop_timers:
+                                        del delayed_stop_timers[req_id]
+                                # 检查请求是否还存在
+                                req_list = translation_manager.get_all_requests()
+                                for r in req_list:
+                                    if r.request_id == req_id:
+                                        logger.info(f"[DelayedStop] Stopping translation service: request_id={req_id}, reason={reason}")
+                                        stop_translation_service(req_id, reason=reason)
+                                        r.status = TranslationStatus.STOPPED
+                                        r.stop_reason = reason
+                                        r.pullers.clear()
+                                        break
+                            return _do_stop
+                        
+                        timer = threading.Timer(DELAYED_STOP_DELAY, delayed_stop(req.request_id, "client_disconnected"))
+                        delayed_stop_timers[timer_key] = timer
+                        timer.start()
+                        logger.info(f"[OnUnpublish] Scheduled delayed stop in {DELAYED_STOP_DELAY}s: request_id={req.request_id}")
+                    break
             
             # 通知停止说话
             # 需要找到 room_id
@@ -2522,10 +2602,11 @@ def on_unpublish():
                         notification_service.notify_user_speaking_stop(room_id, f"{user_id}_translation_{to_lang}")
                     break
         
+        logger.info(f"[OnUnpublish] ===== END STREAM UNPUBLISH =====")
         return jsonify({'code': 0}), 200
         
     except Exception as e:
-        logger.error(f"Error handling on_unpublish: {e}", exc_info=True)
+        logger.error(f"[OnUnpublish] Error handling on_unpublish: {e}", exc_info=True)
         return jsonify({'code': 0}), 200
 
 
@@ -2542,16 +2623,41 @@ def on_play():
         tc_url = data.get('tcUrl', '')
         client_ip = data.get('client_ip', '')
         client_id = data.get('client_id', '')
+        
+        # SRS 提供的额外信息
+        sdp = data.get('sdp', '')[:100] if data.get('sdp') else ''
+        dtls = data.get('dtls', '')
+        srs_server = data.get('srs_server', '')
 
-        logger.info(f"Received on_play callback for stream: {stream_name}, tcUrl: {tc_url}, client_ip: {client_ip}, client_id: {client_id}")
-
+        logger.info(f"===== OnPlay =====")
+        logger.info(f"stream={stream_name}, tcUrl={tc_url}")
+        logger.info(f"client_ip={client_ip}, client_id={client_id}")
+        logger.info(f"srs_server={srs_server}, dtls={dtls}")
+        
+        # 检查SRS中该流的当前状态
+        import requests as http_requests
+        try:
+            srs_api = "http://127.0.0.1:1985/api/v1/streams/"
+            resp = http_requests.get(srs_api, timeout=2)
+            if resp.status_code == 200:
+                streams_data = resp.json().get('streams', [])
+                for s in streams_data:
+                    if stream_name in s.get('name', ''):
+                        logger.info(f"SRS stream state: name={s.get('name')}, clients={s.get('clients')}, kbps={s.get('kbps')}, send_bytes={s.get('send_bytes')}")
+        except Exception as e:
+            logger.warning(f"Failed to query SRS: {e}")
+        
         # 解析流名称获取房间信息
         parsed = parse_stream_name(stream_name) if stream_name else {}
-
+        logger.info(f"parsed type={parsed.get('type')}, room={parsed.get('room_id')}, user={parsed.get('user_id')}, to_lang={parsed.get('to_lang')}")
+        
         if parsed.get('type') == 'translation':
             # 翻译流：检查目标用户是否在房间中
             room_id = parsed.get('room_id')
             target_user = parsed.get('target_user')
+            user_id = parsed.get('user_id')
+            to_lang = parsed.get('to_lang')
+            
             if room_id and target_user:
                 member = user_manager.get_member(room_id, target_user)
                 if member:
@@ -2561,7 +2667,47 @@ def on_play():
             
             # 记录翻译流拉取日志
             logger.info(f"[TranslationPlay] Client {client_ip} started playing translation stream: {stream_name}")
-
+            
+            # ========== 检查是否需要自动恢复翻译服务 ==========
+            # 如果翻译服务已停止但有客户端尝试拉取，自动重启翻译服务
+            if room_id and user_id and to_lang:
+                requests = translation_manager.get_all_requests()
+                logger.info(f"[OnPlay] Checking auto-restore: room={room_id}, user={user_id}, lang={to_lang}, total_requests={len(requests)}")
+                for req in requests:
+                    logger.info(f"[OnPlay] Checking request: id={req.request_id}, room={req.room_id}, user={req.source_user}, lang={req.to_lang}, status={req.status}")
+                    if (req.room_id == room_id and req.source_user == user_id and req.to_lang == to_lang):
+                        logger.info(f"[OnPlay] Found matching request: {req.request_id}, status={req.status}")
+                        
+                        # 取消延迟停止定时器
+                        timer_key = f"{req.request_id}_stop"
+                        with delayed_stop_lock:
+                            if timer_key in delayed_stop_timers:
+                                old_timer = delayed_stop_timers.pop(timer_key)
+                                old_timer.cancel()
+                                logger.info(f"[OnPlay] Cancelled delayed stop timer for {req.request_id}")
+                        
+                        if req.status == TranslationStatus.STOPPED:
+                            # 请求已停止，需要恢复
+                            logger.info(f"[OnPlay] Restoring stopped translation: request_id={req.request_id}")
+                            req.status = TranslationStatus.ACTIVE
+                            req.stop_reason = ""
+                            req.pullers.clear()
+                            
+                            # 启动翻译服务
+                            start_translation_service(
+                                request_id=req.request_id,
+                                room_id=req.room_id,
+                                source_user=req.source_user,
+                                to_lang=req.to_lang,
+                                target_user=req.target_user,
+                                source_lang=getattr(req, 'source_lang', 'auto')
+                            )
+                            logger.info(f"[OnPlay] Translation service restored for request_id={req.request_id}")
+                        else:
+                            logger.info(f"[OnPlay] Request status is {req.status}, not restoring")
+                        break
+        
+        logger.info(f"===== END OnPlay (returning code=0) =====")
         # 返回0表示允许播放
         return jsonify({'code': 0}), 200
 
@@ -2580,21 +2726,56 @@ def on_stop():
         data = request.json or {}
         stream_name = data.get('stream', '')
         client_ip = data.get('client_ip', '')
+        client_id = data.get('client_id', '')
+        
+        # SRS 可能提供的额外信息
+        duration = data.get('duration', 0)  # 连接持续时间（毫秒）
+        send_bytes = data.get('send_bytes', 0)
+        recv_bytes = data.get('recv_bytes', 0)
 
-        logger.info(f"Received on_stop callback for stream: {stream_name}, client_ip: {client_ip}")
-
+        logger.info(f"[OnStop] ===== CLIENT DISCONNECT DETECTED =====")
+        logger.info(f"[OnStop] stream={stream_name}, client_ip={client_ip}, client_id={client_id}")
+        logger.info(f"[OnStop] duration={duration}ms, send_bytes={send_bytes}, recv_bytes={recv_bytes}")
+        
         # 解析流名称获取房间信息
         parsed = parse_stream_name(stream_name) if stream_name else {}
         
         if parsed.get('type') == 'translation':
             room_id = parsed.get('room_id')
             target_user = parsed.get('target_user')
-            logger.info(f"[TranslationStop] Client {client_ip} stopped playing translation stream: {stream_name}")
-
+            user_id = parsed.get('user_id')
+            to_lang = parsed.get('to_lang')
+            logger.info(f"[OnStop] Translation stream stopped: room={room_id}, user_id={user_id}, to_lang={to_lang}")
+            
+            # 查找匹配的翻译请求
+            requests = translation_manager.get_all_requests()
+            logger.info(f"[OnStop] Total active requests: {len(requests)}")
+            
+            for req in requests:
+                match = (req.room_id == room_id and req.source_user == user_id and req.to_lang == to_lang)
+                logger.info(f"[OnStop] Checking: id={req.request_id}, status={req.status}, pullers={list(req.pullers.keys())}, match={match}")
+                
+                if match:
+                    logger.info(f"[OnStop] Found matching request: {req.request_id}")
+                    # 检查当前SRS中该流的连接数
+                    try:
+                        import requests as http_requests
+                        srs_api = "http://127.0.0.1:1985/api/v1/streams/"
+                        resp = http_requests.get(srs_api, timeout=2)
+                        if resp.status_code == 200:
+                            streams_data = resp.json().get('streams', [])
+                            for s in streams_data:
+                                if stream_name in s.get('name', ''):
+                                    logger.info(f"[OnStop] SRS stream info: name={s.get('name')}, clients={s.get('clients')}, kbps={s.get('kbps')}")
+                    except Exception as e:
+                        logger.warning(f"[OnStop] Failed to query SRS API: {e}")
+                    break
+        
+        logger.info(f"[OnStop] ===== END CLIENT DISCONNECT =====")
         return jsonify({'code': 0}), 200
 
     except Exception as e:
-        logger.error(f"Error handling on_stop: {e}", exc_info=True)
+        logger.error(f"[OnStop] Error handling on_stop: {e}", exc_info=True)
         return jsonify({'code': 0}), 200
 
 
@@ -3016,10 +3197,25 @@ async def handle_native_ws(websocket):
         
         logger.info(f"[WS] Native WebSocket connected: room={room_id}, user={user_id}")
         
+        # 获取房间在线人数
+        with native_ws_lock:
+            online_users = len(native_ws_connections.get(room_id, []))
+        
+        # 检查翻译状态
+        translation_status = "idle"
+        for req_id, proc in translation_processes.items():
+            if proc.get('room_id') == room_id:
+                translation_status = "active"
+                break
+        
         await websocket.send(json.dumps({
             "type": "connected",
             "room_id": room_id,
-            "user_id": user_id
+            "user_id": user_id,
+            "room_info": {
+                "online_users": online_users,
+                "translation_status": translation_status
+            }
         }))
         
         async for message in websocket:
