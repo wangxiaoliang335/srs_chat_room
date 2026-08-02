@@ -575,23 +575,32 @@ def main():
     
     # 创建 WebSocket 服务器
     ws_server = TranslationWebSocketServer(host=host, port=port)
-    
-    # 创建 HTTP 服务器
-    http_server = HTTPServer(ws_server, host=host, port=port)
-    
+
+    # 创建 HTTP 服务器（使用独立端口，避免与 WebSocket 冲突）
+    http_port = int(os.getenv('TEXT_HTTP_PORT', port + 1))
+    http_server = HTTPServer(ws_server, host=host, port=http_port)
+
     # 设置全局 SO_REUSEADDR
     import socketserver
     socketserver.TCPServer.allow_reuse_address = True
-    
+
     # 在后台线程启动 WebSocket 服务器
     ws_server.run_in_thread()
-    
+
     # 等待一下让 WebSocket 服务器先绑定
     import time
     time.sleep(1)
-    
-    # 主线程运行 HTTP 服务器
-    http_server.run()
+
+    # 主线程运行 HTTP 服务器（即使失败也不应让 WS 退出）
+    try:
+        http_server.run()
+    except OSError as e:
+        logger.error(f"HTTP 服务器在 {http_port} 端口启动失败: {e}")
+        logger.info("WebSocket 继续在端口 8086 提供服务，保持运行...")
+        # 阻塞主线程，避免 daemon 线程被回收
+        import threading
+        evt = threading.Event()
+        evt.wait()
 
 
 if __name__ == '__main__':

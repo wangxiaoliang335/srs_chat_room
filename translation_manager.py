@@ -40,6 +40,12 @@ class TranslationRequest:
     source_stream_active: bool = field(default=False)  # 源流是否活跃
     stop_reason: str = field(default="")  # 停止原因
     _no_puller_since: Optional[float] = field(default=None, repr=False)  # 无拉流者开始时间
+    # ========== BUG4 新增：申请翻译的"客户端"心跳 ==========
+    # 区别于 pullers（听翻译的客户端），这里指"申请翻译"的客户端
+    # 客户端如果关浏览器/断网，pullers 会先超时，但 source 端推流未必断
+    # → 需要客户端主动发心跳，否则认为该客户端已离线
+    requester_heartbeat: Dict[str, float] = field(default_factory=dict)  # 客户端标识 -> 最后心跳时间
+    last_requester_heartbeat: float = field(default_factory=lambda: time.time())  # 申请端最后一次心跳（任何标识）
 
 
 class TranslationManager:
@@ -59,6 +65,9 @@ class TranslationManager:
         self.heartbeat_timeout = 15  # 拉流者心跳超时时间
         self.source_stream_timeout = 1800  # 源流检测超时时间（30分钟）
         self.no_puller_stop_delay = 300  # 无拉流者多久后停止翻译（已废弃，不再使用）
+        # ========== BUG4 新增：申请翻译的客户端心跳超时 ==========
+        # 客户端必须每 ~5 秒发一次心跳，否则 30 秒后认为离线 → 停止翻译
+        self.requester_heartbeat_timeout = 30  # 申请端心跳超时（秒）
         
         logger.info("[TranslationManager] Initialized with fault tolerance support")
 
@@ -362,6 +371,14 @@ class TranslationManager:
                     if now - request.last_source_stream_seen > self.source_stream_timeout:
                         needs_stop = True
                         cleanup_info["stop_reason"] = "source_stream_timeout"
+
+                # BUG4 新增：申请翻译的客户端心跳超时
+                # 客户端关浏览器/断网后不再发心跳 → 30s 后主动停止翻译
+                # 注意: 刚启动时 last_requester_heartbeat = created_at，给 60s 宽限
+                # （如果客户端在 60s 内都没发心跳，那就停掉）
+                if now - max(request.last_requester_heartbeat, request.created_at) > self.requester_heartbeat_timeout:
+                    needs_stop = True
+                    cleanup_info["stop_reason"] = "requester_heartbeat_timeout"
                 
                 # 注意：不再因为无拉流者而停止翻译
                 # 翻译流应该一直存在，直到源流停止才停止
@@ -412,7 +429,40 @@ class TranslationManager:
                         
                         logger.info(f"[TranslationManager] Source stream status updated: "
                                   f"room={room_id}, user={source_user}, active={active}")
-    
+
+    # ========== BUG4 新增：申请翻译的客户端心跳 ==========
+
+    def update_requester_heartbeat(self, request_id: str, client_id: str) -> bool:
+        """更新申请翻译的客户端心跳
+
+        Args:
+            request_id: 翻译请求ID
+            client_id: 客户端标识（如 sessionId、userId+tabId 等）
+
+        Returns:
+            True if updated, False if request not found
+        """
+        with self._lock:
+            request = self._requests_by_id.get(request_id)
+            if not request:
+                return False
+            now = time.time()
+            request.requester_heartbeat[client_id] = now
+            request.last_requester_heartbeat = now
+            return True
+
+    def update_requester_heartbeat_by_source(self, room_id: str, source_user: str,
+                                              to_lang: str, client_id: str) -> bool:
+        """通过 room/source/to_lang 更新申请端心跳（客户端不知道 request_id 时用）"""
+        with self._lock:
+            req = self.get_request_by_source(room_id, source_user, to_lang=to_lang)
+            if not req:
+                return False
+            now = time.time()
+            req.requester_heartbeat[client_id] = now
+            req.last_requester_heartbeat = now
+            return True
+
     def get_request_by_stream(self, room_id: str, stream_name: str) -> Optional[TranslationRequest]:
         """根据流名称查找翻译请求
         

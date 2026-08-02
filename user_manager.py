@@ -31,6 +31,18 @@ class UserStatus(Enum):
     MIC_OFF = "mic_off"       # 被禁麦
 
 
+class OwnerStatus(Enum):
+    """房主在线状态"""
+    ONLINE = "online"      # 房主在线
+    OFFLINE = "offline"    # 房主离线（离开房间但房间仍运行）
+
+
+class RoomStatus(Enum):
+    """房间状态"""
+    ACTIVE = "active"           # 正常运行
+    CLOSED = "closed"           # 已被关闭，不可再加入
+
+
 @dataclass
 class User:
     """用户信息"""
@@ -60,16 +72,26 @@ class Room:
     room_id: str
     name: str = ""
     owner_id: str = ""          # 群主ID
+    owner_status: OwnerStatus = OwnerStatus.ONLINE  # 房主在线状态
+    status: RoomStatus = RoomStatus.ACTIVE          # 房间状态
+    closed_by: str = ""          # 关闭者 user_id（仅 closed 时有值）
+    closed_at: str = ""          # 关闭时间戳（仅 closed 时有值）
+    close_reason: str = ""       # 关闭原因（如 owner_entered_another_room）
     created_at: str = ""
     max_members: int = 100
     allow_speak: bool = True    # 是否允许发言（全体禁言开关）
     members: Dict[str, User] = field(default_factory=dict)
-    
+
     def to_dict(self):
         return {
             'room_id': self.room_id,
             'name': self.name,
             'owner_id': self.owner_id,
+            'owner_status': self.owner_status.value,
+            'status': self.status.value,
+            'closed_by': self.closed_by,
+            'closed_at': self.closed_at,
+            'close_reason': self.close_reason,
             'created_at': self.created_at,
             'max_members': self.max_members,
             'allow_speak': self.allow_speak,
@@ -170,6 +192,51 @@ class UserManager:
             del self._rooms[room_id]
             logger.info(f"[UserManager] Deleted room: {room_id}")
             return True
+
+    def close_room(self, room_id: str, closed_by: str, reason: str = "") -> bool:
+        """关闭房间（保留房主占位，仅清理其他成员）"""
+        with self._lock:
+            if room_id not in self._rooms:
+                return False
+            
+            room = self._rooms[room_id]
+            
+            # 清理流映射（保留房主）
+            for user_id in list(room.members.keys()):
+                if user_id != room.owner_id:
+                    stream_name = f"{room_id}_{user_id}"
+                    self._stream_to_user.pop(stream_name, None)
+                    del room.members[user_id]
+            
+            # 标记房间关闭
+            room.status = RoomStatus.CLOSED
+            room.closed_by = closed_by
+            room.closed_at = self._get_current_time()
+            room.close_reason = reason
+            room.owner_status = OwnerStatus.OFFLINE
+            
+            logger.info(f"[UserManager] Closed room {room_id} by {closed_by}, reason={reason}")
+            return True
+
+    def set_owner_online(self, room_id: str) -> bool:
+        """房主重新上线"""
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if not room:
+                return False
+            room.owner_status = OwnerStatus.ONLINE
+            logger.info(f"[UserManager] Owner online in room {room_id}")
+            return True
+
+    def set_owner_offline(self, room_id: str) -> bool:
+        """房主离线"""
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if not room:
+                return False
+            room.owner_status = OwnerStatus.OFFLINE
+            logger.info(f"[UserManager] Owner offline in room {room_id}")
+            return True
     
     def get_all_rooms(self) -> List[Room]:
         """获取所有房间"""
@@ -184,14 +251,23 @@ class UserManager:
             # 确保房间存在（未先调用 create_room 时创建空房间，首位加入者在下方成为群主）
             if room_id not in self._rooms:
                 self.create_room(room_id, "", "")
-            
+
             room = self._rooms[room_id]
             self._repair_room_if_needed(room)
-            
+
+            # 拒绝加入已关闭的房间
+            if room.status == RoomStatus.CLOSED:
+                raise ValueError(f"Room {room_id} is closed")
+
             if user_id in room.members:
                 # 更新最后活跃时间
-                room.members[user_id].last_active = self._get_current_time()
-                return room.members[user_id]
+                user = room.members[user_id]
+                user.last_active = self._get_current_time()
+                # 房主重新加入：恢复在线状态
+                if user_id == room.owner_id:
+                    room.owner_status = OwnerStatus.ONLINE
+                    logger.info(f"[UserManager] Owner {user_id} re-joined room {room_id}, restored to online")
+                return user
             
             # 检查房间人数限制
             if len(room.members) >= room.max_members:
@@ -231,22 +307,27 @@ class UserManager:
         with self._lock:
             if room_id not in self._rooms:
                 return False
-            
+
             room = self._rooms[room_id]
             if user_id not in room.members:
                 return False
-            
+
             # 清理流映射
             stream_name = f"{room_id}_{user_id}"
             self._stream_to_user.pop(stream_name, None)
-            
-            del room.members[user_id]
-            logger.info(f"[UserManager] User {user_id} left room {room_id}")
-            
+
+            # 如果是房主离开，标记为 owner_offline（不删除房主占位）
+            if user_id == room.owner_id:
+                # 房主离开：保留成员占位，标记为 offline
+                room.owner_status = OwnerStatus.OFFLINE
+                logger.info(f"[UserManager] Owner {user_id} left room {room_id}, marked as owner_offline")
+            else:
+                del room.members[user_id]
+
             # 如果房间空了，删除房间
             if not room.members:
                 del self._rooms[room_id]
-            
+
             return True
     
     def get_member(self, room_id: str, user_id: str) -> Optional[User]:
@@ -265,6 +346,47 @@ class UserManager:
                 return []
             self._repair_room_if_needed(room)
             return list(room.members.values())
+
+    def find_room_for_user(self, user_id: str) -> Optional[str]:
+        """反查：某 user_id 当前所在的 room_id（在线且在房间内）。仅返回第一个匹配。
+        用于中间件实时同步 request.state.room_id。
+        """
+        if not user_id:
+            return None
+        with self._lock:
+            for room_id, room in self._rooms.items():
+                if user_id in room.members:
+                    return room_id
+            return None
+
+    def get_user_room_info(self, user_id: str) -> Optional[dict]:
+        """获取指定用户所在的房间信息（房主或成员），用于"查找好友房间"流程。
+        返回 None 表示用户不在任何 active/closed 房间中。
+        """
+        if not user_id:
+            return None
+        with self._lock:
+            for room_id, room in self._rooms.items():
+                if room.status == RoomStatus.ACTIVE and user_id in room.members:
+                    member = room.members[user_id]
+                    # 在线成员数（不含 owner_offline 时的 owner，因为 owner 不在 members 里了）
+                    # 但 owner 在 members 里时正常统计
+                    online_count = sum(
+                        1 for uid, m in room.members.items()
+                        if uid != room.owner_id or room.owner_status == OwnerStatus.ONLINE
+                    )
+                    your_role = "owner" if user_id == room.owner_id else member.role.value
+                    owner_status = room.owner_status.value
+                    return {
+                        "room_id": room_id,
+                        "room_name": room.name,
+                        "owner_id": room.owner_id,
+                        "owner_status": owner_status,
+                        "your_role": your_role,
+                        "member_count": len(room.members),
+                        "online_count": online_count,
+                    }
+            return None
     
     def get_user_by_stream(self, stream_name: str) -> Optional[User]:
         """通过流名称获取用户"""

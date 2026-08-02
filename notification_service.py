@@ -61,7 +61,10 @@ class RoomEvent:
             self.timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     def to_dict(self):
-        return asdict(self)
+        d = asdict(self)
+        # 映射 event_type 到 type 以匹配文档格式
+        d['type'] = d.pop('event_type', '')
+        return d
 
     def to_json(self):
         return json.dumps(self.to_dict(), ensure_ascii=False)
@@ -98,10 +101,8 @@ class NotificationService:
         if sio_instance is None:
             return
         
-        message = {
-            "type": event.event_type,
-            "data": event.to_dict()
-        }
+        # 使用平铺格式匹配文档
+        message = event.to_dict()
         
         try:
             sio_instance.emit('room_event', message, room=event.room_id)
@@ -117,10 +118,8 @@ class NotificationService:
         
         import requests
         
-        message = json.dumps({
-            "type": event.event_type,
-            "data": event.to_dict()
-        })
+        # 使用平铺格式匹配文档
+        message = json.dumps(event.to_dict())
         
         # 发送到 /broadcast 端点
         try:
@@ -175,10 +174,8 @@ class NotificationService:
             if event.room_id not in self._room_subscriptions:
                 return
             
-            message = json.dumps({
-                "type": event.event_type,
-                "data": event.to_dict()
-            })
+            # 使用平铺格式匹配文档
+            message = json.dumps(event.to_dict())
             
             for ws in self._room_subscriptions[event.room_id]:
                 try:
@@ -336,10 +333,8 @@ class NotificationService:
     def _emit_to_user(self, event: RoomEvent, target_user_id: str):
         """向特定用户发送事件"""
         with self._lock:
-            message = json.dumps({
-                "type": event.event_type,
-                "data": event.to_dict()
-            })
+            # 使用平铺格式匹配文档
+            message = json.dumps(event.to_dict())
             
             for ws, info in self._user_connections.items():
                 if info.get('user_id') == target_user_id:
