@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "saved_at": 1786670867,
+  "saved_at": 1786675176,
   "rooms": {
     "alove_room_demo": {
       "room_id": "alove_room_demo",
@@ -813,6 +813,84 @@
           "offline_at": null
         }
       }
+    },
+    "rate_1786674667": {
+      "room_id": "rate_1786674667",
+      "name": "rate_1786674667",
+      "owner_id": "user_070de03780fc",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-14 10:31:07",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_070de03780fc": {
+          "user_id": "user_070de03780fc",
+          "room_id": "rate_1786674667",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-14 10:31:07",
+          "last_active": "2026-08-14 10:31:07",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        }
+      }
+    },
+    "metrics_rm": {
+      "room_id": "metrics_rm",
+      "name": "metrics_rm",
+      "owner_id": "user_4bc0aaee9058",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-14 10:36:19",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_4bc0aaee9058": {
+          "user_id": "user_4bc0aaee9058",
+          "room_id": "metrics_rm",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-14 10:36:19",
+          "last_active": "2026-08-14 10:36:19",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        }
+      }
+    },
+    "metrics_rm2": {
+      "room_id": "metrics_rm2",
+      "name": "metrics_rm2",
+      "owner_id": "user_f9a7cf95763a",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-14 10:39:36",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_f9a7cf95763a": {
+          "user_id": "user_f9a7cf95763a",
+          "room_id": "metrics_rm2",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-14 10:39:36",
+          "last_active": "2026-08-14 10:39:36",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        }
+      }
     }
   },
   "stream_to_user": {
@@ -841,6 +919,9 @@
     "hb_1786670206_user_a0e36626c40a": "user_a0e36626c40a",
     "msg_1786670653_user_64d98497a972": "user_64d98497a972",
     "inv_1786670867_user_8833edd3e48a": "user_8833edd3e48a",
-    "inv_1786670867_user_1ee0beeca470": "user_1ee0beeca470"
+    "inv_1786670867_user_1ee0beeca470": "user_1ee0beeca470",
+    "rate_1786674667_user_070de03780fc": "user_070de03780fc",
+    "metrics_rm_user_4bc0aaee9058": "user_4bc0aaee9058",
+    "metrics_rm2_user_f9a7cf95763a": "user_f9a7cf95763a"
   }
 }

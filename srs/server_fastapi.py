@@ -47,6 +47,7 @@ from notification_service import notification_service
 from notification_store import notification_store
 from message_store import message_store
 from invite_code_store import invite_code_store
+from rate_limiter import rate_limiter
 from auth import user_store, issue_token, verify_token, AuthError, JWT_TTL_SECONDS, revocation, USERNAME_RE
 from sync_client import sync
 from invitation_store import invitation_store
@@ -220,6 +221,7 @@ def verify_external_token(external_token: str) -> dict:
 # 不需要鉴权的路径（公开接口、SRS 内部回调）
 PUBLIC_PATHS = {
     "/api/v1/health",
+    "/api/v1/metrics",  # 2026-08-13 文档 §12.7：metrics 公开给内网监控
     "/api/v1/auth/register",
     "/api/v1/auth/login",
     "/api/v1/auth/test_login",  # 仅本地/测试环境使用，生产部署建议网关鉴权
@@ -462,13 +464,20 @@ class ConnectionManager:
                     "last_pong_at": time.time(),
                     "fail_count": 0,
                 }
-            # 2026-08-13 §2.2：连接建立 → 标记在线（覆盖之前的 offline）
-            try:
-                room = user_manager.get_room(room_id)
-                if room and user_id in room.members:
-                    user_manager._mark_member_online(room_id, user_id)
-            except Exception as e:
-                logger.warning(f"[WS] mark_online failed for {user_id}/{room_id}: {e}")
+        # 2026-08-13 §2.2：连接建立 → 标记在线（覆盖之前的 offline）
+        try:
+            room = user_manager.get_room(room_id)
+            if room and user_id in room.members:
+                user_manager._mark_member_online(room_id, user_id)
+                # 2026-08-13 §2.5：缓存
+                from cache import cache
+                cache.mark_user_online(user_id, room_id)
+        except Exception as e:
+            logger.warning(f"[WS] mark_online failed for {user_id}/{room_id}: {e}")
+        # 2026-08-13 §12.7：metrics
+        from metrics import metrics
+        metrics.inc("ws_connect_total")
+        metrics.gauge("ws_active_connections", len(self.user_connections))
         logger.info(f"[WS] Connected: room={room_id}, user={user_id}")
         await websocket.send_json({
             "type": "connected",
@@ -500,9 +509,16 @@ class ConnectionManager:
                 room = user_manager.get_room(room_id)
                 if room and user_id in room.members:
                     offline_at = user_manager._mark_member_offline(room_id, user_id)
+                    # 2026-08-13 §2.5：缓存
+                    from cache import cache
+                    cache.mark_user_offline(user_id, room_id)
             except Exception as e:
                 logger.warning(f"[WS] mark_offline failed for {user_id}/{room_id}: {e}")
         logger.info(f"[WS] Disconnected: room={room_id}, user={user_id}")
+        # 2026-08-13 §12.7：metrics
+        from metrics import metrics
+        metrics.inc("ws_disconnect_total")
+        metrics.gauge("ws_active_connections", len(self.user_connections))
         # 2026-08-13 §2.2：状态变更广播（异步触发）
         if user_id and offline_at is not None:
             try:
@@ -531,6 +547,14 @@ class ConnectionManager:
             try:
                 notification_service.notify_member_offline(
                     room_id=room_id, user_id=user_id, offline_at=offline_at)
+                # 2026-08-13 文档 §12.7：审计日志
+                from audit_log import audit_logger
+                audit_logger.log(
+                    action="member_offline",
+                    actor_id=user_id,
+                    room_id=room_id,
+                    details={"offline_at": offline_at},
+                )
             except Exception as e:
                 logger.warning(f"[WS] notify_member_offline failed: {e}")
 
@@ -915,6 +939,21 @@ async def health_check():
 @app.get("/api/v1/health")
 async def health_check_v1():
     return {"status": "ok"}
+
+
+# 2026-08-13 文档 §12.7：metrics 端点（轻量）
+@app.get("/api/v1/metrics")
+async def get_metrics():
+    """返回进程内指标快照（连接数、消息吞吐、推送失败率等）。
+
+    不需要鉴权（内网监控用）。
+    """
+    from metrics import metrics
+    snap = metrics.snapshot()
+    # 附加当前快照
+    snap["gauges"]["ws_active_connections"] = len(manager.user_connections)
+    snap["gauges"]["rooms_count"] = len(user_manager.get_all_rooms())
+    return api_ok(snap)
 
 
 # ==============================================================================
@@ -1388,6 +1427,14 @@ async def create_room(request: Request, req: RoomCreateRequest):
             name=room.name or req.name or "",
             max_members=room.max_members,
         ))
+        # 2026-08-13 文档 §12.7：审计日志
+        from audit_log import audit_logger
+        audit_logger.log(
+            action="room_created" if not existing_owned else "room_overwritten",
+            actor_id=jwt_user_id,
+            room_id=room.room_id,
+            details={"name": room.name, "overwritten": bool(existing_owned)},
+        )
         return api_ok({
             "room_id": room.room_id,
             "name": room.name,
@@ -1927,13 +1974,29 @@ async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
         if role in (UserRole.MEMBER, UserRole.GUEST):
             if not req.invite_code:
                 return api_err(403, "invalid or missing invite code")
+            # §3.3：Redis 风格缓存先查（命中 + 状态 OK 时快速通过）
+            from cache import cache
+            cached = cache.get_invite_code_meta(req.invite_code)
+            if cached and cached.get("room_id") != actual_room_id:
+                return api_err(403, "invalid or missing invite code: 房间不匹配")
             ok, reason, _ = invite_code_store.validate(req.invite_code, room_id=actual_room_id)
             if not ok:
+                # 缓存 + 库都不通过 → 失败计数（写回原 store）
                 return api_err(403, f"invalid or missing invite code: {reason}")
             # CAS 原子消费（文档 §3.3）
             ok, reason, _ = invite_code_store.consume(req.invite_code, used_by=jwt_user_id)
             if not ok:
                 return api_err(403, f"invalid or missing invite code: {reason}")
+            # 失效缓存
+            cache.invalidate_invite_code(req.invite_code)
+            # 2026-08-13 文档 §12.7：审计日志
+            from audit_log import audit_logger
+            audit_logger.log(
+                action="invite_code_used",
+                actor_id=jwt_user_id,
+                room_id=actual_room_id,
+                details={"code": req.invite_code},
+            )
 
         user = user_manager.join_room(actual_room_id, jwt_user_id, role=role)
 
@@ -2032,6 +2095,15 @@ async def kick_member(request: Request, room_id: str, user_id: str, operator_id:
             "operator_id": operator_id
         })
 
+        # 2026-08-13 文档 §12.7：审计日志
+        from audit_log import audit_logger
+        audit_logger.log(
+            action="member_kicked",
+            actor_id=operator_id,
+            target_id=user_id,
+            room_id=room_id,
+        )
+
         logger.info(f"[API] User {user_id} kicked from room {room_id} by {operator_id}")
         return api_ok({})
     except JSONResponse:
@@ -2047,7 +2119,10 @@ async def kick_member(request: Request, room_id: str, user_id: str, operator_id:
 
 @app.post("/api/v1/room/{room_id}/knock")
 async def knock_door(request: Request, room_id: str, req: KnockRequest):
-    """§5.1 敲门请求（knocker 身份从 JWT 取，请求体里若带需一致）"""
+    """§5.1 敲门请求（knocker 身份从 JWT 取，请求体里若带需一致）
+
+    2026-08-13 文档 §3.4 限流：每用户 1 次/30s + 同房间 3 次/小时
+    """
     try:
         jwt_user_id = request.state.user_id
         if not jwt_user_id:
@@ -2055,6 +2130,11 @@ async def knock_door(request: Request, room_id: str, req: KnockRequest):
         if req.user_id and req.user_id != jwt_user_id:
             return api_err(403, "user_id mismatch")
         knocker_id = jwt_user_id
+
+        # 文档 §3.4 限流
+        ok, wait = rate_limiter.check_knock(knocker_id, room_id)
+        if not ok:
+            return api_err(429, f"too many knocks, retry in {wait}s")
 
         room = user_manager.get_room(room_id)
         if not room:
@@ -3010,11 +3090,17 @@ async def generate_invite_code(request: Request, room_id: str = "",
       room_id: 必填（房间路径）
       target_user_id: 限定使用的用户（空 = 通用）
       expire_seconds: 有效期秒数（0 = 默认 600s）
+
+    限流（文档 §3.4 邀请同节奏）：每用户 1 次/30s
     """
     try:
         jwt_user_id = request.state.user_id
         if not jwt_user_id:
             return api_err(401, "not authenticated")
+        # 限流
+        ok, wait = rate_limiter.check_invite(jwt_user_id)
+        if not ok:
+            return api_err(429, f"too many invites, retry in {wait}s")
         if not room_id:
             return api_err(400, "room_id required")
         room = user_manager.get_room(room_id)
@@ -3027,6 +3113,20 @@ async def generate_invite_code(request: Request, room_id: str = "",
             created_by=jwt_user_id,
             target_user_id=target_user_id,
             expire_seconds=expire_seconds if expire_seconds > 0 else 600,
+        )
+        # 2026-08-13 文档 §3.3：缓存邀请码（TTL=有效期）
+        from cache import cache
+        cache.cache_invite_code(
+            item["code"], room_id,
+            ttl=item["expires_at"] - item["created_at"],
+        )
+        # 2026-08-13 文档 §12.7：审计日志
+        from audit_log import audit_logger
+        audit_logger.log(
+            action="invite_code_generated",
+            actor_id=jwt_user_id,
+            room_id=room_id,
+            details={"code": item["code"], "target_user_id": target_user_id},
         )
         return api_ok(item)
     except Exception as e:
@@ -3044,6 +3144,9 @@ async def revoke_invite_code(request: Request, code: str):
         ok = invite_code_store.revoke(code, operator_id=jwt_user_id)
         if not ok:
             return api_err(404, "invite code not found or not unused")
+        # 失效缓存
+        from cache import cache
+        cache.invalidate_invite_code(code)
         return api_ok({"code": code, "status": "revoked"})
     except Exception as e:
         logger.error(f"[API] revoke_invite_code error: {e}", exc_info=True)
@@ -3208,6 +3311,12 @@ async def send_message(request: Request, req: MessageSendRequest):
             height=req.height,
             timestamp=req.timestamp,
         )
+        # 2026-08-13 §12.7：metrics
+        from metrics import metrics
+        if item.get("_idempotent"):
+            metrics.inc("msg_idempotent_hits_total")
+        else:
+            metrics.inc("msg_send_total")
         # 异步广播给房间（不通过 WS 端 send_message 重复发送，而是直接 broadcast）
         if not item.get("_idempotent"):
             asyncio.create_task(_broadcast_chat_message(room_id, item))
@@ -3258,16 +3367,33 @@ async def _notify_user(user_id: str, type_: str, title: str, content: str,
         data=data or {},
     )
 
+    # 2026-08-13 §12.7：metrics
+    from metrics import metrics
+    metrics.inc(f"notif_{type_}_total")
+    metrics.inc("notif_total")
+
     async def _push():
+        started = time.time()
         try:
             import requests as _req
-            await asyncio.to_thread(
+            resp = await asyncio.to_thread(
                 _req.post,
                 f"{_NOTICE_SERVER_URL}/internal/push",
                 json={"user_id": user_id, "item": item},
                 timeout=2,
             )
+            latency_ms = (time.time() - started) * 1000
+            metrics.observe("notif_push_latency_ms", latency_ms)
+            if resp.ok:
+                payload = resp.json()
+                if payload.get("delivered"):
+                    metrics.inc("notif_push_success_total")
+                else:
+                    metrics.inc("notif_push_offline_total")
+            else:
+                metrics.inc("notif_push_failed_total")
         except Exception as e:
+            metrics.inc("notif_push_failed_total")
             logger.debug(f"[Notify] push to notice_server failed: {e}")
 
     # 不阻塞调用方
