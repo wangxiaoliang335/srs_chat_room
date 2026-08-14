@@ -54,6 +54,14 @@ class BaiduRealtimeTranslationClient:
 
         # TTS 音频数据缓冲
         self.tts_audio_buffer = b""
+        
+        # TTS 发送策略：只在 FIN 时发送完整句子
+        # 避免播放一句话时中间被新的 TTS 打断
+        self._tts_buffer_enabled = True  # 是否启用缓冲
+        self._pending_tts_audio = b""   # 累积的 TTS 音频
+        self._tts_binary_packet_count = 0
+        self._tts_binary_total_bytes = 0
+        self._tts_fin_count = 0
 
         # TTS 音频保存设置
         self.tts_save_dir = "tts_recordings"
@@ -295,20 +303,23 @@ class BaiduRealtimeTranslationClient:
                 if tts_type == 0x01:
                     # TTS 播报报文，payload 是 MP3 格式
                     tts_audio = message[1:]
+                    self._tts_binary_packet_count += 1
+                    self._tts_binary_total_bytes += len(tts_audio)
                     self.tts_audio_buffer += tts_audio
                     
                     # 保存到本地文件
                     saved = self._write_tts_audio(tts_audio)
                     
-                    # 触发回调
-                    if self.on_tts_audio_callback:
-                        try:
-                            self.on_tts_audio_callback(tts_audio)
-                            logger.info(f"[{self.request_id}] TTS callback triggered: {len(tts_audio)} bytes, saved={saved}")
-                        except Exception as e:
-                            logger.error(f"[{self.request_id}] TTS callback error: {e}")
-                    else:
-                        logger.warning(f"[{self.request_id}] TTS callback is None! Audio dropped: {len(tts_audio)} bytes")
+                    # 缓冲 TTS 音频，不立即发送
+                    # 只有收到 FIN（整句结束）时才发送
+                    self._pending_tts_audio += tts_audio
+                    
+                    if self._tts_binary_packet_count <= 3 or self._tts_binary_packet_count % 20 == 0:
+                        logger.info(
+                            f"[{self.request_id}] TTS binary packet #{self._tts_binary_packet_count}: "
+                            f"size={len(tts_audio)} bytes, total_binary={self._tts_binary_total_bytes}, "
+                            f"pending={len(self._pending_tts_audio)}, saved={saved}"
+                        )
                 else:
                     logger.warning(f"Unknown binary message type: 0x{tts_type:02x}")
 
@@ -329,12 +340,42 @@ class BaiduRealtimeTranslationClient:
                         result_type = result_obj.get("type", "")  # MID 或 FIN
 
                         if result_type == "FIN":
-                            # 最终结果
+                            # 最终结果 - 发送累积的 TTS 音频
                             sentence = result_obj.get("sentence", "")
                             sentence_trans = result_obj.get("sentence_trans", "")
+                            self._tts_fin_count += 1
+                            pending_before_fin = len(self._pending_tts_audio)
+
+                            logger.info(
+                                f"[{self.request_id}] FIN #{self._tts_fin_count}: sentence_len={len(sentence)}, "
+                                f"trans_len={len(sentence_trans)}, pending_tts={pending_before_fin}, "
+                                f"binary_packets={self._tts_binary_packet_count}, total_binary={self._tts_binary_total_bytes}"
+                            )
 
                             # 每收到最终结果，开启新的TTS保存文件
                             self._start_new_tts_file()
+                            
+                            # 清空 TTS 缓冲前，先发送累积的音频
+                            if self._pending_tts_audio:
+                                logger.info(f"[{self.request_id}] FIN received, sending {len(self._pending_tts_audio)} bytes of buffered TTS")
+                                if self.on_tts_audio_callback:
+                                    try:
+                                        self.on_tts_audio_callback(self._pending_tts_audio)
+                                        logger.info(
+                                            f"[{self.request_id}] TTS callback invoked successfully: "
+                                            f"bytes={len(self._pending_tts_audio)}"
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"[{self.request_id}] TTS callback error: {e}")
+                                else:
+                                    logger.warning(f"[{self.request_id}] FIN has pending TTS but on_tts_audio_callback is not set")
+                                # 清空缓冲
+                                self._pending_tts_audio = b""
+                            else:
+                                logger.warning(
+                                    f"[{self.request_id}] FIN received but no pending TTS audio: "
+                                    f"sentence='{sentence[:80]}', trans='{sentence_trans[:80]}'"
+                                )
 
                             if sentence_trans:
                                 logger.info(f"Translation [{result_type}]: '{sentence}' -> '{sentence_trans}'")
@@ -343,7 +384,7 @@ class BaiduRealtimeTranslationClient:
                                         sentence_trans, sentence, self.from_lang, self.to_lang
                                     )
                         elif result_type == "MID":
-                            # 中间结果
+                            # 中间结果 - 只缓冲 TTS 音频，不发送
                             asr = result_obj.get("asr", "")
                             asr_trans = result_obj.get("asr_trans", "")
 
@@ -518,10 +559,11 @@ class RealtimeTranslationProcessor:
         self.tts_save_enabled = False
         self.tts_save_dir = "tts_recordings"
         
-        # 回调函数（与 audio_translation_service_websocket.py 的期望一致）
-        self.on_translation_callback = None  # 回调签名: callback(result: Dict)
-        self.on_tts_callback = None         # 回调签名: callback(audio_data: bytes)
-        self.on_error_callback = None       # 回调签名: callback(code: int, msg: str)
+        # 回调函数（兼容 service/client 两侧不同命名）
+        self.on_translation_callback = None   # 回调签名: callback(result: Dict)
+        self.on_tts_callback = None           # 兼容旧字段: callback(audio_data: bytes)
+        self.on_tts_audio_callback = None     # 新字段: callback(audio_data: bytes)
+        self.on_error_callback = None         # 回调签名: callback(code: int, msg: str)
     
     def set_tts_save_config(self, enabled: bool, save_dir: str = "tts_recordings"):
         """配置 TTS 音频保存
@@ -598,8 +640,14 @@ class RealtimeTranslationProcessor:
     
     def _on_tts_audio(self, audio_data: bytes):
         """TTS 音频回调"""
-        if self.on_tts_callback:
-            self.on_tts_callback(audio_data)
+        callback = self.on_tts_audio_callback or self.on_tts_callback
+        logger.info(
+            f"[{getattr(self.client, 'request_id', 'baidu-processor')}] Processor TTS dispatch: "
+            f"bytes={len(audio_data)}, has_audio_cb={self.on_tts_audio_callback is not None}, "
+            f"has_legacy_cb={self.on_tts_callback is not None}, callback={repr(callback)}"
+        )
+        if callback:
+            callback(audio_data)
     
     def _on_error(self, error_msg: str):
         """错误回调"""

@@ -34,7 +34,7 @@ trunk/
 objs/
 
 # 其他
-srs/
+srs_ignore_marker
 android_socketio_example/
 nginx_cors.conf
 realtime_trans_python3/

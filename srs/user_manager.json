@@ -1,0 +1,659 @@
+{
+  "version": 1,
+  "saved_at": 1786632882,
+  "rooms": {
+    "alove_room_demo": {
+      "room_id": "alove_room_demo",
+      "name": "示例房间",
+      "owner_id": "user_owner1",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-03 11:25:47",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 3,
+      "members": {
+        "user_owner1": {
+          "user_id": "user_owner1",
+          "room_id": "alove_room_demo",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-03 11:25:47",
+          "last_active": "2026-08-03 11:25:47",
+          "publish_allowed": true
+        },
+        "user_member1": {
+          "user_id": "user_member1",
+          "room_id": "alove_room_demo",
+          "role": "member",
+          "status": "muted",
+          "joined_at": "2026-08-03 11:25:47",
+          "last_active": "2026-08-03 11:25:47",
+          "publish_allowed": false
+        },
+        "user_admin1": {
+          "user_id": "user_admin1",
+          "room_id": "alove_room_demo",
+          "role": "admin",
+          "status": "normal",
+          "joined_at": "2026-08-03 11:25:47",
+          "last_active": "2026-08-03 11:25:47",
+          "publish_allowed": true
+        }
+      }
+    },
+    "smoke_1785727565724": {
+      "room_id": "smoke_1785727565724",
+      "name": "smoke",
+      "owner_id": "user_4ff0601447cf",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-03 11:26:05",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_4ff0601447cf": {
+          "user_id": "user_4ff0601447cf",
+          "room_id": "smoke_1785727565724",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-03 11:26:05",
+          "last_active": "2026-08-03 11:26:05",
+          "publish_allowed": true
+        }
+      }
+    },
+    "smoke_1785727582605": {
+      "room_id": "smoke_1785727582605",
+      "name": "smoke",
+      "owner_id": "user_8a18777f0c2b",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-03 11:26:22",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_8a18777f0c2b": {
+          "user_id": "user_8a18777f0c2b",
+          "room_id": "smoke_1785727582605",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-03 11:26:22",
+          "last_active": "2026-08-03 11:26:22",
+          "publish_allowed": true
+        }
+      }
+    },
+    "smoke_1785727601109": {
+      "room_id": "smoke_1785727601109",
+      "name": "smoke",
+      "owner_id": "user_e7587a69f1b1",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-03 11:26:41",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_e7587a69f1b1": {
+          "user_id": "user_e7587a69f1b1",
+          "room_id": "smoke_1785727601109",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-03 11:26:41",
+          "last_active": "2026-08-03 11:26:41",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1785724656836": {
+      "room_id": "alove_room_1785724656836",
+      "name": "alove_room_1785724656836",
+      "owner_id": "user_50ebf1752dbf",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-04 15:52:56",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_50ebf1752dbf": {
+          "user_id": "user_50ebf1752dbf",
+          "room_id": "alove_room_1785724656836",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-04 15:52:56",
+          "last_active": "2026-08-04 15:52:56",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1785832247641": {
+      "room_id": "alove_room_1785832247641",
+      "name": "Test",
+      "owner_id": "user_d004625859f8",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-04 16:30:49",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_d004625859f8": {
+          "user_id": "user_d004625859f8",
+          "room_id": "alove_room_1785832247641",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-04 16:30:49",
+          "last_active": "2026-08-12 20:22:48",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1785822252903": {
+      "room_id": "alove_room_1785822252903",
+      "name": "alove_room_1785822252903",
+      "owner_id": "user_a6e69f185da0",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-04 16:33:12",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1785822252903",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-04 16:33:12",
+          "last_active": "2026-08-04 16:36:23",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1785822065692": {
+      "room_id": "alove_room_1785822065692",
+      "name": "alove_room_1785822065692",
+      "owner_id": "user_d6bd064c78df",
+      "owner_status": "offline",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-04 16:33:34",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_d6bd064c78df": {
+          "user_id": "user_d6bd064c78df",
+          "room_id": "alove_room_1785822065692",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-04 16:33:34",
+          "last_active": "2026-08-04 16:34:35",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1785832775919": {
+      "room_id": "alove_room_1785832775919",
+      "name": "MHH的测试房间",
+      "owner_id": "user_a6e69f185da0",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-04 16:39:36",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1785832775919",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-04 16:39:36",
+          "last_active": "2026-08-04 16:39:38",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1785832810732": {
+      "room_id": "alove_room_1785832810732",
+      "name": "1111",
+      "owner_id": "user_d6bd064c78df",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-04 16:40:11",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_d6bd064c78df": {
+          "user_id": "user_d6bd064c78df",
+          "room_id": "alove_room_1785832810732",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-04 16:40:11",
+          "last_active": "2026-08-04 16:40:13",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1785834624987": {
+      "room_id": "alove_room_1785834624987",
+      "name": "1111",
+      "owner_id": "user_d6bd064c78df",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-04 17:10:26",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_d6bd064c78df": {
+          "user_id": "user_d6bd064c78df",
+          "room_id": "alove_room_1785834624987",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-04 17:10:26",
+          "last_active": "2026-08-04 17:10:27",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1785660481507": {
+      "room_id": "alove_room_1785660481507",
+      "name": "alove_room_1785660481507",
+      "owner_id": "user_a6e69f185da0",
+      "owner_status": "offline",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-04 18:35:09",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 2,
+      "members": {
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1785660481507",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-04 18:35:09",
+          "last_active": "2026-08-07 16:24:19",
+          "publish_allowed": true
+        },
+        "user_9c06a02e0be8": {
+          "user_id": "user_9c06a02e0be8",
+          "room_id": "alove_room_1785660481507",
+          "role": "member",
+          "status": "normal",
+          "joined_at": "2026-08-07 16:25:59",
+          "last_active": "2026-08-07 16:26:36",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1785577123888": {
+      "room_id": "alove_room_1785577123888",
+      "name": "alove_room_1785577123888",
+      "owner_id": "user_50ebf1752dbf",
+      "owner_status": "offline",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-04 21:05:23",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_50ebf1752dbf": {
+          "user_id": "user_50ebf1752dbf",
+          "room_id": "alove_room_1785577123888",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-04 21:05:23",
+          "last_active": "2026-08-04 21:05:23",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1786090928863": {
+      "room_id": "alove_room_1786090928863",
+      "name": "MHH的测试房间",
+      "owner_id": "user_9c06a02e0be8",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-07 16:22:08",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_9c06a02e0be8": {
+          "user_id": "user_9c06a02e0be8",
+          "room_id": "alove_room_1786090928863",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-07 16:22:08",
+          "last_active": "2026-08-07 16:27:07",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1786238499938": {
+      "room_id": "alove_room_1786238499938",
+      "name": "MHH的测试房间",
+      "owner_id": "user_a6e69f185da0",
+      "owner_status": "offline",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-09 09:21:40",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 2,
+      "members": {
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1786238499938",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-09 09:21:40",
+          "last_active": "2026-08-09 15:06:05",
+          "publish_allowed": true
+        },
+        "user_9c06a02e0be8": {
+          "user_id": "user_9c06a02e0be8",
+          "room_id": "alove_room_1786238499938",
+          "role": "member",
+          "status": "normal",
+          "joined_at": "2026-08-09 10:01:51",
+          "last_active": "2026-08-09 10:01:51",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1786240574885": {
+      "room_id": "alove_room_1786240574885",
+      "name": "111",
+      "owner_id": "user_d6bd064c78df",
+      "owner_status": "offline",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-09 09:56:16",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 2,
+      "members": {
+        "user_d6bd064c78df": {
+          "user_id": "user_d6bd064c78df",
+          "room_id": "alove_room_1786240574885",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-09 09:56:16",
+          "last_active": "2026-08-09 09:56:37",
+          "publish_allowed": true
+        },
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1786240574885",
+          "role": "member",
+          "status": "normal",
+          "joined_at": "2026-08-09 09:56:28",
+          "last_active": "2026-08-09 09:56:35",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1786282877183": {
+      "room_id": "alove_room_1786282877183",
+      "name": "mhh",
+      "owner_id": "user_a6e69f185da0",
+      "owner_status": "offline",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-09 21:41:17",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1786282877183",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-09 21:41:17",
+          "last_active": "2026-08-09 22:10:30",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1786351578051": {
+      "room_id": "alove_room_1786351578051",
+      "name": "mhh的测试房间",
+      "owner_id": "user_a6e69f185da0",
+      "owner_status": "offline",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-10 16:46:18",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 2,
+      "members": {
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1786351578051",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-10 16:46:18",
+          "last_active": "2026-08-11 16:13:00",
+          "publish_allowed": true
+        },
+        "user_9c06a02e0be8": {
+          "user_id": "user_9c06a02e0be8",
+          "room_id": "alove_room_1786351578051",
+          "role": "member",
+          "status": "normal",
+          "joined_at": "2026-08-11 13:41:32",
+          "last_active": "2026-08-11 13:41:32",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1786352115049": {
+      "room_id": "alove_room_1786352115049",
+      "name": "123456",
+      "owner_id": "user_d6bd064c78df",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-10 16:55:16",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 2,
+      "members": {
+        "user_d6bd064c78df": {
+          "user_id": "user_d6bd064c78df",
+          "room_id": "alove_room_1786352115049",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-10 16:55:16",
+          "last_active": "2026-08-13 20:57:18",
+          "publish_allowed": true
+        },
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1786352115049",
+          "role": "member",
+          "status": "normal",
+          "joined_at": "2026-08-11 16:02:16",
+          "last_active": "2026-08-11 16:02:16",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1786514276287": {
+      "room_id": "alove_room_1786514276287",
+      "name": "MHH的房间",
+      "owner_id": "user_a6e69f185da0",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-12 13:57:57",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1786514276287",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-12 13:57:57",
+          "last_active": "2026-08-12 13:58:09",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1786534318242": {
+      "room_id": "alove_room_1786534318242",
+      "name": "1000",
+      "owner_id": "user_5c1b21256fa3",
+      "owner_status": "offline",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-12 19:31:58",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 3,
+      "members": {
+        "user_5c1b21256fa3": {
+          "user_id": "user_5c1b21256fa3",
+          "room_id": "alove_room_1786534318242",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-12 19:31:58",
+          "last_active": "2026-08-13 22:54:21",
+          "publish_allowed": true
+        },
+        "user_d6bd064c78df": {
+          "user_id": "user_d6bd064c78df",
+          "room_id": "alove_room_1786534318242",
+          "role": "member",
+          "status": "normal",
+          "joined_at": "2026-08-13 21:02:03",
+          "last_active": "2026-08-13 21:04:15",
+          "publish_allowed": true
+        },
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1786534318242",
+          "role": "member",
+          "status": "normal",
+          "joined_at": "2026-08-13 21:02:05",
+          "last_active": "2026-08-13 21:02:05",
+          "publish_allowed": true
+        }
+      }
+    },
+    "alove_room_1786626090689": {
+      "room_id": "alove_room_1786626090689",
+      "name": "mhh的房间",
+      "owner_id": "user_a6e69f185da0",
+      "owner_status": "online",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-13 21:01:30",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_a6e69f185da0": {
+          "user_id": "user_a6e69f185da0",
+          "room_id": "alove_room_1786626090689",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-13 21:01:30",
+          "last_active": "2026-08-13 22:44:22",
+          "publish_allowed": true
+        }
+      }
+    }
+  },
+  "stream_to_user": {
+    "alove_room_demo_user_owner1": "user_owner1",
+    "alove_room_demo_user_member1": "user_member1",
+    "alove_room_demo_user_admin1": "user_admin1",
+    "smoke_1785727565724_user_4ff0601447cf": "user_4ff0601447cf",
+    "smoke_1785727582605_user_8a18777f0c2b": "user_8a18777f0c2b",
+    "smoke_1785727601109_user_e7587a69f1b1": "user_e7587a69f1b1",
+    "alove_room_1785724656836_user_50ebf1752dbf": "user_50ebf1752dbf",
+    "alove_room_1785822252903_user_a6e69f185da0": "user_a6e69f185da0",
+    "alove_room_1785832775919_user_a6e69f185da0": "user_a6e69f185da0",
+    "alove_room_1785832810732_user_d6bd064c78df": "user_d6bd064c78df",
+    "alove_room_1785834624987_user_d6bd064c78df": "user_d6bd064c78df",
+    "alove_room_1786090928863_user_9c06a02e0be8": "user_9c06a02e0be8",
+    "alove_room_1785660481507_user_9c06a02e0be8": "user_9c06a02e0be8",
+    "alove_room_1786240574885_user_a6e69f185da0": "user_a6e69f185da0",
+    "alove_room_1786238499938_user_9c06a02e0be8": "user_9c06a02e0be8",
+    "alove_room_1786351578051_user_9c06a02e0be8": "user_9c06a02e0be8",
+    "alove_room_1786352115049_user_a6e69f185da0": "user_a6e69f185da0",
+    "alove_room_1786514276287_user_a6e69f185da0": "user_a6e69f185da0",
+    "alove_room_1786534318242_user_d6bd064c78df": "user_d6bd064c78df",
+    "alove_room_1786534318242_user_a6e69f185da0": "user_a6e69f185da0"
+  }
+}

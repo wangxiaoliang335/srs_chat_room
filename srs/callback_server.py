@@ -161,11 +161,8 @@ def add_cors_headers(response):
     response.headers['Access-Control-Max-Age'] = '3600'
     return response
 
-@app.route('/<path:path>', methods=['OPTIONS'])
-@app.route('/', methods=['OPTIONS'])
-def handle_options(path=None):
-    """处理 OPTIONS 预检请求"""
-    return '', 204
+# 通配 OPTIONS 路由必须在特定路由之后定义，或者只匹配根路径
+# @app.route('/<path:path>', methods=['OPTIONS'])  # 删除这行，它会拦截所有 API 请求
 
 # 翻译管理器
 translation_manager = TranslationManager()
