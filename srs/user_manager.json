@@ -1,12 +1,11 @@
 {
   "version": 1,
-  "saved_at": 1786632882,
+  "saved_at": 1786670867,
   "rooms": {
     "alove_room_demo": {
       "room_id": "alove_room_demo",
       "name": "示例房间",
       "owner_id": "user_owner1",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -23,7 +22,9 @@
           "status": "normal",
           "joined_at": "2026-08-03 11:25:47",
           "last_active": "2026-08-03 11:25:47",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         },
         "user_member1": {
           "user_id": "user_member1",
@@ -32,7 +33,9 @@
           "status": "muted",
           "joined_at": "2026-08-03 11:25:47",
           "last_active": "2026-08-03 11:25:47",
-          "publish_allowed": false
+          "publish_allowed": false,
+          "online_status": "offline",
+          "offline_at": null
         },
         "user_admin1": {
           "user_id": "user_admin1",
@@ -41,7 +44,9 @@
           "status": "normal",
           "joined_at": "2026-08-03 11:25:47",
           "last_active": "2026-08-03 11:25:47",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -49,7 +54,6 @@
       "room_id": "smoke_1785727565724",
       "name": "smoke",
       "owner_id": "user_4ff0601447cf",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -66,7 +70,9 @@
           "status": "normal",
           "joined_at": "2026-08-03 11:26:05",
           "last_active": "2026-08-03 11:26:05",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -74,7 +80,6 @@
       "room_id": "smoke_1785727582605",
       "name": "smoke",
       "owner_id": "user_8a18777f0c2b",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -91,7 +96,9 @@
           "status": "normal",
           "joined_at": "2026-08-03 11:26:22",
           "last_active": "2026-08-03 11:26:22",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -99,7 +106,6 @@
       "room_id": "smoke_1785727601109",
       "name": "smoke",
       "owner_id": "user_e7587a69f1b1",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -116,7 +122,9 @@
           "status": "normal",
           "joined_at": "2026-08-03 11:26:41",
           "last_active": "2026-08-03 11:26:41",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -124,7 +132,6 @@
       "room_id": "alove_room_1785724656836",
       "name": "alove_room_1785724656836",
       "owner_id": "user_50ebf1752dbf",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -141,7 +148,9 @@
           "status": "normal",
           "joined_at": "2026-08-04 15:52:56",
           "last_active": "2026-08-04 15:52:56",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -149,7 +158,6 @@
       "room_id": "alove_room_1785832247641",
       "name": "Test",
       "owner_id": "user_d004625859f8",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -166,7 +174,9 @@
           "status": "normal",
           "joined_at": "2026-08-04 16:30:49",
           "last_active": "2026-08-12 20:22:48",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -174,7 +184,6 @@
       "room_id": "alove_room_1785822252903",
       "name": "alove_room_1785822252903",
       "owner_id": "user_a6e69f185da0",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -191,7 +200,9 @@
           "status": "normal",
           "joined_at": "2026-08-04 16:33:12",
           "last_active": "2026-08-04 16:36:23",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -199,7 +210,6 @@
       "room_id": "alove_room_1785822065692",
       "name": "alove_room_1785822065692",
       "owner_id": "user_d6bd064c78df",
-      "owner_status": "offline",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -216,7 +226,9 @@
           "status": "normal",
           "joined_at": "2026-08-04 16:33:34",
           "last_active": "2026-08-04 16:34:35",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -224,7 +236,6 @@
       "room_id": "alove_room_1785832775919",
       "name": "MHH的测试房间",
       "owner_id": "user_a6e69f185da0",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -241,7 +252,9 @@
           "status": "normal",
           "joined_at": "2026-08-04 16:39:36",
           "last_active": "2026-08-04 16:39:38",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -249,7 +262,6 @@
       "room_id": "alove_room_1785832810732",
       "name": "1111",
       "owner_id": "user_d6bd064c78df",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -266,7 +278,9 @@
           "status": "normal",
           "joined_at": "2026-08-04 16:40:11",
           "last_active": "2026-08-04 16:40:13",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -274,7 +288,6 @@
       "room_id": "alove_room_1785834624987",
       "name": "1111",
       "owner_id": "user_d6bd064c78df",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -291,7 +304,9 @@
           "status": "normal",
           "joined_at": "2026-08-04 17:10:26",
           "last_active": "2026-08-04 17:10:27",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -299,7 +314,6 @@
       "room_id": "alove_room_1785660481507",
       "name": "alove_room_1785660481507",
       "owner_id": "user_a6e69f185da0",
-      "owner_status": "offline",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -316,7 +330,9 @@
           "status": "normal",
           "joined_at": "2026-08-04 18:35:09",
           "last_active": "2026-08-07 16:24:19",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         },
         "user_9c06a02e0be8": {
           "user_id": "user_9c06a02e0be8",
@@ -325,7 +341,9 @@
           "status": "normal",
           "joined_at": "2026-08-07 16:25:59",
           "last_active": "2026-08-07 16:26:36",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -333,7 +351,6 @@
       "room_id": "alove_room_1785577123888",
       "name": "alove_room_1785577123888",
       "owner_id": "user_50ebf1752dbf",
-      "owner_status": "offline",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -350,7 +367,9 @@
           "status": "normal",
           "joined_at": "2026-08-04 21:05:23",
           "last_active": "2026-08-04 21:05:23",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -358,7 +377,6 @@
       "room_id": "alove_room_1786090928863",
       "name": "MHH的测试房间",
       "owner_id": "user_9c06a02e0be8",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -375,7 +393,9 @@
           "status": "normal",
           "joined_at": "2026-08-07 16:22:08",
           "last_active": "2026-08-07 16:27:07",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -383,7 +403,6 @@
       "room_id": "alove_room_1786238499938",
       "name": "MHH的测试房间",
       "owner_id": "user_a6e69f185da0",
-      "owner_status": "offline",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -400,7 +419,9 @@
           "status": "normal",
           "joined_at": "2026-08-09 09:21:40",
           "last_active": "2026-08-09 15:06:05",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         },
         "user_9c06a02e0be8": {
           "user_id": "user_9c06a02e0be8",
@@ -409,7 +430,9 @@
           "status": "normal",
           "joined_at": "2026-08-09 10:01:51",
           "last_active": "2026-08-09 10:01:51",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -417,7 +440,6 @@
       "room_id": "alove_room_1786240574885",
       "name": "111",
       "owner_id": "user_d6bd064c78df",
-      "owner_status": "offline",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -434,7 +456,9 @@
           "status": "normal",
           "joined_at": "2026-08-09 09:56:16",
           "last_active": "2026-08-09 09:56:37",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         },
         "user_a6e69f185da0": {
           "user_id": "user_a6e69f185da0",
@@ -443,7 +467,9 @@
           "status": "normal",
           "joined_at": "2026-08-09 09:56:28",
           "last_active": "2026-08-09 09:56:35",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -451,7 +477,6 @@
       "room_id": "alove_room_1786282877183",
       "name": "mhh",
       "owner_id": "user_a6e69f185da0",
-      "owner_status": "offline",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -468,7 +493,9 @@
           "status": "normal",
           "joined_at": "2026-08-09 21:41:17",
           "last_active": "2026-08-09 22:10:30",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -476,7 +503,6 @@
       "room_id": "alove_room_1786351578051",
       "name": "mhh的测试房间",
       "owner_id": "user_a6e69f185da0",
-      "owner_status": "offline",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -493,7 +519,9 @@
           "status": "normal",
           "joined_at": "2026-08-10 16:46:18",
           "last_active": "2026-08-11 16:13:00",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         },
         "user_9c06a02e0be8": {
           "user_id": "user_9c06a02e0be8",
@@ -502,7 +530,9 @@
           "status": "normal",
           "joined_at": "2026-08-11 13:41:32",
           "last_active": "2026-08-11 13:41:32",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -510,7 +540,6 @@
       "room_id": "alove_room_1786352115049",
       "name": "123456",
       "owner_id": "user_d6bd064c78df",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -527,7 +556,9 @@
           "status": "normal",
           "joined_at": "2026-08-10 16:55:16",
           "last_active": "2026-08-13 20:57:18",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         },
         "user_a6e69f185da0": {
           "user_id": "user_a6e69f185da0",
@@ -536,7 +567,9 @@
           "status": "normal",
           "joined_at": "2026-08-11 16:02:16",
           "last_active": "2026-08-11 16:02:16",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -544,7 +577,6 @@
       "room_id": "alove_room_1786514276287",
       "name": "MHH的房间",
       "owner_id": "user_a6e69f185da0",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -561,7 +593,9 @@
           "status": "normal",
           "joined_at": "2026-08-12 13:57:57",
           "last_active": "2026-08-12 13:58:09",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -569,7 +603,6 @@
       "room_id": "alove_room_1786534318242",
       "name": "1000",
       "owner_id": "user_5c1b21256fa3",
-      "owner_status": "offline",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -586,7 +619,9 @@
           "status": "normal",
           "joined_at": "2026-08-12 19:31:58",
           "last_active": "2026-08-13 22:54:21",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         },
         "user_d6bd064c78df": {
           "user_id": "user_d6bd064c78df",
@@ -595,7 +630,9 @@
           "status": "normal",
           "joined_at": "2026-08-13 21:02:03",
           "last_active": "2026-08-13 21:04:15",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         },
         "user_a6e69f185da0": {
           "user_id": "user_a6e69f185da0",
@@ -604,7 +641,9 @@
           "status": "normal",
           "joined_at": "2026-08-13 21:02:05",
           "last_active": "2026-08-13 21:02:05",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     },
@@ -612,7 +651,6 @@
       "room_id": "alove_room_1786626090689",
       "name": "mhh的房间",
       "owner_id": "user_a6e69f185da0",
-      "owner_status": "online",
       "status": "active",
       "closed_by": "",
       "closed_at": "",
@@ -629,7 +667,150 @@
           "status": "normal",
           "joined_at": "2026-08-13 21:01:30",
           "last_active": "2026-08-13 22:44:22",
-          "publish_allowed": true
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        }
+      }
+    },
+    "test_notif_1786669982": {
+      "room_id": "test_notif_1786669982",
+      "name": "通知测试房间",
+      "owner_id": "user_1922b5e42940",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-14 09:13:02",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_1922b5e42940": {
+          "user_id": "user_1922b5e42940",
+          "room_id": "test_notif_1786669982",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-14 09:13:02",
+          "last_active": "2026-08-14 09:13:02",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        }
+      }
+    },
+    "test_notif2_1786670050": {
+      "room_id": "test_notif2_1786670050",
+      "name": "test_notif2_1786670050",
+      "owner_id": "user_fbf5095ff864",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-14 09:14:10",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_fbf5095ff864": {
+          "user_id": "user_fbf5095ff864",
+          "room_id": "test_notif2_1786670050",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-14 09:14:10",
+          "last_active": "2026-08-14 09:14:10",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        }
+      }
+    },
+    "hb_1786670206": {
+      "room_id": "hb_1786670206",
+      "name": "hb_1786670206",
+      "owner_id": "user_a0e36626c40a",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-14 09:16:46",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_a0e36626c40a": {
+          "user_id": "user_a0e36626c40a",
+          "room_id": "hb_1786670206",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-14 09:16:46",
+          "last_active": "2026-08-14 09:19:28",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        }
+      }
+    },
+    "msg_1786670653": {
+      "room_id": "msg_1786670653",
+      "name": "msg_1786670653",
+      "owner_id": "user_64d98497a972",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-14 09:24:13",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 1,
+      "members": {
+        "user_64d98497a972": {
+          "user_id": "user_64d98497a972",
+          "room_id": "msg_1786670653",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-14 09:24:13",
+          "last_active": "2026-08-14 09:24:13",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        }
+      }
+    },
+    "inv_1786670867": {
+      "room_id": "inv_1786670867",
+      "name": "inv_1786670867",
+      "owner_id": "user_8833edd3e48a",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-14 09:27:47",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 2,
+      "members": {
+        "user_8833edd3e48a": {
+          "user_id": "user_8833edd3e48a",
+          "room_id": "inv_1786670867",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-14 09:27:47",
+          "last_active": "2026-08-14 09:27:47",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        },
+        "user_1ee0beeca470": {
+          "user_id": "user_1ee0beeca470",
+          "room_id": "inv_1786670867",
+          "role": "member",
+          "status": "normal",
+          "joined_at": "2026-08-14 09:27:47",
+          "last_active": "2026-08-14 09:27:47",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
         }
       }
     }
@@ -654,6 +835,12 @@
     "alove_room_1786352115049_user_a6e69f185da0": "user_a6e69f185da0",
     "alove_room_1786514276287_user_a6e69f185da0": "user_a6e69f185da0",
     "alove_room_1786534318242_user_d6bd064c78df": "user_d6bd064c78df",
-    "alove_room_1786534318242_user_a6e69f185da0": "user_a6e69f185da0"
+    "alove_room_1786534318242_user_a6e69f185da0": "user_a6e69f185da0",
+    "test_notif_1786669982_user_1922b5e42940": "user_1922b5e42940",
+    "test_notif2_1786670050_user_fbf5095ff864": "user_fbf5095ff864",
+    "hb_1786670206_user_a0e36626c40a": "user_a0e36626c40a",
+    "msg_1786670653_user_64d98497a972": "user_64d98497a972",
+    "inv_1786670867_user_8833edd3e48a": "user_8833edd3e48a",
+    "inv_1786670867_user_1ee0beeca470": "user_1ee0beeca470"
   }
 }

@@ -103,6 +103,10 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+
+# 2026-08-13 文档 §2.2：room_socket 心跳参数（可配置）
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
+HEARTBEAT_FAIL_THRESHOLD = int(os.getenv("HEARTBEAT_FAIL_THRESHOLD", "3"))
 # =============================================================================
 
 
@@ -2010,8 +2014,8 @@ async def kick_member(request: Request, room_id: str, user_id: str, operator_id:
 
         asyncio.create_task(sync.member_kicked(room_id=room_id, user_id=user_id, operator_id=operator_id))
 
-        # 2026-08-13 文档 §6.2：通知持久化（被踢人是 recipient）
-        notification_store.add(
+        # 2026-08-13 文档 §6.2：通知持久化（被踢人是 recipient）+ notice_socket 实时推送
+        await _notify_user(
             user_id=user_id,
             type_="member_kicked",
             title="你被踢出房间",
@@ -3235,6 +3239,42 @@ async def _broadcast_chat_message(room_id: str, item: dict):
     await manager.broadcast_to_room_with_timestamp(room_id, msg)
 
 
+# 2026-08-13 文档 §6.2 + §1.2：通知 helper（持久化 + notice_socket 推送）
+# 通过 HTTP 调用 8090 notice_server 的 /internal/push
+_NOTICE_SERVER_URL = os.getenv("NOTICE_SERVER_URL", "http://127.0.0.1:8090")
+
+
+async def _notify_user(user_id: str, type_: str, title: str, content: str,
+                       room_id: str = "", related_user_id: str = "",
+                       data: Optional[dict] = None) -> dict:
+    """持久化通知 + 实时推送（跨房间 -> notice_socket）。"""
+    item = notification_store.add(
+        user_id=user_id,
+        type_=type_,
+        title=title,
+        content=content,
+        room_id=room_id,
+        related_user_id=related_user_id,
+        data=data or {},
+    )
+
+    async def _push():
+        try:
+            import requests as _req
+            await asyncio.to_thread(
+                _req.post,
+                f"{_NOTICE_SERVER_URL}/internal/push",
+                json={"user_id": user_id, "item": item},
+                timeout=2,
+            )
+        except Exception as e:
+            logger.debug(f"[Notify] push to notice_server failed: {e}")
+
+    # 不阻塞调用方
+    asyncio.create_task(_push())
+    return item
+
+
 @app.get("/api/v1/messages/history")
 async def get_message_history(request: Request, room_id: str, after_seq: int = 0, limit: int = 50):
     """§5.2 历史查询（按 seq 游标分页，after_seq=0 = 最新一页）。
@@ -3720,9 +3760,12 @@ def heartbeat_check_worker():
         except Exception as e:
             logger.error(f"[HeartbeatCheck] Error: {e}", exc_info=True)
 
-        # 2026-08-13 §2.2：扫描 room_socket 心跳（30s 一次，3 次失败 → 离线）
+        # 2026-08-13 §2.2：扫描 room_socket 心跳（HEARTBEAT_INTERVAL/HOLD_THRESHOLD 来自 .env）
         try:
-            asyncio.run(manager.check_heartbeats(ping_interval=30, fail_threshold=3))
+            asyncio.run(manager.check_heartbeats(
+                ping_interval=HEARTBEAT_INTERVAL,
+                fail_threshold=HEARTBEAT_FAIL_THRESHOLD,
+            ))
         except Exception as e:
             logger.error(f"[HeartbeatCheck] WS heartbeat error: {e}", exc_info=True)
 

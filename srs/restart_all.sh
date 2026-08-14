@@ -170,6 +170,7 @@ stop_all() {
     kill_by_keyword "server_fastapi.py"
     kill_by_keyword "translation_text_publisher.py"
     kill_by_keyword "callback_server.py"
+    kill_by_keyword "notice_server.py"
     kill_by_keyword "objs/srs"
     kill_by_keyword "nginx.*nginx_cors"
 
@@ -177,6 +178,7 @@ stop_all() {
     kill_by_port 8085   # FastAPI
     kill_by_port 8086   # WS publisher
     kill_by_port 8087   # HTTP publisher
+    kill_by_port 8090   # notice_socket (2026-08-13 文档 §1.1)
     kill_by_port 1985   # SRS API
     kill_by_port 8080   # SRS HTTP
     kill_by_port 1990   # SRS RTC
@@ -331,6 +333,39 @@ start_text_publisher() {
     fi
 }
 
+# 2026-08-13 文档 §1.1 / §8.2: notice_socket (跨房间事件)
+start_notice_server() {
+    local notice_port="${NOTICE_SOCKET_PORT:-8090}"
+    log_step "启动 notice_socket (notice_server.py) on :$notice_port ..."
+
+    if [ ! -f "$SCRIPT_DIR/notice_server.py" ]; then
+        log_warn "找不到 notice_server.py，跳过 notice_socket"
+        return 0
+    fi
+
+    if get_pids_by_keyword "python.*notice_server.py" > /dev/null; then
+        log_warn "notice_socket 已在运行，跳过启动"
+        return 0
+    fi
+
+    if check_port "$notice_port"; then
+        log_warn "$notice_port 端口已被占用，先清理"
+        kill_by_port "$notice_port"
+        sleep 1
+    fi
+
+    NOTICE_SOCKET_PORT="$notice_port" nohup "$PYTHON_BIN" "$SCRIPT_DIR/notice_server.py" > "$LOG_DIR/notice_server.log" 2>&1 &
+    local pid=$!
+    sleep 1
+    if check_port "$notice_port"; then
+        echo "$pid" > "$PID_DIR/notice_server.pid"
+        log_ok "notice_socket 启动成功 (PID: $pid, :$notice_port)"
+    else
+        log_fail "notice_socket 启动后端口未监听，请检查 $LOG_DIR/notice_server.log"
+        return 1
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # 启动 nginx (用于跨域, 8089)
 # ---------------------------------------------------------------------------
@@ -383,7 +418,10 @@ start_all() {
     # 3. 翻译文本推送
     start_text_publisher || log_warn "翻译文本推送启动失败，但不影响主流程"
 
-    # 4. Nginx (跨域，可选)
+    # 4. notice_socket (2026-08-13 文档 §1.1：跨房间事件)
+    start_notice_server || log_warn "notice_socket 启动失败，但不影响主流程"
+
+    # 5. Nginx (跨域，可选)
     start_nginx || log_warn "Nginx 启动失败，但不影响主流程"
 
     echo
@@ -427,6 +465,16 @@ show_status() {
         echo "    - HTTP:      http://localhost:8087"
     else
         echo -e "  ${YELLOW}⚠${NC} 翻译文本推送服务  未运行"
+    fi
+
+    # notice_socket 跨房间（2026-08-13 文档 §1.1）
+    if get_pids_by_keyword "python.*notice_server.py" > /dev/null; then
+        local pid
+        pid="$(get_pids_by_keyword 'python.*notice_server.py' | head -1)"
+        echo -e "  ${GREEN}✓${NC} notice_socket (notice_server.py)  PID: $pid"
+        echo "    - WebSocket: ws://localhost:8090/ws/notice"
+    else
+        echo -e "  ${YELLOW}⚠${NC} notice_socket  未运行 (可选)"
     fi
 
     # Nginx
