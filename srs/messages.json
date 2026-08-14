@@ -1,0 +1,34 @@
+{
+  "msg_1786670653": [
+    {
+      "id": "m_1786670653508_77a2ca",
+      "room_id": "msg_1786670653",
+      "user_id": "user_64d98497a972",
+      "client_msg_id": "c1",
+      "seq": 1,
+      "type": "text",
+      "content": "hello",
+      "file_name": "",
+      "file_size": 0,
+      "mime_type": "",
+      "width": 0,
+      "height": 0,
+      "timestamp": 1786670653.5089767
+    },
+    {
+      "id": "m_1786670653543_02dac8",
+      "room_id": "msg_1786670653",
+      "user_id": "user_64d98497a972",
+      "client_msg_id": "c2",
+      "seq": 2,
+      "type": "text",
+      "content": "world",
+      "file_name": "",
+      "file_size": 0,
+      "mime_type": "",
+      "width": 0,
+      "height": 0,
+      "timestamp": 1786670653.5434139
+    }
+  ]
+}

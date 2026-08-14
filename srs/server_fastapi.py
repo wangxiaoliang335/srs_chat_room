@@ -44,6 +44,9 @@ from user_manager import (
     UserManager, UserRole, UserStatus, User, Room, user_manager
 )
 from notification_service import notification_service
+from notification_store import notification_store
+from message_store import message_store
+from invite_code_store import invite_code_store
 from auth import user_store, issue_token, verify_token, AuthError, JWT_TTL_SECONDS, revocation, USERNAME_RE
 from sync_client import sync
 from invitation_store import invitation_store
@@ -425,11 +428,21 @@ def _get_timestamp() -> str:
 # ==============================================================================
 
 class ConnectionManager:
-    """WebSocket 连接管理器"""
+    """WebSocket 连接管理器
+
+    2026-08-13 文档 §2：
+    - 在线状态由本管理器 + 心跳驱动（不再由 /join 接口设置）
+    - 3 次心跳无响应 → 标记 offline（offline_at）
+    - 断开连接 → 标记 offline
+    """
 
     def __init__(self):
         self.active_connections: Dict[str, list] = {}
         self.user_connections: Dict[str, WebSocket] = {}
+        # 2026-08-13：心跳 + 在线状态跟踪
+        # _ws_state: ws -> {user_id, room_id, last_pong_at, fail_count}
+        self._ws_state: Dict[WebSocket, dict] = {}
+        self._ws_lock = threading.RLock()
 
     async def connect(self, websocket: WebSocket, room_id: str, user_id: str = ""):
         with native_ws_lock:
@@ -438,12 +451,29 @@ class ConnectionManager:
             self.active_connections[room_id].append(websocket)
         if user_id:
             self.user_connections[user_id] = websocket
+            with self._ws_lock:
+                self._ws_state[websocket] = {
+                    "user_id": user_id,
+                    "room_id": room_id,
+                    "last_pong_at": time.time(),
+                    "fail_count": 0,
+                }
+            # 2026-08-13 §2.2：连接建立 → 标记在线（覆盖之前的 offline）
+            try:
+                room = user_manager.get_room(room_id)
+                if room and user_id in room.members:
+                    user_manager._mark_member_online(room_id, user_id)
+            except Exception as e:
+                logger.warning(f"[WS] mark_online failed for {user_id}/{room_id}: {e}")
         logger.info(f"[WS] Connected: room={room_id}, user={user_id}")
         await websocket.send_json({
             "type": "connected",
             "room_id": room_id,
             "user_id": user_id
         })
+        # 2026-08-13 §2.2：状态变更广播
+        if user_id:
+            await self._broadcast_online_status(room_id, user_id, "online")
 
     def disconnect(self, websocket: WebSocket, room_id: str):
         with native_ws_lock:
@@ -452,10 +482,94 @@ class ConnectionManager:
                     self.active_connections[room_id].remove(websocket)
                 if not self.active_connections[room_id]:
                     del self.active_connections[room_id]
+        user_id = None
         for uid, ws in list(self.user_connections.items()):
             if ws == websocket:
+                user_id = uid
                 del self.user_connections[uid]
-        logger.info(f"[WS] Disconnected: room={room_id}")
+        # 2026-08-13 §2.2：断开 → 标记 offline（保留房间关联）
+        offline_at = None
+        if user_id:
+            with self._ws_lock:
+                self._ws_state.pop(websocket, None)
+            try:
+                room = user_manager.get_room(room_id)
+                if room and user_id in room.members:
+                    offline_at = user_manager._mark_member_offline(room_id, user_id)
+            except Exception as e:
+                logger.warning(f"[WS] mark_offline failed for {user_id}/{room_id}: {e}")
+        logger.info(f"[WS] Disconnected: room={room_id}, user={user_id}")
+        # 2026-08-13 §2.2：状态变更广播（异步触发）
+        if user_id and offline_at is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(self._broadcast_online_status(
+                        room_id, user_id, "offline", offline_at=offline_at))
+            except RuntimeError:
+                pass
+
+    async def _broadcast_online_status(self, room_id: str, user_id: str,
+                                        status: str, offline_at: int = 0):
+        """广播成员在线/离线状态变更（2026-08-13 §2.2 / 8.1 事件）"""
+        msg = {
+            "type": "member_online_status_changed",
+            "room_id": room_id,
+            "user_id": user_id,
+            "data": {
+                "online_status": status,
+                "offline_at": offline_at,
+            },
+        }
+        await self.broadcast_to_room_with_timestamp(room_id, msg)
+        # 同步：触发通知服务（如果用户已不在任何房间，不需要 notification）
+        if status == "offline":
+            try:
+                notification_service.notify_member_offline(
+                    room_id=room_id, user_id=user_id, offline_at=offline_at)
+            except Exception as e:
+                logger.warning(f"[WS] notify_member_offline failed: {e}")
+
+    def record_pong(self, websocket: WebSocket):
+        """客户端响应 pong 时重置失败计数（2026-08-13 §2.2）"""
+        with self._ws_lock:
+            state = self._ws_state.get(websocket)
+            if state:
+                state["last_pong_at"] = time.time()
+                state["fail_count"] = 0
+
+    async def check_heartbeats(self, ping_interval: int = 30, fail_threshold: int = 3):
+        """扫描所有 ws：对超过 ping_interval*fail_threshold 秒未 pong 的 → 强制关闭。
+
+        文档 §2.2：3 次 ping 无响应 → 判离线。
+        """
+        now = time.time()
+        stale: List[Tuple[WebSocket, str, str]] = []  # (ws, room_id, user_id)
+        with self._ws_lock:
+            for ws, state in list(self._ws_state.items()):
+                elapsed = now - state["last_pong_at"]
+                # 超过 ping_interval 秒未收到 pong → 计数 +1
+                if elapsed > ping_interval:
+                    state["fail_count"] += 1
+                    if state["fail_count"] >= fail_threshold:
+                        stale.append((ws, state["room_id"], state["user_id"]))
+        # 警告但未到阈值：发一次 ping（让客户端有最后一次响应机会）
+        for ws, state in list(self._ws_state.items()):
+            with self._ws_lock:
+                elapsed = now - state["last_pong_at"]
+                if ping_interval < elapsed < ping_interval * fail_threshold:
+                    try:
+                        await ws.send_json({"type": "ping"})
+                    except Exception:
+                        stale.append((ws, state["room_id"], state["user_id"]))
+        # 强制断开
+        for ws, room_id, user_id in stale:
+            logger.info(f"[WS] Heartbeat failure threshold: closing {user_id}/{room_id}")
+            try:
+                await ws.close(code=1011, reason="heartbeat_timeout")
+            except Exception:
+                pass
+            self.disconnect(ws, room_id)
 
     async def broadcast_to_room(self, room_id: str, message: dict):
         with native_ws_lock:
@@ -609,12 +723,64 @@ async def websocket_endpoint(websocket: WebSocket):
             msg_type = data.get('type', '')
 
             if msg_type == 'ping':
+                # 客户端 → 服务端 ping（兼容旧客户端）
                 await websocket.send_json({"type": "pong"})
+            elif msg_type == 'pong':
+                # 服务端 ping → 客户端 pong（2026-08-13 §2.2）
+                manager.record_pong(websocket)
             elif msg_type == 'subscribe':
                 new_room = data.get('room_id', room_id)
                 manager.disconnect(websocket, room_id)
                 await manager.connect(websocket, new_room, user_id)
                 room_id = new_room
+            elif msg_type == 'chat_message':
+                # 2026-08-13 §5.2：WS 发送消息（持久化 + 广播）
+                try:
+                    client_msg_id = data.get('client_msg_id', '')
+                    if not client_msg_id:
+                        await websocket.send_json({"type": "error", "message": "client_msg_id required"})
+                        continue
+                    item = message_store.send(
+                        room_id=room_id,
+                        user_id=user_id,
+                        client_msg_id=client_msg_id,
+                        msg_type=data.get('msg_type', data.get('type2', 'text')),
+                        content=data.get('content', ''),
+                        file_name=data.get('file_name', ''),
+                        file_size=data.get('file_size', 0),
+                        mime_type=data.get('mime_type', ''),
+                        width=data.get('width', 0),
+                        height=data.get('height', 0),
+                        timestamp=data.get('timestamp'),
+                    )
+                    if not item.get("_idempotent"):
+                        await _broadcast_chat_message(room_id, item)
+                    await websocket.send_json({
+                        "type": "chat_message_ack",
+                        "id": item["id"],
+                        "seq": item["seq"],
+                        "client_msg_id": client_msg_id,
+                        "_idempotent": bool(item.get("_idempotent")),
+                    })
+                except Exception as e:
+                    logger.warning(f"[WS] chat_message error: {e}")
+                    try:
+                        await websocket.send_json({"type": "error", "message": str(e)})
+                    except Exception:
+                        pass
+            elif msg_type == 'history_sync':
+                # 2026-08-13 §5.2：离线补拉（按 seq 增量）
+                try:
+                    after_seq = int(data.get('after_seq', 0))
+                    items = message_store.history(room_id, after_seq=after_seq, limit=200)
+                    await websocket.send_json({
+                        "type": "history_sync",
+                        "room_id": room_id,
+                        "items": items,
+                        "latest_seq": message_store.latest_seq(room_id),
+                    })
+                except Exception as e:
+                    logger.warning(f"[WS] history_sync error: {e}")
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, room_id)
@@ -665,6 +831,7 @@ class RoomJoinRequest(BaseModel):
     user_id: str = ""
     room_id: str = None                # 可选，URL 路径中有则优先用路径的
     role: str = "member"               # 文档 §4.3：可选，默认 member
+    invite_code: str = ""              # 2026-08-13 文档 §4.2.1：加入房间需校验邀请码（owner/admin 除外）
 
 # 文档 §2.3 变更说明：移除 RoomLeaveRequest（/leave 接口已删除）
 # class RoomLeaveRequest(BaseModel):
@@ -711,6 +878,26 @@ class TranslationHeartbeatRequest(BaseModel):
     client_id: str
     to_lang: str = None
     request_id: str = None
+
+
+class MessageSendRequest(BaseModel):
+    """2026-08-13 文档 §5.2：消息发送请求（含 client_msg_id 幂等）"""
+    client_msg_id: str
+    type: str = "text"  # text / image / file
+    content: str = ""
+    file_name: str = ""
+    file_size: int = 0
+    mime_type: str = ""
+    width: int = 0
+    height: int = 0
+    timestamp: float = None
+
+
+class MessageHistoryRequest(BaseModel):
+    """文档 §5.2：历史查询的房间 + 游标"""
+    room_id: str
+    after_seq: int = 0
+    limit: int = 50
 
 
 # ==============================================================================
@@ -1709,7 +1896,11 @@ async def get_member_detail(room_id: str, user_id: str):
 
 @app.post("/api/v1/room/{room_id}/join")
 async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
-    """§4.3 加入房间（拒绝加入已关闭房间；2026-08-13 文档：不再设置在线状态，由心跳判定）"""
+    """§4.3 加入房间（2026-08-13 文档）：
+    - 拒绝加入已关闭房间
+    - 普通成员必须携带有效邀请码（CAS 消费）
+    - 不再设置在线状态（由心跳判定）
+    """
     try:
         jwt_user_id = request.state.user_id
         if not jwt_user_id:
@@ -1726,6 +1917,20 @@ async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
 
         role_map = {"owner": UserRole.OWNER, "admin": UserRole.ADMIN, "member": UserRole.MEMBER, "guest": UserRole.GUEST}
         role = role_map.get(req.role, UserRole.MEMBER)
+
+        # 2026-08-13 文档 §4.2.1：邀请码校验
+        # owner/admin 无需邀请码；普通成员/guest 必须
+        if role in (UserRole.MEMBER, UserRole.GUEST):
+            if not req.invite_code:
+                return api_err(403, "invalid or missing invite code")
+            ok, reason, _ = invite_code_store.validate(req.invite_code, room_id=actual_room_id)
+            if not ok:
+                return api_err(403, f"invalid or missing invite code: {reason}")
+            # CAS 原子消费（文档 §3.3）
+            ok, reason, _ = invite_code_store.consume(req.invite_code, used_by=jwt_user_id)
+            if not ok:
+                return api_err(403, f"invalid or missing invite code: {reason}")
+
         user = user_manager.join_room(actual_room_id, jwt_user_id, role=role)
 
         # 回填 room_id 到账号表（便于下次登录时 JWT 带上 room_id）
@@ -1765,7 +1970,6 @@ async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
             "status": user.status.value,
             "publish_allowed": user.publish_allowed,
             "joined_at": user.joined_at,
-            # 2026-08-13 文档：返回在线状态字段（由心跳判定）
             "online_status": user.online_status,
             "offline_at": user.offline_at,
         })
@@ -1805,6 +2009,17 @@ async def kick_member(request: Request, room_id: str, user_id: str, operator_id:
         user_manager.leave_room(room_id, user_id)
 
         asyncio.create_task(sync.member_kicked(room_id=room_id, user_id=user_id, operator_id=operator_id))
+
+        # 2026-08-13 文档 §6.2：通知持久化（被踢人是 recipient）
+        notification_store.add(
+            user_id=user_id,
+            type_="member_kicked",
+            title="你被踢出房间",
+            content=f"你已被踢出房间 {room_id}",
+            room_id=room_id,
+            related_user_id=operator_id,
+            data={},
+        )
 
         await manager.broadcast_to_room_with_timestamp(room_id, {
             "type": "member_kicked",
@@ -2776,6 +2991,280 @@ async def batch_invitations(request: Request, req: InviteBatchRequest):
         return api_err(500, str(e))
 
 
+# 2026-08-13 文档 §3.2.3：邀请码管理接口
+# - POST /api/v1/invite/code/generate  房主手动生成邀请码
+# - POST /api/v1/invite/code/revoke    房主撤销邀请码
+# - GET  /api/v1/invite/code/list      房主查看本房间的邀请码列表
+
+@app.post("/api/v1/invite/code/generate")
+async def generate_invite_code(request: Request, room_id: str = "",
+                                target_user_id: str = "",
+                                expire_seconds: int = 0):
+    """§3.2.3 房主生成邀请码。
+
+    Query/Body:
+      room_id: 必填（房间路径）
+      target_user_id: 限定使用的用户（空 = 通用）
+      expire_seconds: 有效期秒数（0 = 默认 600s）
+    """
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        if not room_id:
+            return api_err(400, "room_id required")
+        room = user_manager.get_room(room_id)
+        if not room:
+            return api_err(404, "room not found")
+        if room.owner_id != jwt_user_id:
+            return api_err(403, "only owner can generate invite code")
+        item = invite_code_store.generate(
+            room_id=room_id,
+            created_by=jwt_user_id,
+            target_user_id=target_user_id,
+            expire_seconds=expire_seconds if expire_seconds > 0 else 600,
+        )
+        return api_ok(item)
+    except Exception as e:
+        logger.error(f"[API] generate_invite_code error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+@app.post("/api/v1/invite/code/revoke")
+async def revoke_invite_code(request: Request, code: str):
+    """§3.2.3 房主撤销未用的邀请码。"""
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        ok = invite_code_store.revoke(code, operator_id=jwt_user_id)
+        if not ok:
+            return api_err(404, "invite code not found or not unused")
+        return api_ok({"code": code, "status": "revoked"})
+    except Exception as e:
+        logger.error(f"[API] revoke_invite_code error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+@app.get("/api/v1/invite/code/list")
+async def list_invite_codes(request: Request, room_id: str, status: str = ""):
+    """§3.2.3 房主查看本房间的邀请码列表。"""
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        room = user_manager.get_room(room_id)
+        if not room:
+            return api_err(404, "room not found")
+        if room.owner_id != jwt_user_id:
+            return api_err(403, "only owner can view invite codes")
+        items = invite_code_store.list_for_room(room_id, status=status)
+        return api_ok({"items": items, "count": len(items)})
+    except Exception as e:
+        logger.error(f"[API] list_invite_codes error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+# ==============================================================================
+# 通知管理接口（2026-08-13 文档 §6.2）
+# ==============================================================================
+# - GET    /api/v1/notifications              分页列表（时间倒序）
+# - GET    /api/v1/notifications/unread-count 未读数
+# - POST   /api/v1/notifications/{id}/read   单条已读
+# - POST   /api/v1/notifications/read-all    全部已读
+# - DELETE /api/v1/notifications/{id}        删除通知
+
+@app.get("/api/v1/notifications")
+async def list_notifications(request: Request, limit: int = 50, before_ts: int = 0):
+    """§6.2 通知列表（分页，时间倒序）。
+
+    Query:
+      limit:     每页条数（默认 50，最大 200）
+      before_ts: 游标分页，返回 created_at < before_ts 的条目（0 = 最新页）
+    """
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        if limit < 1 or limit > 200:
+            limit = 50
+        items = notification_store.list(
+            jwt_user_id,
+            limit=limit,
+            before_ts=before_ts if before_ts > 0 else None,
+        )
+        next_before_ts = items[-1]["created_at"] if len(items) == limit else 0
+        return api_ok({
+            "items": items,
+            "limit": limit,
+            "next_before_ts": next_before_ts,
+            "has_more": next_before_ts > 0,
+        })
+    except Exception as e:
+        logger.error(f"[API] list_notifications error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+@app.get("/api/v1/notifications/unread-count")
+async def get_unread_count(request: Request):
+    """§6.2 未读通知数。"""
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        count = notification_store.unread_count(jwt_user_id)
+        return api_ok({"unread_count": count})
+    except Exception as e:
+        logger.error(f"[API] get_unread_count error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+@app.post("/api/v1/notifications/{notification_id}/read")
+async def mark_notification_read(request: Request, notification_id: str):
+    """§6.2 单条已读。"""
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        ok = notification_store.mark_read(jwt_user_id, notification_id)
+        if not ok:
+            return api_err(404, "notification not found")
+        return api_ok({"id": notification_id, "is_read": True})
+    except Exception as e:
+        logger.error(f"[API] mark_notification_read error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+@app.post("/api/v1/notifications/read-all")
+async def mark_all_notifications_read(request: Request):
+    """§6.2 全部已读。"""
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        count = notification_store.mark_all_read(jwt_user_id)
+        return api_ok({"marked_count": count})
+    except Exception as e:
+        logger.error(f"[API] mark_all_notifications_read error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+@app.delete("/api/v1/notifications/{notification_id}")
+async def delete_notification(request: Request, notification_id: str):
+    """§6.2 删除通知。"""
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        ok = notification_store.delete(jwt_user_id, notification_id)
+        if not ok:
+            return api_err(404, "notification not found")
+        return api_ok({"id": notification_id, "deleted": True})
+    except Exception as e:
+        logger.error(f"[API] delete_notification error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+# ==============================================================================
+# 消息接口（2026-08-13 文档 §5.2）
+# ==============================================================================
+# - POST /api/v1/messages/send    发送消息（client_msg_id 幂等 + 房间 seq）
+# - GET  /api/v1/messages/history 增量历史（按 seq 游标）
+
+@app.post("/api/v1/messages/send")
+async def send_message(request: Request, req: MessageSendRequest):
+    """§5.2 发送消息（含 client_msg_id 幂等 + 房间内 seq 单调递增）。
+
+    幂等命中：返回原消息 + _idempotent=true（不分配新 seq）。
+    """
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        if not req.client_msg_id:
+            return api_err(400, "client_msg_id required")
+        # room_id 从 query 或 path 取（这里用 body 形式简洁）
+        room_id = request.query_params.get("room_id", "")
+        if not room_id:
+            return api_err(400, "room_id required (query param)")
+        # 鉴权：必须在房间内
+        room = user_manager.get_room(room_id)
+        if not room or jwt_user_id not in room.members:
+            return api_err(403, "not in room")
+        item = message_store.send(
+            room_id=room_id,
+            user_id=jwt_user_id,
+            client_msg_id=req.client_msg_id,
+            msg_type=req.type,
+            content=req.content,
+            file_name=req.file_name,
+            file_size=req.file_size,
+            mime_type=req.mime_type,
+            width=req.width,
+            height=req.height,
+            timestamp=req.timestamp,
+        )
+        # 异步广播给房间（不通过 WS 端 send_message 重复发送，而是直接 broadcast）
+        if not item.get("_idempotent"):
+            asyncio.create_task(_broadcast_chat_message(room_id, item))
+        return api_ok({k: v for k, v in item.items() if k != "_idempotent"})
+    except Exception as e:
+        logger.error(f"[API] send_message error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+async def _broadcast_chat_message(room_id: str, item: dict):
+    """广播聊天消息给房间内所有在线成员（2026-08-13 §5.2 / 8.1）"""
+    msg = {
+        "type": "chat_message",
+        "room_id": room_id,
+        "user_id": item["user_id"],
+        "data": {
+            "id": item["id"],
+            "seq": item["seq"],
+            "msg_type": item["type"],
+            "content": item["content"],
+            "file_name": item.get("file_name", ""),
+            "file_size": item.get("file_size", 0),
+            "mime_type": item.get("mime_type", ""),
+            "width": item.get("width", 0),
+            "height": item.get("height", 0),
+            "timestamp": item.get("timestamp"),
+        },
+    }
+    await manager.broadcast_to_room_with_timestamp(room_id, msg)
+
+
+@app.get("/api/v1/messages/history")
+async def get_message_history(request: Request, room_id: str, after_seq: int = 0, limit: int = 50):
+    """§5.2 历史查询（按 seq 游标分页，after_seq=0 = 最新一页）。
+
+    鉴权：必须是房间成员。
+    """
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        if not room_id:
+            return api_err(400, "room_id required")
+        room = user_manager.get_room(room_id)
+        if not room or jwt_user_id not in room.members:
+            return api_err(403, "not in room")
+        if limit < 1 or limit > 200:
+            limit = 50
+        items = message_store.history(room_id, after_seq=after_seq, limit=limit)
+        latest = message_store.latest_seq(room_id)
+        return api_ok({
+            "items": items,
+            "room_id": room_id,
+            "latest_seq": latest,
+            "count": len(items),
+        })
+    except Exception as e:
+        logger.error(f"[API] get_message_history error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
 # ==============================================================================
 # §7 说话状态接口
 # ==============================================================================
@@ -3230,6 +3719,12 @@ def heartbeat_check_worker():
                     }))
         except Exception as e:
             logger.error(f"[HeartbeatCheck] Error: {e}", exc_info=True)
+
+        # 2026-08-13 §2.2：扫描 room_socket 心跳（30s 一次，3 次失败 → 离线）
+        try:
+            asyncio.run(manager.check_heartbeats(ping_interval=30, fail_threshold=3))
+        except Exception as e:
+            logger.error(f"[HeartbeatCheck] WS heartbeat error: {e}", exc_info=True)
 
         for _ in range(10):
             if not heartbeat_check_running:

@@ -1,0 +1,15 @@
+{
+  "5VXTD25QRF": {
+    "code": "5VXTD25QRF",
+    "room_id": "inv_1786670867",
+    "created_by": "user_8833edd3e48a",
+    "target_user_id": "",
+    "status": "used",
+    "used_by": "user_1ee0beeca470",
+    "created_at": 1786670867,
+    "expires_at": 1786671467,
+    "used_at": 1786670867,
+    "fail_count": 0,
+    "locked_until": 0
+  }
+}

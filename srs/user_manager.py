@@ -442,6 +442,34 @@ class UserManager:
             if not room:
                 return None
             return room.members.get(user_id)
+
+    # 2026-08-13：在线状态辅助（由 room_socket 心跳调用）
+    def _mark_member_online(self, room_id: str, user_id: str) -> bool:
+        """标记成员在线（连接建立时调用）。"""
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if not room:
+                return False
+            member = room.members.get(user_id)
+            if not member:
+                return False
+            member.mark_online()
+            self._flush()
+            return True
+
+    def _mark_member_offline(self, room_id: str, user_id: str) -> Optional[int]:
+        """标记成员离线（断开/心跳超时）。返回 offline_at 时间戳。"""
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if not room:
+                return None
+            member = room.members.get(user_id)
+            if not member:
+                return None
+            ts = int(datetime.now().timestamp())
+            member.mark_offline(ts)
+            self._flush()
+            return ts
     
     def get_room_members(self, room_id: str) -> List[User]:
         """获取房间成员列表"""
