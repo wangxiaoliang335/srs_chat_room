@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 账号 / JWT 鉴权模块
-- 用户表持久化到 users.json
+- 用户表持久化：MySQL 优先 + users.json 兜底（双写）
 - 密码用 PBKDF2-HMAC-SHA256 哈希存储（无需第三方依赖）
 - JWT 用 PyJWT (HS256)
 """
@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Optional, Set, Tuple
 
 import jwt
+
+from db import mysql_db
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\-]{3,32}$")
 
@@ -56,7 +58,14 @@ class AuthError(Exception):
 
 
 class UserStore:
-    """线程安全的用户表（持久化到 JSON）"""
+    """线程安全的用户表。
+
+    持久化策略（2026-08-13 文档 §7.1）：
+    - MySQL 优先（admin 配置）：作为主存储
+    - users.json 兜底：MySQL 不可用时降级使用
+    - 启动时若 MySQL 成功连接且表为空 → 自动从 JSON 迁移全部记录
+    - 每次写入双写：MySQL + JSON（保证一致性）
+    """
 
     def __init__(self, path: Path = USERS_FILE):
         self._path = path
@@ -67,7 +76,105 @@ class UserStore:
         self._user_id_to_name: dict = {}
         # 索引：(app_id, bus_id) -> user_id  （支撑 bus: 前缀解析）
         self._app_bus_to_uid: dict = {}
+        # MySQL 是否可用
+        self._mysql_ok = False
         self._load()
+        # 启动时尝试从 MySQL 加载；若 MySQL 空表 → 从 JSON 迁移
+        self._init_mysql()
+
+    def _init_mysql(self):
+        """启动时初始化 MySQL（建表 / 加载 / 迁移）。"""
+        try:
+            if not mysql_db.is_ok():
+                logger.info("[UserStore] MySQL 不可用，使用 users.json 模式")
+                return
+            self._mysql_ok = True
+            # 建表
+            if not mysql_db.init_schema():
+                logger.warning("[UserStore] MySQL 建表失败，回退到 JSON 模式")
+                self._mysql_ok = False
+                return
+            # 加载 MySQL 已有记录
+            mysql_count = mysql_db.count()
+            logger.info(f"[UserStore] MySQL 当前 chat_user 行数: {mysql_count}")
+            if mysql_count == 0 and self._users:
+                # 从 JSON 迁移到 MySQL
+                ok = mysql_db.bulk_insert(list(self._users.values()))
+                logger.info(
+                    f"[UserStore] 从 JSON 迁移到 MySQL: {ok}/{len(self._users)} 成功"
+                )
+            elif mysql_count > 0:
+                # MySQL 已有数据 → 以 MySQL 为准，同步内存索引
+                # （JSON 可能缺 bus_id 等字段，MySQL 是最新状态）
+                self._sync_from_mysql()
+        except Exception as e:
+            logger.warning(f"[UserStore] MySQL 初始化异常: {e}")
+            self._mysql_ok = False
+
+    def _sync_from_mysql(self):
+        """从 MySQL 拉取全部记录，同步到内存缓存（确保 bus_id 等字段最新）。"""
+        try:
+            import pymysql
+            conn = mysql_db._get_conn()
+            if conn is None:
+                return
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM chat_user")
+                rows = cur.fetchall()
+            cols = ("user_id", "username", "password_hash", "salt", "room_id",
+                    "role", "app_id", "bus_id", "ext_id", "ext_data",
+                    "created_at", "updated_at")
+            synced = 0
+            for row in rows:
+                rec = dict(zip(cols, row))
+                if rec.get("ext_data"):
+                    try:
+                        rec["ext_data"] = json.loads(rec["ext_data"])
+                    except Exception:
+                        rec["ext_data"] = {}
+                else:
+                    rec["ext_data"] = None
+                username = rec.get("username")
+                if not username:
+                    continue
+                user_id = rec.get("user_id")
+                # 同步到内存（以 MySQL 为准，覆盖 JSON 里可能缺失的字段）
+                self._users[username] = rec
+                if user_id:
+                    self._user_id_to_name[user_id] = username
+                    if rec.get("app_id") and rec.get("bus_id"):
+                        self._app_bus_to_uid[(rec["app_id"], rec["bus_id"])] = user_id
+                synced += 1
+            # 写回 JSON（同步后以 MySQL 为准）
+            self._flush()
+            logger.info(f"[UserStore] _sync_from_mysql: 同步 {synced} 条到内存缓存 + JSON")
+        except Exception as e:
+            logger.warning(f"[UserStore] _sync_from_mysql 失败: {e}")
+
+    def _persist_to_mysql(self, rec: dict) -> None:
+        """写一条记录到 MySQL（失败不抛错）。"""
+        if not self._mysql_ok:
+            return
+        try:
+            if not mysql_db.insert_user(rec):
+                # MySQL 这次失败 → 关闭后续同步
+                self._mysql_ok = False
+        except Exception:
+            self._mysql_ok = False
+
+    def _update_mysql(self, user_id: str, fields: dict) -> None:
+        """增量更新 MySQL 字段。"""
+        if not self._mysql_ok:
+            return
+        try:
+            if not mysql_db.update_user(user_id, fields):
+                self._mysql_ok = False
+        except Exception:
+            self._mysql_ok = False
+
+    def _delete_in_mysql(self, user_id: str) -> None:
+        """删 MySQL 一条（保留未实现——本业务不需要删用户）。"""
+        pass
 
     def _load(self):
         if self._path.exists():
@@ -92,10 +199,18 @@ class UserStore:
                 self._users = {}
 
     def _flush(self):
+        """JSON 落盘 + 异步同步 MySQL。"""
         tmp = self._path.with_suffix(".json.tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(self._users, f, ensure_ascii=False, indent=2)
         tmp.replace(self._path)
+        # 同步 MySQL 全部记录（简单可靠，少量用户可接受）
+        if self._mysql_ok:
+            try:
+                for rec in self._users.values():
+                    self._persist_to_mysql(rec)
+            except Exception:
+                pass
 
     @staticmethod
     def _hash_password(password: str, salt: bytes) -> bytes:
@@ -169,21 +284,65 @@ class UserStore:
 
     def get_by_username(self, username: str) -> Optional[dict]:
         with self._lock:
-            return self._users.get(username)
+            rec = self._users.get(username)
+            if rec is not None:
+                return rec
+        # 缓存 miss：如果 MySQL 可用就查一次
+        if self._mysql_ok:
+            rec = mysql_db.get_by_username(username)
+            if rec is not None:
+                with self._lock:
+                    self._users[username] = rec
+                    if rec.get("user_id"):
+                        self._user_id_to_name[rec["user_id"]] = username
+                return rec
+        return None
 
     def get_by_user_id(self, user_id: str) -> Optional[dict]:
-        """按 user_id 查记录（扫描 _user_id_to_name → username → record）"""
+        """按 user_id 查记录（内存索引 → MySQL 兜底）"""
         with self._lock:
             name = self._user_id_to_name.get(user_id)
             if name:
                 rec = self._users.get(name)
                 if rec:
                     return rec
-            # 兜底：兼容早期没有 _user_id_to_name 的情况（直接扫描）
+            # 兜底：内存里全扫
             for name, rec in self._users.items():
                 if rec.get("user_id") == user_id:
                     return rec
-            return None
+        # 内存 miss → MySQL 兜底
+        if self._mysql_ok:
+            rec = mysql_db.get_by_user_id(user_id)
+            if rec is not None:
+                with self._lock:
+                    username = rec.get("username")
+                    if username:
+                        self._users[username] = rec
+                        self._user_id_to_name[user_id] = username
+                return rec
+        return None
+
+    def get_by_app_bus(self, app_id: str, bus_id: str) -> Optional[dict]:
+        """按 (app_id, bus_id) 查记录（内存索引 → MySQL 兜底）"""
+        with self._lock:
+            uid = self._app_bus_to_uid.get((app_id, bus_id))
+            if uid:
+                name = self._user_id_to_name.get(uid)
+                if name:
+                    return self._users.get(name)
+        # 内存 miss → MySQL 兜底
+        if self._mysql_ok:
+            rec = mysql_db.get_by_app_bus(app_id, bus_id)
+            if rec is not None:
+                with self._lock:
+                    username = rec.get("username")
+                    user_id = rec.get("user_id")
+                    if username and user_id:
+                        self._users[username] = rec
+                        self._user_id_to_name[user_id] = username
+                        self._app_bus_to_uid[(app_id, bus_id)] = user_id
+                return rec
+        return None
 
     def update_username(self, user_id: str, new_username: str) -> bool:
         """更新库中 username。user_id 决定唯一记录，new_username 是新的显示名。

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "saved_at": 1786675176,
+  "saved_at": 1786678102,
   "rooms": {
     "alove_room_demo": {
       "room_id": "alove_room_demo",
@@ -891,6 +891,43 @@
           "offline_at": null
         }
       }
+    },
+    "redis_rm_1786678085": {
+      "room_id": "redis_rm_1786678085",
+      "name": "redis_rm_1786678085",
+      "owner_id": "user_682e5c94273c",
+      "status": "active",
+      "closed_by": "",
+      "closed_at": "",
+      "close_reason": "",
+      "created_at": "2026-08-14 11:28:05",
+      "max_members": 100,
+      "allow_speak": true,
+      "member_count": 2,
+      "members": {
+        "user_682e5c94273c": {
+          "user_id": "user_682e5c94273c",
+          "room_id": "redis_rm_1786678085",
+          "role": "owner",
+          "status": "normal",
+          "joined_at": "2026-08-14 11:28:05",
+          "last_active": "2026-08-14 11:28:05",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        },
+        "user_b00dc99281aa": {
+          "user_id": "user_b00dc99281aa",
+          "room_id": "redis_rm_1786678085",
+          "role": "member",
+          "status": "normal",
+          "joined_at": "2026-08-14 11:28:22",
+          "last_active": "2026-08-14 11:28:22",
+          "publish_allowed": true,
+          "online_status": "offline",
+          "offline_at": null
+        }
+      }
     }
   },
   "stream_to_user": {
@@ -922,6 +959,8 @@
     "inv_1786670867_user_1ee0beeca470": "user_1ee0beeca470",
     "rate_1786674667_user_070de03780fc": "user_070de03780fc",
     "metrics_rm_user_4bc0aaee9058": "user_4bc0aaee9058",
-    "metrics_rm2_user_f9a7cf95763a": "user_f9a7cf95763a"
+    "metrics_rm2_user_f9a7cf95763a": "user_f9a7cf95763a",
+    "redis_rm_1786678085_user_682e5c94273c": "user_682e5c94273c",
+    "redis_rm_1786678085_user_b00dc99281aa": "user_b00dc99281aa"
   }
 }

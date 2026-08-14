@@ -24,5 +24,18 @@
     "used_at": null,
     "fail_count": 0,
     "locked_until": 0
+  },
+  "CXEJTGTNAQ": {
+    "code": "CXEJTGTNAQ",
+    "room_id": "redis_rm_1786678085",
+    "created_by": "user_682e5c94273c",
+    "target_user_id": "",
+    "status": "used",
+    "used_by": "user_b00dc99281aa",
+    "created_at": 1786678085,
+    "expires_at": 1786678685,
+    "used_at": 1786678102,
+    "fail_count": 0,
+    "locked_until": 0
   }
 }
