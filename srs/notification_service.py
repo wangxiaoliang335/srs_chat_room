@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class EventType(Enum):
     """事件类型"""
     MEMBER_JOINED = "member_joined"
-    MEMBER_LEFT = "member_left"
+    MEMBER_OFFLINE = "member_offline"  # 成员离线（2026-08-13 文档：member_left → member_offline）
     MEMBER_KICKED = "member_kicked"
     MEMBER_ROLE_CHANGED = "member_role_changed"
     MEMBER_MUTED = "member_muted"
@@ -193,13 +193,20 @@ class NotificationService:
         )
         self._emit(event)
 
-    def notify_member_left(self, room_id: str, user_id: str):
+    def notify_member_offline(self, room_id: str, user_id: str, offline_at: int = 0):
+        """成员离线通知（2026-08-13 文档：从 notify_member_left 重命名）"""
         event = RoomEvent(
-            event_type=EventType.MEMBER_LEFT.value,
+            event_type=EventType.MEMBER_OFFLINE.value,
             room_id=room_id,
-            user_id=user_id
+            user_id=user_id,
+            data={"offline_at": offline_at}
         )
         self._emit(event)
+
+    # 兼容旧调用：保留别名，内部走 offline（2026-08-13 文档变更说明）
+    def notify_member_left(self, room_id: str, user_id: str):
+        import time as _t
+        self.notify_member_offline(room_id, user_id, offline_at=int(_t.time()))
 
     def notify_member_kicked(self, room_id: str, user_id: str, operator_id: str):
         event = RoomEvent(

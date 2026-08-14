@@ -40,10 +40,11 @@ class UserStatus(Enum):
     MIC_OFF = "mic_off"       # 被禁麦
 
 
-class OwnerStatus(Enum):
-    """房主在线状态"""
-    ONLINE = "online"      # 房主在线
-    OFFLINE = "offline"    # 房主离线（离开房间但房间仍运行）
+# 2026-08-13 文档：移除 OwnerStatus 枚举
+# 所有成员（含房主）统一用 User.online_status 字段，由 room_socket 心跳判定
+# class OwnerStatus(Enum):
+#     ONLINE = "online"
+#     OFFLINE = "offline"
 
 
 class RoomStatus(Enum):
@@ -62,7 +63,10 @@ class User:
     joined_at: str = ""
     last_active: str = ""
     publish_allowed: bool = True  # 是否允许发布（麦克风权限）
-    
+    # 2026-08-13 文档：成员在线/离线状态（由 room_socket 心跳判定，非 join 设置）
+    online_status: str = "offline"  # online / offline
+    offline_at: Optional[int] = None  # 最近离线时间戳（None = 在线）
+
     def to_dict(self):
         return {
             'user_id': self.user_id,
@@ -71,8 +75,23 @@ class User:
             'status': self.status.value,
             'joined_at': self.joined_at,
             'last_active': self.last_active,
-            'publish_allowed': self.publish_allowed
+            'publish_allowed': self.publish_allowed,
+            'online_status': self.online_status,
+            'offline_at': self.offline_at,
         }
+
+    def mark_online(self) -> None:
+        """标记为在线（由 room_socket 心跳建立连接时调用）"""
+        self.online_status = "online"
+        self.offline_at = None
+        self.last_active = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def mark_offline(self, ts: Optional[int] = None) -> None:
+        """标记为离线（3 次心跳失败时调用）"""
+        if ts is None:
+            ts = int(datetime.now().timestamp())
+        self.online_status = "offline"
+        self.offline_at = ts
 
 
 @dataclass
@@ -81,7 +100,6 @@ class Room:
     room_id: str
     name: str = ""
     owner_id: str = ""          # 群主ID
-    owner_status: OwnerStatus = OwnerStatus.ONLINE  # 房主在线状态
     status: RoomStatus = RoomStatus.ACTIVE          # 房间状态
     closed_by: str = ""          # 关闭者 user_id（仅 closed 时有值）
     closed_at: str = ""          # 关闭时间戳（仅 closed 时有值）
@@ -96,7 +114,7 @@ class Room:
             'room_id': self.room_id,
             'name': self.name,
             'owner_id': self.owner_id,
-            'owner_status': self.owner_status.value,
+            # 2026-08-13 文档：移除 owner_status 字段（统一用成员 online_status）
             'status': self.status.value,
             'closed_by': self.closed_by,
             'closed_at': self.closed_at,
@@ -171,7 +189,7 @@ class UserManager:
                         room_id=rd.get("room_id", rid),
                         name=rd.get("name", ""),
                         owner_id=rd.get("owner_id", ""),
-                        owner_status=OwnerStatus(rd.get("owner_status", "online")),
+                        # 2026-08-13：忽略旧 owner_status 字段
                         status=RoomStatus(rd.get("status", "active")),
                         closed_by=rd.get("closed_by", ""),
                         closed_at=rd.get("closed_at", ""),
@@ -318,34 +336,17 @@ class UserManager:
             room.closed_by = closed_by
             room.closed_at = self._get_current_time()
             room.close_reason = reason
-            room.owner_status = OwnerStatus.OFFLINE
-            
+
+            # 2026-08-13：房主在线/离线改用 User.online_status（不在 Room 上）
+
             logger.info(f"[UserManager] Closed room {room_id} by {closed_by}, reason={reason}")
             self._flush()
             return True
 
-    def set_owner_online(self, room_id: str) -> bool:
-        """房主重新上线"""
-        with self._lock:
-            room = self._rooms.get(room_id)
-            if not room:
-                return False
-            room.owner_status = OwnerStatus.ONLINE
-            logger.info(f"[UserManager] Owner online in room {room_id}")
-            self._flush()
-            return True
+    # 2026-08-13：移除 set_owner_online / set_owner_offline
+    # 房主在线/离线统一通过 User.online_status 字段管理（在成员 User 上）
+    # 不再提供房间级 owner_status 操作
 
-    def set_owner_offline(self, room_id: str) -> bool:
-        """房主离线"""
-        with self._lock:
-            room = self._rooms.get(room_id)
-            if not room:
-                return False
-            room.owner_status = OwnerStatus.OFFLINE
-            logger.info(f"[UserManager] Owner offline in room {room_id}")
-            self._flush()
-            return True
-    
     def get_all_rooms(self) -> List[Room]:
         """获取所有房间"""
         with self._lock:
@@ -371,11 +372,7 @@ class UserManager:
                 # 更新最后活跃时间
                 user = room.members[user_id]
                 user.last_active = self._get_current_time()
-                # 房主重新加入：恢复在线状态
-                if user_id == room.owner_id:
-                    room.owner_status = OwnerStatus.ONLINE
-                    logger.info(f"[UserManager] Owner {user_id} re-joined room {room_id}, restored to online")
-                    self._flush()
+                # 2026-08-13：join 不再设在线状态（由心跳判定）
                 return user
             
             # 检查房间人数限制
@@ -426,13 +423,10 @@ class UserManager:
             stream_name = f"{room_id}_{user_id}"
             self._stream_to_user.pop(stream_name, None)
 
-            # 如果是房主离开，标记为 owner_offline（不删除房主占位）
-            if user_id == room.owner_id:
-                # 房主离开：保留成员占位，标记为 offline
-                room.owner_status = OwnerStatus.OFFLINE
-                logger.info(f"[UserManager] Owner {user_id} left room {room_id}, marked as owner_offline")
-            else:
-                del room.members[user_id]
+            # 2026-08-13 文档：移除"房主离开 → owner_offline"概念
+            # 文档要求成员仅有在线/离线，由心跳判定，leave 不存在
+            # 踢人/关房间才会真正移除成员关联（见 kick_member / close_room）
+            del room.members[user_id]
 
             # 如果房间空了，删除房间
             if not room.members:
@@ -470,6 +464,40 @@ class UserManager:
                     return room_id
             return None
 
+    def find_owned_room(self, user_id: str) -> Optional[str]:
+        """查找 user_id 作为房主（owner）的房间 ID（仅 ACTIVE）。
+
+        2026-08-13 文档 §7.1：每账号最多拥有 1 个房主房间。
+        用于创建房间时检查唯一性 + 覆盖更新。
+        """
+        if not user_id:
+            return None
+        with self._lock:
+            for room_id, room in self._rooms.items():
+                if room.status == RoomStatus.ACTIVE and room.owner_id == user_id:
+                    return room_id
+            return None
+
+    def update_room(self, room_id: str, name: Optional[str] = None,
+                    max_members: Optional[int] = None,
+                    allow_speak: Optional[bool] = None) -> Optional[Room]:
+        """覆盖更新房间字段（2026-08-13 文档 §7.1：已拥有房主房间时创建房间走覆盖语义）。
+
+        仅更新非空字段；返回更新后的 Room 对象，不存在返回 None。
+        """
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if not room:
+                return None
+            if name is not None:
+                room.name = name
+            if max_members is not None:
+                room.max_members = max_members
+            if allow_speak is not None:
+                room.allow_speak = allow_speak
+            self._flush()
+            return room
+
     def get_user_room_info(self, user_id: str) -> Optional[dict]:
         """获取指定用户所在的房间信息（房主或成员），用于"查找好友房间"流程。
         返回 None 表示用户不在任何 active/closed 房间中。
@@ -481,18 +509,19 @@ class UserManager:
                 if room.status == RoomStatus.ACTIVE and user_id in room.members:
                     member = room.members[user_id]
                     # 在线成员数（不含 owner_offline 时的 owner，因为 owner 不在 members 里了）
-                    # 但 owner 在 members 里时正常统计
+                    # 2026-08-13：online_count 改为统计 User.online_status == 'online' 的成员
                     online_count = sum(
-                        1 for uid, m in room.members.items()
-                        if uid != room.owner_id or room.owner_status == OwnerStatus.ONLINE
+                        1 for m in room.members.values()
+                        if m.online_status == "online"
                     )
                     your_role = "owner" if user_id == room.owner_id else member.role.value
-                    owner_status = room.owner_status.value
+                    owner_member = room.members.get(room.owner_id) if room.owner_id else None
+                    owner_online_status = owner_member.online_status if owner_member else "offline"
                     return {
                         "room_id": room_id,
                         "room_name": room.name,
                         "owner_id": room.owner_id,
-                        "owner_status": owner_status,
+                        "owner_online_status": owner_online_status,  # 2026-08-13 替代 owner_status
                         "your_role": your_role,
                         "member_count": len(room.members),
                         "online_count": online_count,

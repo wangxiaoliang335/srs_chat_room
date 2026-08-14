@@ -666,8 +666,9 @@ class RoomJoinRequest(BaseModel):
     room_id: str = None                # 可选，URL 路径中有则优先用路径的
     role: str = "member"               # 文档 §4.3：可选，默认 member
 
-class RoomLeaveRequest(BaseModel):
-    user_id: str = ""
+# 文档 §2.3 变更说明：移除 RoomLeaveRequest（/leave 接口已删除）
+# class RoomLeaveRequest(BaseModel):
+#     user_id: str = ""
 
 class MemberOperatorRequest(BaseModel):
     """禁言/禁麦/踢人等接口的统一 operator_id 参数（现已从 JWT 取，此字段保留兼容）"""
@@ -1156,7 +1157,12 @@ async def get_rooms():
 
 @app.post("/api/v1/room")
 async def create_room(request: Request, req: RoomCreateRequest):
-    """§3.1 创建房间（owner_id 从 JWT 取，请求体里若带值需一致）"""
+    """§3.1 创建房间（owner_id 从 JWT 取，请求体里若带值需一致）
+
+    2026-08-13 文档 §7.1：
+    - 用户已是某房间房主 → 不创建新房间，走"覆盖更新"现有房间（room_id 不变）
+    - 用户非任何房主 → 正常创建，用户成为 owner
+    """
     try:
         jwt_user_id = request.state.user_id
         if not jwt_user_id:
@@ -1166,7 +1172,25 @@ async def create_room(request: Request, req: RoomCreateRequest):
         if req.owner_id and req.owner_id != jwt_user_id:
             return api_err(403, "owner_id must match current user")
 
-        room = user_manager.create_room(req.room_id, jwt_user_id, name=req.name)
+        # 2026-08-13 文档 §7.1：房主唯一性 + 覆盖更新语义
+        existing_owned = user_manager.find_owned_room(jwt_user_id)
+        if existing_owned:
+            # 已是某房间房主 → 不创建新房间，覆盖更新现有房间
+            # 若请求中的 room_id 与现有不同，记一条警告（不阻断，覆盖优先）
+            if req.room_id and req.room_id != existing_owned:
+                logger.warning(
+                    f"[API] create_room: user {jwt_user_id} already owns room {existing_owned}, "
+                    f"ignoring requested room_id {req.room_id}, applying overwrite"
+                )
+            room = user_manager.update_room(
+                existing_owned,
+                name=req.name if req.name else None,
+            )
+            logger.info(f"[API] Owner {jwt_user_id} re-create: overwrite room {existing_owned}")
+        else:
+            # 非任何房间房主 → 正常创建
+            room = user_manager.create_room(req.room_id, jwt_user_id, name=req.name)
+
         asyncio.create_task(sync.room_created(
             room_id=room.room_id,
             owner_id=room.owner_id,
@@ -1180,7 +1204,9 @@ async def create_room(request: Request, req: RoomCreateRequest):
             "created_at": room.created_at,
             "max_members": room.max_members,
             "allow_speak": room.allow_speak,
-            "member_count": len(room.members)
+            "member_count": len(room.members),
+            # 2026-08-13 文档：标记是否走"覆盖更新"语义（客户端可据此选择不重置房间状态）
+            "overwritten": bool(existing_owned),
         })
     except Exception as e:
         logger.error(f"[API] create_room error: {e}")
@@ -1227,7 +1253,11 @@ async def room_health(room_id: str):
             "room_id": room.room_id,
             "status": room.status.value,
             "owner_id": room.owner_id,
-            "owner_status": room.owner_status.value,
+            # 2026-08-13：移除 owner_status，改用 owner_online_status（取自 Room.members[owner]）
+            "owner_online_status": (
+                room.members[room.owner_id].online_status
+                if room.owner_id and room.owner_id in room.members else "offline"
+            ),
             "member_count": len(room.members)
         })
     except Exception as e:
@@ -1615,10 +1645,9 @@ async def join_room_alias(request: Request, room_id: str, req: RoomJoinRequest):
     return await join_room(request, room_id, req)
 
 
-@app.post("/api/v1/rooms/{room_id}/leave")
-async def leave_room_alias(request: Request, room_id: str, req: RoomLeaveRequest):
-    """POST /api/v1/rooms/{room_id}/leave（复数别名）"""
-    return await leave_room(request, room_id, req)
+# 文档 §2.3 变更说明：移除 /api/v1/rooms/{room_id}/leave 接口
+# 离线由 room_socket 心跳判定，客户端断开连接即可
+# @app.post("/api/v1/rooms/{room_id}/leave")  # 已移除（2026-08-13 文档变更）
 
 
 @app.delete("/api/v1/rooms/{room_id}/member/{user_id}/kick")
@@ -1680,7 +1709,7 @@ async def get_member_detail(room_id: str, user_id: str):
 
 @app.post("/api/v1/room/{room_id}/join")
 async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
-    """§4.3 加入房间（房主重新加入时恢复 owner_online；拒绝加入已关闭房间）"""
+    """§4.3 加入房间（拒绝加入已关闭房间；2026-08-13 文档：不再设置在线状态，由心跳判定）"""
     try:
         jwt_user_id = request.state.user_id
         if not jwt_user_id:
@@ -1716,20 +1745,8 @@ async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
             last_active="",
         ))
 
-        # 房主重新加入：广播 owner_online 给其他成员（不包含房主自己）
-        room_after = user_manager.get_room(actual_room_id)
-        if room_after and jwt_user_id == room_after.owner_id and room_after.owner_status.value == "online":
-            await manager.broadcast_to_room_exclude(actual_room_id, {
-                "type": "owner_online",
-                "room_id": actual_room_id,
-                "data": {
-                    "owner_id": jwt_user_id,
-                    "owner_name": getattr(request.state, "name", "") or jwt_user_id,
-                    "timestamp": int(time.time())
-                }
-            }, exclude_user_ids={jwt_user_id})
-            logger.info(f"[API] Owner {jwt_user_id} re-joined room {actual_room_id}, broadcast owner_online")
-
+        # 2026-08-13 文档：join 不再设在线状态、也不再广播 owner_online
+        # 在线/离线一律由 room_socket 心跳判定（详见 §2）
         await manager.broadcast_to_room_with_timestamp(actual_room_id, {
             "type": "member_joined",
             "room_id": actual_room_id,
@@ -1747,61 +1764,20 @@ async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
             "role": user.role.value,
             "status": user.status.value,
             "publish_allowed": user.publish_allowed,
-            "joined_at": user.joined_at
+            "joined_at": user.joined_at,
+            # 2026-08-13 文档：返回在线状态字段（由心跳判定）
+            "online_status": user.online_status,
+            "offline_at": user.offline_at,
         })
     except Exception as e:
         logger.error(f"[API] join_room error: {e}")
         return api_err(400, str(e))
 
-@app.post("/api/v1/room/{room_id}/leave")
-async def leave_room(request: Request, room_id: str, req: RoomLeaveRequest):
-    """§4.4 离开房间（房主离开：owner_offline；其他人：member_left）"""
-    try:
-        jwt_user_id = request.state.user_id
-        if not jwt_user_id:
-            return api_err(401, "not authenticated")
-        if req.user_id and req.user_id != jwt_user_id:
-            return api_err(403, "user_id must match current user")
-
-        room_before = user_manager.get_room(room_id)
-        was_owner = room_before and room_before.owner_id == jwt_user_id
-
-        user_manager.leave_room(room_id, jwt_user_id)
-
-        # 清空账号表中的 room_id
-        for name, rec in list(user_store._users.items()):
-            if rec.get("user_id") == jwt_user_id or name == jwt_user_id:
-                if rec.get("room_id") == room_id:
-                    user_store.set_room(name, None)
-                break
-
-        asyncio.create_task(sync.member_left(room_id=room_id, user_id=jwt_user_id, reason="left"))
-
-        if was_owner:
-            # 房主离开：广播 owner_offline 给其他成员（不包含房主自己）
-            owner_name = resolve_display_name(jwt_user_id, user_store=user_store, fallback=jwt_user_id)
-            await manager.broadcast_to_room_exclude(room_id, {
-                "type": "owner_offline",
-                "room_id": room_id,
-                "data": {
-                    "owner_id": jwt_user_id,
-                    "owner_name": owner_name,
-                    "timestamp": int(time.time())
-                }
-            }, exclude_user_ids={jwt_user_id})
-            logger.info(f"[API] Owner {jwt_user_id} (name={owner_name!r}) left room {room_id}, broadcast owner_offline")
-        else:
-            await manager.broadcast_to_room_with_timestamp(room_id, {
-                "type": "member_left",
-                "room_id": room_id,
-                "user_id": jwt_user_id
-            })
-            logger.info(f"[API] User {jwt_user_id} left room {room_id}")
-
-        return api_ok({})
-    except Exception as e:
-        logger.error(f"[API] leave_room error: {e}")
-        return api_err(400, str(e))
+# 文档 §2.3 变更说明：移除 /api/v1/room/{room_id}/leave 接口
+# 离线由 room_socket 心跳判定，客户端断开连接即可
+# @app.post("/api/v1/room/{room_id}/leave")  # 已移除（2026-08-13 文档变更）
+# async def leave_room(request: Request, room_id: str, req: RoomLeaveRequest):
+#     ...
 
 @app.delete("/api/v1/room/{room_id}/member/{user_id}/kick")
 async def kick_member(request: Request, room_id: str, user_id: str, operator_id: str = ""):
