@@ -64,7 +64,6 @@ core-*
 # Test and docs
 test/
 test_*.py
-docs/
 
 # Config
 .env
