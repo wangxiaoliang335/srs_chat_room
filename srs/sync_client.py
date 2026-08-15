@@ -178,6 +178,19 @@ class Debouncer:
         """注入回调：async fn(room_id, event, body)"""
         self._on_flush = fn
 
+    async def _flush(self, key: str) -> None:
+        """防抖到期后调用：取 pending[key] 并触发回调。"""
+        async with self._lock:
+            item = self._pending.pop(key, None)
+        if not item:
+            return
+        if self._on_flush is None:
+            return
+        try:
+            await self._on_flush(item["room_id"], item["event"], item["body"])
+        except Exception as e:
+            _main_logger.warning(f"[Debouncer] _on_flush error: {e}")
+
     async def cancel_all(self):
         async with self._lock:
             self._pending.clear()

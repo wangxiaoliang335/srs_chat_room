@@ -202,7 +202,8 @@ class MySQLClient:
                     f"UPDATE chat_user SET {', '.join(sets)} WHERE user_id=%s",
                     tuple(vals),
                 )
-            return cur.rowcount >= 0
+            # rowcount == 0 也算成功（无变化）；只有 -1/抛错才算失败
+            return cur.rowcount > -1
         except Exception as e:
             self._mark_offline(str(e))
             return False

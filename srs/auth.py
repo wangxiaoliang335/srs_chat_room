@@ -199,7 +199,11 @@ class UserStore:
                 self._users = {}
 
     def _flush(self):
-        """JSON 落盘 + 异步同步 MySQL。"""
+        """JSON 落盘 + 异步同步 MySQL。
+
+        ⚠️ 全表同步成本高，只用在 register / get_or_create（创建新用户）等
+        真正全表状态变更的场景。增量更新请用 _update_mysql + _flush_json。
+        """
         tmp = self._path.with_suffix(".json.tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(self._users, f, ensure_ascii=False, indent=2)
@@ -211,6 +215,13 @@ class UserStore:
                     self._persist_to_mysql(rec)
             except Exception:
                 pass
+
+    def _flush_json(self):
+        """仅 JSON 落盘（不做 MySQL 同步）。通常配合 _update_mysql 使用。"""
+        tmp = self._path.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(self._users, f, ensure_ascii=False, indent=2)
+        tmp.replace(self._path)
 
     @staticmethod
     def _hash_password(password: str, salt: bytes) -> bytes:
@@ -268,9 +279,11 @@ class UserStore:
                 raise AuthError(401, "用户名或密码错误")
             # 兼容老数据：补字段并落盘
             changed = False
-            if not record.get("user_id"):
-                record["user_id"] = "user_" + uuid.uuid4().hex[:12]
-                self._user_id_to_name[record["user_id"]] = username
+            user_id = record.get("user_id")
+            if not user_id:
+                user_id = "user_" + uuid.uuid4().hex[:12]
+                record["user_id"] = user_id
+                self._user_id_to_name[user_id] = username
                 changed = True
             if "room_id" not in record:
                 record["room_id"] = None
@@ -279,7 +292,13 @@ class UserStore:
                 record["role"] = "member"
                 changed = True
             if changed:
-                self._flush()
+                # 增量同步 MySQL + JSON（不全表重写）
+                self._update_mysql(user_id, {
+                    "user_id": user_id,
+                    "room_id": record.get("room_id"),
+                    "role": record.get("role"),
+                })
+                self._flush_json()
             return record
 
     def get_by_username(self, username: str) -> Optional[dict]:
@@ -365,14 +384,16 @@ class UserStore:
                 return False
             if old_username == new_username:
                 return True
-            # 注意：_users 的 key 是 username，但 get_or_create_from_external
-            # 用 username 当唯一键。改名时不应改 key，否则会破坏按 username 的索引。
-            # 改的是 record["username"] 字段（外部读取时使用的"显示名"），
-            # 而不是 _users 的 key。
-            rec["username"] = new_username
-            rec["updated_at"] = int(time.time())
-            self._flush()
-            return True
+# 注意：_users 的 key 是 username，但 get_or_create_from_external
+        # 用 username 当唯一键。改名时不应改 key，否则会破坏按 username 的索引。
+        # 改的是 record["username"] 字段（外部读取时使用的"显示名"），
+        # 而不是 _users 的 key。
+        rec["username"] = new_username
+        rec["updated_at"] = int(time.time())
+        # 增量同步 MySQL（避免全表同步）
+        self._update_mysql(user_id, {"username": new_username})
+        self._flush_json()
+        return True
 
     def set_room(self, username: str, room_id: Optional[str]) -> None:
         """登录进房后回填 / 离开房间后清空"""
@@ -381,7 +402,10 @@ class UserStore:
             if not rec:
                 return
             rec["room_id"] = room_id
-            self._flush()
+            user_id = rec.get("user_id")
+        if user_id:
+            self._update_mysql(user_id, {"room_id": room_id})
+        self._flush_json()
 
     def set_role(self, username: str, role: str) -> None:
         with self._lock:
@@ -389,7 +413,10 @@ class UserStore:
             if not rec:
                 return
             rec["role"] = role
-            self._flush()
+            user_id = rec.get("user_id")
+        if user_id:
+            self._update_mysql(user_id, {"role": role})
+        self._flush_json()
 
     def get_or_create_from_external(
         self, username: str, ext_data: dict, app_id: str = "default"
@@ -424,7 +451,9 @@ class UserStore:
                     rec["app_id"] = app_id
                     rec["bus_id"] = bus_id
                     self._app_bus_to_uid[(app_id, bus_id)] = rec["user_id"]
-                    self._flush()
+                    # 增量同步 MySQL + JSON
+                    self._update_mysql(rec["user_id"], {"app_id": app_id, "bus_id": bus_id})
+                    self._flush_json()
                 return rec
 
             # 均不存在 → 创建

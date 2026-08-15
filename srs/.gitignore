@@ -96,6 +96,15 @@ invitations_archive.json
 invitations.json.legacy
 revoked_tokens.json
 
+# 运行时状态数据（运行时生成，不入库）
+invite_codes.json
+user_manager.json
+messages.json
+messages_seq.json
+notifications.json
+notifications_active.json
+notifications_archive.json
+
 # 音频 / 录制临时数据
 input_recordings/
 pcm_recordings/

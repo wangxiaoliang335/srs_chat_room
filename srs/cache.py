@@ -57,7 +57,16 @@ class Cache:
         if self._redis_disabled:
             return None
         if self._redis is not None:
-            return self._redis
+            try:
+                self._redis.ping()
+                return self._redis
+            except Exception:
+                # 连接已死，重建
+                try:
+                    self._redis.close()
+                except Exception:
+                    pass
+                self._redis = None
         try:
             import redis
             client = redis.Redis.from_url(
@@ -154,12 +163,16 @@ class Cache:
             except Exception:
                 pass
         with self._lock:
+            new_exp = (time.time() + ttl) if ttl > 0 else 0
             if key in self._sets:
                 s, exp = self._sets[key]
+                # 过期检查：过期则重置为空集 + 新 TTL
+                if exp > 0 and time.time() > exp:
+                    s = set()
             else:
-                s, exp = set(), (time.time() + ttl if ttl > 0 else 0)
+                s = set()
             s.add(value)
-            self._sets[key] = (s, exp)
+            self._sets[key] = (s, new_exp)
 
     def srem(self, key: str, value: Any) -> None:
         r = self._get_redis()
