@@ -142,11 +142,25 @@ curl http://127.0.0.1:8085/api/v1/me/rooms \
 ### 3.3 房间详情
 
 ```bash
-curl "http://127.0.0.1:8085/api/v1/room/{room_id}/info" \
+curl "http://127.0.0.1:8085/api/v1/room/{room_id}" \
   -H "Authorization: Bearer <JWT>"
 ```
 
 返回 `room_id`、`owner_id`、`status`（active/closed）、`members` 列表、`online_count`。
+
+### 3.3.1 房间成员列表
+
+```bash
+curl "http://127.0.0.1:8085/api/v1/room/{room_id}/members" \
+  -H "Authorization: Bearer <JWT>"
+```
+
+### 3.3.2 房间健康检查
+
+```bash
+curl "http://127.0.0.1:8085/api/v1/rooms/{room_id}/health" \
+  -H "Authorization: Bearer <JWT>"
+```
 
 ### 3.4 关闭房间
 
@@ -185,12 +199,10 @@ curl -X DELETE http://127.0.0.1:8085/api/v1/room/{room_id} \
        │
        ▼
  ┌─────────────────────────┐
- │ /api/v1/invites/        │
- │   {id}/redeem           │  ← R4 邀请记录兑换
- │   │                     │
- │   code/redeem 或        │  ← R3 通用码兑换
- │   link/consume          │  ← R4 邀请链接兑换
- └─────────────────────────┘
+│ /api/v1/invites/{id}/redeem│  ← R4 邀请记录兑换
+│ /api/v1/invites/code/redeem│  ← R3 通用码兑换
+│ /api/v1/invites/link/consume│  ← R4 邀请链接兑换
+└─────────────────────────┘
        │
        ▼  服务端生成 active 通行码（30 天）
        │
@@ -691,10 +703,14 @@ curl http://127.0.0.1:8085/api/v1/health
 
 ### 12.2 在线状态
 
+查看房间整体在线状态：
+
 ```bash
-curl "http://127.0.0.1:8085/api/v1/users/online?room_id=r_team_001" \
+curl "http://127.0.0.1:8085/api/v1/room/{room_id}/members" \
   -H "Authorization: Bearer <JWT>"
 ```
+
+每个 member 自带 `online_status`（`online`/`offline`），可以按此过滤。
 
 ### 12.3 解析业务用户
 
@@ -780,12 +796,12 @@ curl -X POST "/api/v1/messages/send?room_id=..." -d '{"content":"hi"}'
 正确流程：先 redeeem → 再 join。
 
 ```bash
-# ❌ 错误：直接 join
-curl -X POST /api/v1/room/r1/join ...
+# ❌ 错误：直接 join（缺少兑换步骤）
+curl -X POST /api/v1/room/<room_id>/join ...
 
-# ✅ 正确
-curl -X POST /api/v1/invites/$INVITE_ID/redeem ...    # 先兑换
-curl -X POST /api/v1/room/r1/join ...                  # 再 join
+# ✅ 正确流程
+curl -X POST /api/v1/invites/<invitation_id>/redeem ...    # 先兑换
+curl -X POST /api/v1/room/<room_id>/join ...               # 再 join
 ```
 
 ### 13.3 WS 一直断、提示 `member_offline`
