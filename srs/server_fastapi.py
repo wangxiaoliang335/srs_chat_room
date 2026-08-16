@@ -27,6 +27,25 @@ from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+# 自定义路径参数转换器：只匹配 inv_ 开头的字符串
+class InvitationIdConvertor:
+    """FastAPI/Starlette 路径参数：只匹配以 inv_ 开头的字符串（避免 /code /link 路由冲突）。"""
+
+    regex = r"inv_[^/]+"
+
+    def convert(self, value: str) -> str:
+        return value
+
+    def to_string(self, value: str) -> str:
+        return value
+
+
+try:
+    from starlette.convertors import register_url_convertor
+    register_url_convertor("inv_id", InvitationIdConvertor())
+except Exception:
+    pass
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 import requests
@@ -47,6 +66,7 @@ from notification_service import notification_service
 from notification_store import notification_store
 from message_store import message_store
 from invite_code_store import invite_code_store
+from pass_code_store import pass_code_store
 from rate_limiter import rate_limiter
 from auth import user_store, issue_token, verify_token, AuthError, JWT_TTL_SECONDS, revocation, USERNAME_RE
 from sync_client import sync
@@ -1321,6 +1341,39 @@ async def auth_me(request: Request):
     }
 
 
+@app.get("/api/v1/me/rooms")
+async def me_rooms(request: Request):
+    """2026-08-15 R7.2：多设备同步房间列表。
+
+    新设备登录后第一件事调此接口：返回当前用户关联的全部 ACTIVE 房间
+    （owner + member）。
+    """
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        # 1) 房间侧：user_manager 里的 owner + member 关系
+        rooms_map = {r["room_id"]: r for r in user_manager.get_user_rooms(jwt_user_id)}
+        # 2) 通行码侧：服务端保存的 active pass_code（覆盖有通行码但还没 join 的情况）
+        for pc in pass_code_store.list_active_for_user(jwt_user_id):
+            rid = pc.get("room_id")
+            if rid not in rooms_map:
+                rooms_map[rid] = {
+                    "room_id": rid,
+                    "room_name": "",
+                    "role": "member",     # 仅持有通行码但尚未 join
+                    "joined_at": pc.get("created_at"),
+                    "owner_id": "",
+                    "pass_code_only": True,
+                }
+        rooms = list(rooms_map.values())
+        rooms.sort(key=lambda r: r.get("joined_at") or 0, reverse=True)
+        return api_ok({"rooms": rooms, "count": len(rooms)})
+    except Exception as e:
+        logger.error(f"[API] me_rooms error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
 @app.post("/api/v1/auth/logout")
 async def auth_logout(request: Request):
     """撤销当前 token（立即失效）。后续用此 token 调任何业务接口都会 401。"""
@@ -1822,6 +1875,11 @@ async def delete_room(request: Request, room_id: str):
 
         # 使用 close_room：保留房主占位
         user_manager.close_room(room_id, closed_by=operator_id, reason="owner_entered_another_room")
+        # R5：级联撤销该房间全部 active 通行码
+        try:
+            pass_code_store.revoke_all_for_room(room_id, operator_id=operator_id)
+        except Exception as e:
+            logger.warning(f"[CloseRoom] revoke pass_codes failed: {e}")
         asyncio.create_task(sync.room_deleted(room_id=room_id, deleted_by=operator_id))
         logger.info(f"[API] Room {room_id} closed (operator={operator_id})")
 
@@ -1947,9 +2005,12 @@ async def get_member_detail(room_id: str, user_id: str):
 
 @app.post("/api/v1/room/{room_id}/join")
 async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
-    """§4.3 加入房间（2026-08-13 文档）：
+    """§4.3 加入房间（2026-08-15 文档 R3/R4/R7）：
+
     - 拒绝加入已关闭房间
-    - 普通成员必须携带有效邀请码（CAS 消费）
+    - **owner/admin 免码**；**普通成员/guest 需持有该房间 active 通行码**
+      （客户端无需再传 invite_code；服务端按 (user_id, room_id) 查 pass_code）
+    - 单设备活跃互斥 R7.3：该用户在该房间已有活跃 WS → 409
     - 不再设置在线状态（由心跳判定）
     """
     try:
@@ -1969,34 +2030,15 @@ async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
         role_map = {"owner": UserRole.OWNER, "admin": UserRole.ADMIN, "member": UserRole.MEMBER, "guest": UserRole.GUEST}
         role = role_map.get(req.role, UserRole.MEMBER)
 
-        # 2026-08-13 文档 §4.2.1：邀请码校验
-        # owner/admin 无需邀请码；普通成员/guest 必须
+        # 2026-08-15 文档 R3/R7.1：通行码校验
+        # owner/admin 免码；普通成员/guest 必须存在 active 通行码
         if role in (UserRole.MEMBER, UserRole.GUEST):
-            if not req.invite_code:
-                return api_err(403, "invalid or missing invite code")
-            # §3.3：Redis 风格缓存先查（命中 + 状态 OK 时快速通过）
-            from cache import cache
-            cached = cache.get_invite_code_meta(req.invite_code)
-            if cached and cached.get("room_id") != actual_room_id:
-                return api_err(403, "invalid or missing invite code: 房间不匹配")
-            ok, reason, _ = invite_code_store.validate(req.invite_code, room_id=actual_room_id)
-            if not ok:
-                # 缓存 + 库都不通过 → 失败计数（写回原 store）
-                return api_err(403, f"invalid or missing invite code: {reason}")
-            # CAS 原子消费（文档 §3.3）
-            ok, reason, _ = invite_code_store.consume(req.invite_code, used_by=jwt_user_id)
-            if not ok:
-                return api_err(403, f"invalid or missing invite code: {reason}")
-            # 失效缓存
-            cache.invalidate_invite_code(req.invite_code)
-            # 2026-08-13 文档 §12.7：审计日志
-            from audit_log import audit_logger
-            audit_logger.log(
-                action="invite_code_used",
-                actor_id=jwt_user_id,
-                room_id=actual_room_id,
-                details={"code": req.invite_code},
-            )
+            if not pass_code_store.has_active(jwt_user_id, actual_room_id):
+                return api_err(403, "pass code not found or inactive")
+
+        # 单设备活跃互斥 R7.3：同用户已有任意活跃 room_socket → 409
+        if jwt_user_id in manager.user_connections:
+            return api_err(409, "user already active in this room on another device")
 
         user = user_manager.join_room(actual_room_id, jwt_user_id, role=role)
 
@@ -2880,6 +2922,16 @@ async def create_invitation(request: Request, req: InviteCreateRequest):
         if invitation_store.find_pending_for_invitee_room(req.invitee_id, req.room_id, now):
             return api_err(400, "duplicate invitation")
 
+        # R4：自动生成邀请码并暂存到 invite_record
+        inv_code_record = invite_code_store.generate(
+            room_id=req.room_id,
+            created_by=jwt_user_id,
+            target_user_id=req.invitee_id,
+            expire_seconds=INVITATION_TTL_SECONDS,
+        )
+        if not inv_code_record:
+            return api_err(500, "generate invite code failed")
+
         inv_id = _new_invitation_id()
         inv_record = {
             "id": inv_id,
@@ -2890,27 +2942,56 @@ async def create_invitation(request: Request, req: InviteCreateRequest):
             "invitee_id": req.invitee_id,
             "status": "pending",
             "message": req.message or "",
+            "invite_code": inv_code_record["code"],     # R4：附在邀请记录里
             "created_at": now,
             "expires_at": now + INVITATION_TTL_SECONDS,
         }
         invitation_store.put(inv_record)
 
-        # §4.1 WS 事件：推送给被邀请者
+        # 缓存邀请码（让前端也能提前感知）
+        try:
+            from cache import cache
+            cache.cache_invite_code(
+                inv_code_record["code"], req.room_id,
+                ttl=INVITATION_TTL_SECONDS,
+            )
+        except Exception:
+            pass
+
+        # §4.1 WS 事件：推送给被邀请者（R4 含邀请码）
         await manager.send_to_user_with_timestamp(req.invitee_id, {
-            "type": "room_invite",
-            "room_id": req.room_id,
+            "type": "invite_received",
             "data": {
-                "invitation_id": inv_id,
-                "inviter_id": jwt_user_id,
-                "inviter_name": jwt_username or "",
+                "id": inv_id,
+                "from_user_id": jwt_user_id,
+                "from_user_name": jwt_username or "",
+                "room_id": req.room_id,
                 "room_name": room.name or "",
                 "message": req.message or "",
+                "invite_code": inv_code_record["code"],
                 "created_at": now,
+                "expires_at": now + INVITATION_TTL_SECONDS,
             },
         })
 
-        logger.info(f"[Invite] {jwt_user_id} -> {req.invitee_id} (room={req.room_id}, id={inv_id})")
-        return api_ok({"id": inv_id})
+        # 审计
+        try:
+            from audit_log import audit_logger
+            audit_logger.log(
+                action="invite_code_generated",
+                actor_id=jwt_user_id,
+                room_id=req.room_id,
+                details={"code": inv_code_record["code"], "target_user_id": req.invitee_id},
+            )
+        except Exception:
+            pass
+
+        logger.info(f"[Invite] {jwt_user_id} -> {req.invitee_id} (room={req.room_id}, id={inv_id}, code={inv_code_record['code']})")
+        return api_ok({
+            "id": inv_id,
+            "invite_code": inv_code_record["code"],
+            "expires_at": now + INVITATION_TTL_SECONDS,
+        })
     except Exception as e:
         logger.error(f"[API] create_invitation error: {e}", exc_info=True)
         return api_err(500, str(e))
@@ -2932,7 +3013,7 @@ async def list_pending_invitations(request: Request):
         return api_err(500, str(e))
 
 
-@app.post("/api/v1/invite/{invitation_id}/accept")
+@app.post("/api/v1/invites/{invitation_id:inv_id}/accept")
 async def accept_invitation(request: Request, invitation_id: str):
     """§3.3 接受邀请：被邀请者从 JWT 取，邀请状态置 accepted 并加入房间。"""
     try:
@@ -3011,7 +3092,7 @@ async def accept_invitation(request: Request, invitation_id: str):
         return api_err(500, str(e))
 
 
-@app.post("/api/v1/invite/{invitation_id}/reject")
+@app.post("/api/v1/invites/{invitation_id:inv_id}/reject")
 async def reject_invitation(request: Request, invitation_id: str, req: InviteRejectRequest):
     """§3.4 拒绝邀请。"""
     try:
@@ -3050,6 +3131,293 @@ async def reject_invitation(request: Request, invitation_id: str, req: InviteRej
         return api_ok({})
     except Exception as e:
         logger.error(f"[API] reject_invitation error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+# ============================================================================
+# 2026-08-15 文档 R3/R4：邀请码兑换通行码
+# ============================================================================
+
+@app.post("/api/v1/invites/{invitation_id:inv_id}/redeem")
+async def redeem_invitation(request: Request, invitation_id: str):
+    """R4：被邀请者用邀请记录 id 兑换通行码。
+
+    流程：
+      1. 校验 invitation 归属 + 状态（pending）
+      2. CAS 消费邀请码（invite_code_store.consume）
+      3. 生成通行码存服务端（pass_code_store.issue）
+      4. 邀请记录 → accepted
+      5. 通知房主 invite_accepted（notice_socket）
+    """
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        inv = invitation_store.get(invitation_id)
+        if not inv:
+            return api_err(404, "invitation not found")
+        if inv.get("invitee_id") != jwt_user_id:
+            return api_err(403, "not your invitation")
+        if inv.get("status") != "pending":
+            return api_err(400, f"invitation status is {inv.get('status')}, not pending")
+
+        invite_code = inv.get("invite_code") or ""
+        if not invite_code:
+            return api_err(400, "invitation has no invite_code (R4 only)")
+
+        room_id = inv["room_id"]
+        # 1) 校验 + 2) CAS 消费
+        ok, reason, item = invite_code_store.consume(invite_code, used_by=jwt_user_id)
+        if not ok:
+            return api_err(403, f"invalid invite code: {reason}")
+        # 失效缓存
+        try:
+            from cache import cache
+            cache.invalidate_invite_code(invite_code)
+        except Exception:
+            pass
+
+        # 3) 生成通行码存服务端
+        pc = pass_code_store.issue(jwt_user_id, room_id)
+        if not pc:
+            return api_err(500, "issue pass code failed")
+
+        # 4) 邀请记录 → accepted
+        invitation_store.update_status(invitation_id, "accepted", accepted_at=int(time.time()))
+
+        # 5) 通知房主 invite_accepted（notice_socket）
+        await manager.send_to_user_with_timestamp(inv["inviter_id"], {
+            "type": "invite_accepted",
+            "data": {
+                "id": invitation_id,
+                "room_id": room_id,
+                "by_user_id": jwt_user_id,
+                "by_user_name": request.state.username or "",
+            },
+        })
+
+        # 审计
+        try:
+            from audit_log import audit_logger
+            audit_logger.log(
+                action="invite_code_used",
+                actor_id=jwt_user_id,
+                room_id=room_id,
+                details={"code": invite_code, "pass_code": pc.get("code")},
+            )
+        except Exception:
+            pass
+
+        logger.info(f"[Invite] redeem: user={jwt_user_id} invite={invitation_id} room={room_id} pass_code={pc.get('code')}")
+        return api_ok({
+            "room_id": room_id,
+            "expires_at": pc.get("expires_at"),
+            "pass_code": pc.get("code"),     # 服务端保存 + 回显给客户端
+        })
+    except Exception as e:
+        logger.error(f"[API] redeem_invitation error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+# ============================================================================
+# 2026-08-15 文档 R3/R4：邀请码兑换通行码（必须先于 {invitation_id} 路由注册，
+# 否则会被 {invitation_id:str} 抢匹配）
+# ============================================================================
+
+class InviteCodeRedeemRequest(BaseModel):
+    """R3：通用邀请码兑换（不带邀请关系）。"""
+    invite_code: str
+
+
+@app.post("/api/v1/invites/code/redeem")
+async def redeem_invite_code(request: Request, req: InviteCodeRedeemRequest):
+    """R3：通用邀请码兑换通行码（不依赖邀请记录）。
+
+    流程同 redeem_invitation，但不更新任何邀请记录：
+      1. 校验 + CAS 消费邀请码
+      2. 生成通行码存服务端
+    """
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        code = (req.invite_code or "").strip()
+        if not code:
+            return api_err(400, "invite_code required")
+
+        # target_user_id 绑定校验：若码指定了用户，必须等于当前用户
+        meta = invite_code_store.get(code)
+        if not meta:
+            return api_err(404, "invite code not found or not unused")
+        if meta.get("target_user_id") and meta["target_user_id"] != jwt_user_id:
+            return api_err(403, "invite code bound to another user")
+
+        ok, reason, item = invite_code_store.consume(code, used_by=jwt_user_id)
+        if not ok:
+            return api_err(403, f"invalid invite code: {reason}")
+        try:
+            from cache import cache
+            cache.invalidate_invite_code(code)
+        except Exception:
+            pass
+
+        room_id = item.get("room_id", "")
+        pc = pass_code_store.issue(jwt_user_id, room_id)
+        if not pc:
+            return api_err(500, "issue pass code failed")
+
+        # 审计
+        try:
+            from audit_log import audit_logger
+            audit_logger.log(
+                action="invite_code_used",
+                actor_id=jwt_user_id,
+                room_id=room_id,
+                details={"code": code, "pass_code": pc.get("code")},
+            )
+        except Exception:
+            pass
+
+        logger.info(f"[Invite] code redeem: user={jwt_user_id} code={code} room={room_id} pass_code={pc.get('code')}")
+        return api_ok({
+            "room_id": room_id,
+            "expires_at": pc.get("expires_at"),
+            "pass_code": pc.get("code"),
+        })
+    except Exception as e:
+        logger.error(f"[API] redeem_invite_code error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+@app.post("/api/v1/invites/link/generate")
+async def generate_invite_link(request: Request, room_id: str = "", expire_seconds: int = 600):
+    """R4：房主生成房间邀请链接（一次性 token，存 Redis）。
+
+    token 在 cache 中 TTL=expire_seconds；consume 后立即失效。
+    """
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        if not room_id:
+            return api_err(400, "room_id required")
+        room = user_manager.get_room(room_id)
+        if not room:
+            return api_err(404, "room not found")
+        if room.owner_id != jwt_user_id:
+            return api_err(403, "only owner can generate invite link")
+
+        import secrets as _sec
+        token = _sec.token_urlsafe(24)
+        ttl = expire_seconds if expire_seconds > 0 else 600
+        # Redis 一次性存：key → {room_id, ttl}
+        try:
+            from cache import cache
+            # 用 set 存 JSON
+            import json as _json
+            cache.set(f"invite_link:{token}", {"room_id": room_id, "created_by": jwt_user_id}, ttl=ttl)
+        except Exception:
+            pass
+
+        # 审计
+        try:
+            from audit_log import audit_logger
+            audit_logger.log(
+                action="invite_link_generated",
+                actor_id=jwt_user_id,
+                room_id=room_id,
+                details={"token_prefix": token[:8], "ttl": ttl},
+            )
+        except Exception:
+            pass
+
+        # 拼装 link（host 用请求头）
+        host = request.headers.get("host", "127.0.0.1:8085")
+        scheme = request.url.scheme
+        link = f"{scheme}://{host}/room_invite/{token}"
+        return api_ok({"link": link, "token": token, "expires_at": int(time.time()) + ttl, "room_id": room_id})
+    except Exception as e:
+        logger.error(f"[API] generate_invite_link error: {e}", exc_info=True)
+        return api_err(500, str(e))
+
+
+class InviteLinkConsumeRequest(BaseModel):
+    """R4：邀请链接兑换。"""
+    link_token: str
+
+
+@app.post("/api/v1/invites/link/consume")
+async def consume_invite_link(request: Request, req: InviteLinkConsumeRequest):
+    """R4：用户凭 token 兑换通行码。
+
+    流程：
+      1. 从 Redis 拉 link token → 拿到 room_id
+      2. 服务端自动为该 room 生成一条邀请码（无需客户端提供）
+      3. 走 redeem_invite_code 逻辑生成通行码
+      4. 失效 link token（一次性）
+    """
+    try:
+        jwt_user_id = request.state.user_id
+        if not jwt_user_id:
+            return api_err(401, "not authenticated")
+        token = (req.link_token or "").strip()
+        if not token:
+            return api_err(400, "link_token required")
+
+        try:
+            from cache import cache
+            meta = cache.get(f"invite_link:{token}")
+        except Exception:
+            meta = None
+        if not meta or not meta.get("room_id"):
+            return api_err(404, "invite link invalid or expired")
+        room_id = meta["room_id"]
+
+        # 失效 token（一次性）— 必须先失效再消费，避免并发重复兑换
+        try:
+            from cache import cache
+            cache.delete(f"invite_link:{token}")
+        except Exception:
+            pass
+
+        # 自动生成邀请码（600s）+ 走 redeem_invite_code
+        new_code = invite_code_store.generate(
+            room_id=room_id,
+            created_by=meta.get("created_by") or "",
+            target_user_id=jwt_user_id,
+            expire_seconds=600,
+        )
+        if not new_code:
+            return api_err(500, "generate invite code failed")
+
+        ok, reason, item = invite_code_store.consume(new_code["code"], used_by=jwt_user_id)
+        if not ok:
+            return api_err(403, f"invalid invite code: {reason}")
+
+        pc = pass_code_store.issue(jwt_user_id, room_id)
+        if not pc:
+            return api_err(500, "issue pass code failed")
+
+        # 审计
+        try:
+            from audit_log import audit_logger
+            audit_logger.log(
+                action="invite_link_used",
+                actor_id=jwt_user_id,
+                room_id=room_id,
+                details={"pass_code": pc.get("code")},
+            )
+        except Exception:
+            pass
+
+        logger.info(f"[Invite] link consume: user={jwt_user_id} room={room_id} pass_code={pc.get('code')}")
+        return api_ok({
+            "room_id": room_id,
+            "expires_at": pc.get("expires_at"),
+            "pass_code": pc.get("code"),
+        })
+    except Exception as e:
+        logger.error(f"[API] consume_invite_link error: {e}", exc_info=True)
         return api_err(500, str(e))
 
 

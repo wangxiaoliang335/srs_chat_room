@@ -1,6 +1,6 @@
 # SRS 聊天室服务 — 客户端开发调试手册
 
-> 文档版本：v1.0（基于 2026-08-13 文档 + P0~P6 实现）
+> 文档版本：v2.0（基于 `需求文档.md` 2026-08-15 修订版 + R1~R7 改进需求）
 > 服务地址（默认本地）：`http://127.0.0.1:8085` / `ws://127.0.0.1:8085/ws`
 > 目标读者：客户端工程师（开发、联调、QA）
 
@@ -11,16 +11,18 @@
 | 项 | 说明 |
 |---|---|
 | 鉴权 | JWT（HS256），通过 `Authorization: Bearer <token>` 注入；`/api/v1/auth/test_login` 可绕过业务后端直接签发（仅调试） |
-| 房间 | 房主唯一；进入需要邀请码（owner/admin 除外）；2026-08-13 后 **无 `/leave` 接口**，离开通过关闭 WS / 主动断开 |
-| 消息 | HTTP `/api/v1/messages/send` 或 WS `chat_message`；**`client_msg_id` 必须全局唯一**，幂等 |
-| WebSocket | `/ws?room=<room_id>&user=<user_id>` 单连接；服务端主动 ping → 客户端必须回 pong |
-| 限流 | 邀请 1 次/30s；敲门 1 次/30s + 同房间 3 次/小时；超出 429 |
-| 邀请码 | 房主生成，默认 600s 过期；可用作"加群"凭证；缓存到 Redis |
+| Socket 拆分（R1） | **room_socket**（8085，房间内事件）+ **notice_socket**（独立端口，跨房间事件）。**兼容期双通道推送**，客户端迁完可关 room_socket 的跨房间事件 |
+| 房间 | 房主唯一（不可转让）；成员可多房间并存；无 `/leave` 接口（离开=关闭 WS）；房主房间不自动删除 |
+| 邀请（R3/R4） | **邀请码**（一次性兑换凭证，默认 600s）+ **通行码**（兑换后服务端保存，可复用）；`join` 时无需客户端再传邀请码，服务端查通行码 |
+| 单设备互斥（R7.3） | 同用户同房间只能 1 条活跃 WS 连接；另一设备要等旧连接心跳超时（3 次 ping）后才可加入 |
+| 多设备同步房间（R7.2） | 新设备登录后调 `GET /api/v1/me/rooms` 拉全部房间列表 |
+| 消息 | HTTP `/api/v1/messages/send` 或 WS `chat_message`；**`client_msg_id` 必须全局唯一**，幂等；room_id 在 **query** |
+| 限流 | 邀请 1 次/30s；敲门 1 次/30s + 同房间 3 次/小时；邀请码校验 5 次/码失败锁定 5 分钟 |
 | 错误格式 | 统一：`{"code": <int>, "message": "<str>"}`，`code=0` 为成功 |
 
 ---
 
-## 2. 调试第一步：拿到一个 JWT
+## 2. 鉴权与登录
 
 ### 2.1 临时 token（仅调试）
 
@@ -53,9 +55,9 @@ curl -X POST http://127.0.0.1:8085/api/v1/auth/test_login \
 |---|---|---|
 | `user_name` | ✅ | 显示名 |
 | `user_id` | ❌ | 传了就复用已有记录，没传就新建 |
-| `app_id` | � | 默认 `default`，三方登录时用业务方标识 |
+| `app_id` | ❌ | 默认 `default`，三方登录时用业务方标识 |
 | `bus_id` | ❌ | 业务后端用户 id；非业务账号留空 |
-| `role` | � | `member` / `admin` / `owner`，调试时可以直接给 owner 测房主路径 |
+| `role` | ❌ | `member` / `admin` / `owner`，调试时可以直接给 owner 测房主路径 |
 
 > ⚠️ **生产部署务必把 `/api/v1/auth/test_login` 在反向代理层屏蔽！**
 
@@ -69,7 +71,7 @@ curl -X POST http://127.0.0.1:8085/api/v1/auth/login \
 
 服务器用 `BUSINESS_APP_KEY` 调业务后端 `/api/frontend/app/external/users/me` 验证 `token`，查到业务用户后自动创建/复用本地账号，签发 JWT（7 天 TTL）。
 
-### 2.3 验证 token 是否还有效
+### 2.3 验证 token
 
 ```bash
 curl http://127.0.0.1:8085/api/v1/auth/me \
@@ -85,7 +87,7 @@ curl -X POST http://127.0.0.1:8085/api/v1/auth/logout \
   -H "Authorization: Bearer <JWT>"
 ```
 
-立即把当前 jti 加入撤销表，再访问业务接口返回 401。
+立即把当前 jti 加入撤销表。
 
 ---
 
@@ -100,11 +102,44 @@ curl -X POST http://127.0.0.1:8085/api/v1/room \
   -d '{"room_id":"team_alpha","name":"团队 Alpha"}'
 ```
 
-**关键规则（2026-08-13 §7.1）**：
-- 一个用户**只能是一个房间的房主**。再次调用不会创建新房间，而是**覆盖更新**现有房间的 name 等字段
-- `room_id` 是客户端定的；想完全换房间，先把旧 owner 关系释放掉（踢出原房间成员 + 转让 owner）
+**关键规则**：
+- 一个用户**只能是一个房间的房主**。再次调用不会创建新房间，而是**覆盖更新**现有房间（room_id 不变）
+- `room_id` 是客户端定的；想完全换房间，关闭旧房间后重建
+- **房主不可转让**——无 owner 变更接口
 
-### 3.2 生成邀请码
+### 3.2 关闭房间（R5，仅房主）
+
+```bash
+curl -X DELETE http://127.0.0.1:8085/api/v1/room/team_alpha \
+  -H "Authorization: Bearer <owner-JWT>"
+```
+
+关闭时级联：
+- 该房间全部 `active` 通行码 → `revoked`
+- 广播 `room_closed`（notice_socket + 兼容期 room_socket）
+- 清理 Redis key（`room_online:*`、presence）
+
+### 3.3 多设备同步房间列表（R7.2）
+
+新设备登录后，**第一件事**就是拉这个：
+
+```bash
+curl http://127.0.0.1:8085/api/v1/me/rooms \
+  -H "Authorization: Bearer <JWT>"
+```
+
+返回当前用户全部 `active` 通行码对应的房间列表（含 `room_id` / `room_name` / `role`）。新设备无需依赖旧设备导出。
+
+---
+
+## 4. 邀请 / 通行码 / 敲门（R3 + R4 重写）
+
+> **核心模型变更（2026-08-15 文档 R3/R4）**：
+> - **邀请码**：一次性兑换凭证，**默认 600s 过期**
+> - **通行码**：兑换后生成，**绑定用户**、**服务端保存**、`active` 后长期有效
+> - **join 时无需客户端再传邀请码**，服务端查「当前用户在该房间的 `active` 通行码」
+
+### 4.1 房主生成邀请码（手动分享）
 
 ```bash
 curl -X POST "http://127.0.0.1:8085/api/v1/invite/code/generate?room_id=team_alpha&target_user_id=&expire_seconds=600" \
@@ -117,22 +152,116 @@ curl -X POST "http://127.0.0.1:8085/api/v1/invite/code/generate?room_id=team_alp
 | `target_user_id` | ❌ | 限定给某用户；空 = 通用码 |
 | `expire_seconds` | ❌ | 默认 600s（10 分钟） |
 
-**返回**：`{"code":0, "data":{"code":"ABC123XYZ","expires_at":..., ...}}`
+返回 `{"code":0, "data":{"code":"ABC123XYZ","expires_at":..., ...}}`
 
-限流：同用户 1 次/30s → 429 `too many invites, retry in 30s`
+限流：同用户 1 次/30s → 429。
 
-### 3.3 加入房间（成员）
+### 4.2 房主定向发送邀请（自动带码 + 服务端暂存邀请记录）
+
+```bash
+curl -X POST http://127.0.0.1:8085/api/v1/invite \
+  -H "Authorization: Bearer <owner-JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{"room_id":"team_alpha","invitee_user_id":"user_xyz","message":"邀请你加入"}'
+```
+
+服务端**自动生成邀请码** + 建 `invite_record(status=pending, invite_code)` 暂存 → 经 `notice_socket` 推送 `invite_received`（**含邀请码**）给被邀请人。
+
+被邀请人收到的事件：
+
+```json
+{
+  "type": "invite_received",
+  "data": {
+    "id": "inv_xxx",           // 邀请记录 id
+    "from_user_id": "user_owner",
+    "room_id": "team_alpha",
+    "message": "邀请你加入",
+    "invite_code": "ABC123XYZ",
+    "created_at": 1786761000
+  }
+}
+```
+
+### 4.3 兑换通行码（邀请码 → 通行码）
+
+**两种方式，效果相同**：兑换成功后邀请码 → `used`，服务端生成绑定当前用户的通行码。
+
+> 路径说明：本服务邀请类接口使用 `/api/v1/invites/*`（复数）。
+> 旧的 `/api/v1/invite/{id}/...` 路由已迁移到 `/api/v1/invites/{id}/...` 避免与 `code/link` 子路径冲突。
+
+**方式一：邀请兑换**（用邀请信息中的 id）
+
+```bash
+curl -X POST http://127.0.0.1:8085/api/v1/invites/<invite_id>/redeem \
+  -H "Authorization: Bearer <member-JWT>"
+# 返回 {"code":0,"data":{"room_id":"...","expires_at":..., "pass_code":"..."}}
+```
+
+**方式二：通用码兑换**（没有邀请关系，直接拿码）
+
+```bash
+curl -X POST http://127.0.0.1:8085/api/v1/invites/code/redeem \
+  -H "Authorization: Bearer <member-JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{"invite_code":"ABC123XYZ"}'
+```
+
+**校验顺序**：`码归属房间` → `码状态（未过期/未撤销/未使用）` → **`target_user_id` 为空或等于当前 user_id`**。
+
+| 结果 | 状态码 / message |
+|---|---|
+| 兑换成功 | `200`，邀请码 → `used`，`invite_record.status=accepted`，通知房主 `invite_accepted`（notice_socket） |
+| 绑定他人 | `403 invite code bound to another user` |
+| 码无效 | `404 invite code not found or not unused` |
+| 5 次校验失败 | 锁码 5 分钟 |
+
+### 4.4 拒绝邀请
+
+```bash
+curl -X POST http://127.0.0.1:8085/api/v1/invite/<invite_id>/reject \
+  -H "Authorization: Bearer <JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"不感兴趣"}'
+```
+
+→ `invite_record.status=rejected`，邀请码作废 → 通知房主 `invite_rejected`。
+
+### 4.5 邀请链接（房间转发 → 通行码）
+
+```bash
+# 1) 房主生成链接
+curl -X POST "http://127.0.0.1:8085/api/v1/invites/link/generate?room_id=team_alpha" \
+  -H "Authorization: Bearer <owner-JWT>"
+# 返回 {"code":0,"data":{"link":"https://.../room_invite/<token>","expires_at":...}}
+
+# 2) 用户兑换链接（需带 JWT）
+curl -X POST http://127.0.0.1:8085/api/v1/invites/link/consume \
+  -H "Authorization: Bearer <member-JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{"link_token":"<token>"}'
+```
+
+link token **一次性**、默认 10 分钟，存 Redis；consume 走 4.3 兑换逻辑。
+
+### 4.6 加入房间（成员）
 
 ```bash
 curl -X POST http://127.0.0.1:8085/api/v1/room/team_alpha/join \
   -H "Authorization: Bearer <member-JWT>" \
   -H "Content-Type: application/json" \
-  -d '{"role":"member","invite_code":"ABC123XYZ"}'
+  -d '{"role":"member"}'
 ```
 
-**校验顺序**：先看 role；owner/admin 直接放行；member 必传 invite_code，否则 403 `invite_code required`。
+> **join 时无需带邀请码**——服务端按 `(user_id, room_id)` 查 `active` 通行码。
 
-### 3.4 敲门（被拒绝后申请加群）
+校验顺序（R7.1）：
+1. owner → 免码放行
+2. member：服务端查 `active` 通行码 → 无则 403 `pass code not found or inactive`
+3. **单设备活跃互斥（R7.3）**：该用户在该房间已有活跃 WS → 409 `user already active in this room on another device`
+4. 心跳超时后其他设备才可加入
+
+### 4.7 敲门流程
 
 ```bash
 # 1) 敲门
@@ -141,28 +270,42 @@ curl -X POST http://127.0.0.1:8085/api/v1/room/team_alpha/knock \
   -H "Content-Type: application/json" \
   -d '{"message":"hi 想加入"}'
 
-# 2) 房主同意 / 拒绝
+# 2) 房主同意（knocker 直接成为成员）
 curl -X POST http://127.0.0.1:8085/api/v1/room/team_alpha/knock/accept \
   -H "Authorization: Bearer <owner-JWT>" \
   -H "Content-Type: application/json" \
   -d '{"knocker_id":"user_xyz","role":"member"}'
 
+# 3) 房主拒绝
 curl -X POST http://127.0.0.1:8085/api/v1/room/team_alpha/knock/reject \
   -H "Authorization: Bearer <owner-JWT>" \
   -H "Content-Type: application/json" \
   -d '{"knocker_id":"user_xyz","reason":"稍等"}'
 ```
 
-限流：1 次/30s + 同房间 3 次/小时。超限 429。
+推送：
+- 敲门 → 房主收 `knock`（notice_socket，**R1 后**；兼容期也在 room_socket）
+- 接受 → 敲门人收 `knock_result{accepted:true}`，**直接成为成员**
+- 拒绝 → 敲门人收 `knock_result{accepted:false, reason}`
 
-### 3.5 离开房间（重要）
+限流：1 次/30s + 同房间 3 次/小时。
 
-**没有 `/leave` 接口**。离开通过：
+### 4.8 邀请/通行码状态机
 
-1. **关闭 WebSocket**（推荐）：触发服务端 disconnect 事件，其他成员收到 `member_left`
-2. **被踢**：owner/admin 调 `DELETE /api/v1/room/<room>/member/<user>/kick`
+```
+邀请码: unused ──兑换──▶ used        （兑换通行码成功）
+        unused ──过期──▶ expired     （超 10 分钟）
+        unused ──撤销──▶ revoked     （房主撤销 / 拒绝邀请）
 
-### 3.6 房主操作
+通行码: active ──被踢──▶ revoked     （kick 级联）
+        active ──房间关闭──▶ revoked  （R5 级联）
+        active ──撤销──▶ revoked
+        （未生效码超时 → expired）
+```
+
+---
+
+## 5. 房主操作
 
 ```bash
 # 改成员角色
@@ -171,12 +314,11 @@ curl -X POST http://127.0.0.1:8085/api/v1/room/team_alpha/member/<user_id>/role 
   -H "Content-Type: application/json" \
   -d '{"role":"admin"}'
 
-# 禁言 / 解除禁言
+# 禁言 / 解除
 curl -X POST http://127.0.0.1:8085/api/v1/room/team_alpha/member/<user_id>/mute \
-  -H "Authorization: Bearer <owner-JWT>" \
-  -H "Content-Type: application/json" -d '{}'
+  -H "Authorization: Bearer <owner-JWT>" -H "Content-Type: application/json" -d '{}'
 
-# 踢人
+# 踢人（级联撤销该用户本房间 active 通行码）
 curl -X DELETE http://127.0.0.1:8085/api/v1/room/team_alpha/member/<user_id>/kick \
   -H "Authorization: Bearer <owner-JWT>"
 
@@ -187,9 +329,9 @@ curl -X POST http://127.0.0.1:8085/api/v1/room/team_alpha/mute-all \
 
 ---
 
-## 4. 消息收发
+## 6. 消息收发
 
-### 4.1 HTTP 发送（推荐用于发消息）
+### 6.1 HTTP 发送（推荐）
 
 ```bash
 curl -X POST "http://127.0.0.1:8085/api/v1/messages/send?room_id=team_alpha" \
@@ -204,85 +346,73 @@ curl -X POST "http://127.0.0.1:8085/api/v1/messages/send?room_id=team_alpha" \
 
 **必填**：
 - `room_id`：**query 参数**（不在 body 里）
-- `client_msg_id`：**全局唯一**（建议 UUID v4），用于幂等
+- `client_msg_id`：**全局唯一**（UUID v4），用于幂等
 - `content`：消息内容
 - `type`：`text` / `image` / `file`
 
-**幂等**：相同 `client_msg_id` 在 10 分钟内重发，第二次返回原消息 + `_idempotent=true`（不分配新 seq）。
+**幂等**：相同 `client_msg_id` 在 10 分钟内重发，第二次返回原消息 + `_idempotent=true`。
 
-**返回**：
-```json
-{
-  "code": 0,
-  "data": {
-    "id": "m_1786...",
-    "seq": 42,
-    "client_msg_id": "...",
-    "_idempotent": false,
-    "ts": 1786761000.123
-  }
-}
-```
-
-### 4.2 WS 发送（实时性更优）
+### 6.2 WS 发送
 
 ```javascript
 ws.send(JSON.stringify({
   type: "chat_message",
   client_msg_id: "uuid-xxx",
-  type: "text",  // 消息类型（不是 ws type）
+  type: "text",       // 消息类型
   content: "大家好"
 }));
 ```
 
 服务端立刻返回 `chat_message_ack`，消息广播到房间内所有 WS 客户端。
 
-### 4.3 历史消息
+### 6.3 历史消息
 
 ```bash
 curl -X GET "http://127.0.0.1:8085/api/v1/messages/history?room_id=team_alpha&after_seq=0&limit=50" \
   -H "Authorization: Bearer <JWT>"
 ```
 
-- `after_seq`：传 0 = 从头；传上次收到的最大 seq = 增量
+- `after_seq`：0 = 从头；上次收到的最大 seq = 增量
 - `limit`：1~200，默认 50
 
-WS 也可以发 `{"type":"history_sync","after_seq":...}` 拉增量（仅自己）。
+### 6.4 文件上传
 
-### 4.4 实时推送（服务端 → 客户端）
+```bash
+curl -X POST "http://127.0.0.1:8085/api/v1/messages/upload?room_id=team_alpha&type=image" \
+  -H "Authorization: Bearer <JWT>" \
+  -F "file=@./photo.jpg"
+```
 
-| event | 何时触发 | payload |
-|---|---|---|
-| `chat_message` | 房间内任何人发消息 | `{type, room_id, id, seq, user_id, client_msg_id, content, ts, ...}` |
-| `chat_message_ack` | 你发的消息被持久化 | `{type, id, seq, client_msg_id, _idempotent}` |
-| `history_sync` | 你拉历史时 | `{type, room_id, items[], latest_seq}` |
-| `member_joined` | 新成员加入 | `{type, room_id, user_id, role, ts}` |
-| `member_left` | 成员断开 WS | `{type, room_id, user_id, ts, reason}` |
-| `member_kicked` | 你被踢了 | `{type, room_id, user_id, operator_id}` |
-| `role_changed` | 你的角色被改 | `{type, room_id, user_id, old_role, new_role, operator_id}` |
-| `room_mute_changed` | 全员禁言状态变 | `{type, room_id, allow_speak, operator_id}` |
-| `muted` / `unmuted` | 你被禁言 / 解除 | `{type, room_id, user_id, operator_id}` |
-| `mic_disabled` / `mic_enabled` | 你被禁麦 / 解除 | 同上结构 |
-| `knock` | 有人敲门 | `{type, room_id, knocker_id, message}` |
-| `knock_result` | 你的敲门被处理 | `{type, room_id, accepted, role?, reason?}` |
-| `notify` | 新通知 | `{type, notification:{id, type, ...}}` |
+**安全约束**：
+- 图片 ≤ 10MB、文件 ≤ 100MB
+- 扩展名 / MIME 白名单
+- 服务端二次校验（不信任客户端 Content-Type）
+- 私有存储 + 签名 URL（防越权访问）
+
+上传成功返回 `file_id / url`，后续消息 `content` 字段写 URL 或 file_id。
 
 ---
 
-## 5. WebSocket 接入
+## 7. Socket 协议（R1：双通道）
 
-### 5.1 URL
+> **R1 改进**：跨房间事件（敲门、邀请、通知）迁入 `notice_socket`；房间内事件保留 `room_socket`。
+> **兼容期**：双通道推送，客户端迁完后再关 room_socket 的跨房间事件。
 
-```
-ws://<host>:8085/ws?room=<room_id>&user=<user_id>
-```
+### 7.1 room_socket（8085，房间内事件）
 
+**连接**：`ws://{host}:8085/ws?room={room_id}&user={user_id}`（生产建议带 token）
+
+**URL 参数**：
 - `room`：房间 id（必填，否则 close 1008 "Missing room parameter"）
-- `user`：用户 id（可选，但强烈建议传）
+- `user`：用户 id（强烈建议传）
 
-### 5.2 心跳（必须）
+**鉴权**（推荐生产）：
+```
+Sec-WebSocket-Protocol: jwt, <token>
+```
+服务端解析第二个 token，做 JWT 校验。
 
-服务端每 **30s**（`HEARTBEAT_INTERVAL` 环境变量）主动 `ping`，客户端必须在 **3 次**（`HEARTBEAT_FAIL_THRESHOLD`）内回 `pong`，否则被服务端断开。
+**心跳**：服务端每 30s 主动 `ping`，客户端必须在 3 次内回 `pong`，否则被断开。
 
 ```javascript
 ws.onmessage = (e) => {
@@ -293,43 +423,82 @@ ws.onmessage = (e) => {
 };
 ```
 
-> 注意：服务端 ping 用的是应用层 JSON，不是 ws 协议层的 PING 帧。**别用 ws.onping，那是浏览器 ws 协议层事件，服务端没发。**
-
-### 5.3 客户端发送事件
+**客户端发送事件**：
 
 ```javascript
 ws.send(JSON.stringify({type: "subscribe", room_id: "team_alpha"}));  // 切换房间
 ws.send(JSON.stringify({type: "chat_message", client_msg_id: "u-1", type: "text", content: "hi"}));
 ws.send(JSON.stringify({type: "history_sync", after_seq: 0, limit: 100}));
-ws.send(JSON.stringify({type: "ping"}));  // 兼容旧版，服务端回 pong（可选）
 ```
 
-### 5.4 鉴权
+**服务端推送（房间内）**：
 
-WS 鉴权有两种方式：
+| 事件 | 触发 | payload |
+|---|---|---|
+| `chat_message` | 房间内任何人发消息 | `{type, room_id, id, seq, user_id, client_msg_id, content, ts, ...}` |
+| `chat_message_ack` | 你发的消息被持久化 | `{type, id, seq, client_msg_id, _idempotent}` |
+| `history_sync` | 你拉历史 | `{type, room_id, items[], latest_seq}` |
+| `member_joined` | 新成员加入 | `{type, room_id, user_id, role, ts}` |
+| `member_left` | 成员断开 WS（离线判定后） | `{type, room_id, user_id, ts, reason}` |
+| `member_online_status_changed` | 在线/离线状态变更 | `{type, room_id, user_id, online_status, offline_at}` |
+| `member_kicked` | 你被踢了 | `{type, room_id, user_id, operator_id}` |
+| `role_changed` | 你的角色被改 | `{type, room_id, user_id, old_role, new_role, operator_id}` |
+| `room_mute_changed` | 全员禁言状态变 | `{type, room_id, allow_speak, operator_id}` |
+| `muted` / `unmuted` | 你被禁言 / 解除 | `{type, room_id, user_id, operator_id}` |
+| `mic_disabled` / `mic_enabled` | 你被禁麦 / 解除 | 同上 |
+| `speaking_start` / `speaking_stop` | 说话状态广播 | `{type, room_id, user_id, ts}` |
+| `room_closed` | 房间被关闭 | `{type, room_id, operator_id}` |
 
-**A. URL query**（简单）：
-```
-ws://host:8085/ws?room=r1&user=u1
-```
-不强制鉴权，**仅内网调试**。
+> **R1 兼容期**：跨房间事件（`knock` / `knock_result` / `invite_*` / `notify`）**也走这里**，待客户端迁移完成后关闭。
 
-**B. 子协议 / Sec-WebSocket-Protocol header**（生产）：
+### 7.2 notice_socket（独立端口，跨房间）
+
+**连接**：`ws://{host}:{custom_port}/ws/notice?user={user_id}&token=<jwt>`
+
+- 不依赖房间参数，按 `user_id` 订阅；**同一用户一条连接** 即可接收所有房间的跨房间事件
+- 鉴权：JWT（query 或子协议）
+- 心跳：沿用 ping/pong，3 次无响应判离线
+
+**服务端推送（跨房间）**：
+
+| 事件 | 触发 | payload |
+|---|---|---|
+| `invite_received` | 收到房间邀请 | `{type, data:{id, from_user_id, room_id, message, invite_code, created_at}}` |
+| `invite_accepted` | 你发送的邀请被接受 | `{type, data:{id, room_id, by_user_id}}` |
+| `invite_rejected` | 你发送的邀请被拒绝 | `{type, data:{id, room_id, by_user_id, reason}}` |
+| `knock` | 有人敲门（推给房主） | `{type, data:{room_id, knocker_id, message}}` |
+| `knock_result` | 敲门结果 | `{type, data:{room_id, accepted, role?, reason?}}` |
+| `notify` | 通用通知 | `{type, data:{id, type, title, content, room_id, related_user_id, data, created_at}}` |
+| `notification_sync` | 重连补推未读通知 | `{type, data:{unread_count, notifications[]}}` |
+| `room_closed` | 房间关闭（跨房间） | `{type, data:{room_id, operator_id}}` |
+
+**离线补投**：用户离线期间产生的通知只落库；`notice_socket` 重连后按 `created_at > 最后已读时间` 补推未读 + 刷新未读数。
+
+### 7.3 通用事件结构
+
+```json
+{
+  "event_id": "...",
+  "type": "...",
+  "room_id": "...",
+  "user_id": "...",
+  "operator_id": "...",
+  "target_user_id": "...",
+  "data": {...},
+  "timestamp": 1786761000
+}
 ```
-Sec-WebSocket-Protocol: jwt, <token>
-```
-服务端解析第二个 token，做 JWT 校验。
 
 ---
 
-## 6. 通知（站内信）
+## 8. 通知（站内信）
 
 ```bash
-# 拉未读
+# 拉未读数
 curl http://127.0.0.1:8085/api/v1/notifications/unread-count \
   -H "Authorization: Bearer <JWT>"
 
-# 拉列表
+# 拉列表（时间倒序 + 分页）
 curl http://127.0.0.1:8085/api/v1/notifications \
   -H "Authorization: Bearer <JWT>"
 
@@ -340,13 +509,35 @@ curl -X POST http://127.0.0.1:8085/api/v1/notifications/<id>/read \
 # 一键已读
 curl -X POST http://127.0.0.1:8085/api/v1/notifications/read-all \
   -H "Authorization: Bearer <JWT>"
+
+# 删除
+curl -X DELETE http://127.0.0.1:8085/api/v1/notifications/<id> \
+  -H "Authorization: Bearer <JWT>"
 ```
 
-实时通知通过 WS 事件 `notify` 推送。
+实时通知通过 notice_socket 事件 `notify` 推送。
+
+**通知 type 枚举**：
+
+| type | 触发时机 |
+|---|---|
+| `invite_received` | 收到房间邀请（含邀请码） |
+| `invite_accepted` | 你发送的邀请被接受 |
+| `invite_rejected` | 你发送的邀请被拒绝 |
+| `knock_received` | 有人敲门 |
+| `knock_accepted` | 敲门被接受 |
+| `knock_rejected` | 敲门被拒绝 |
+| `member_joined` | 新成员加入房间 |
+| `member_offline` | 成员离线（原 `member_left` 改名） |
+| `member_kicked` | 你被踢出房间 |
+| `role_updated` | 你的角色被更改 |
+| `room_closed` | 房间被关闭 |
+
+**推送可靠性**：推送失败走失败队列 + 指数退避（1s/5s/30s）；目标离线则落库待重连补投。
 
 ---
 
-## 7. 用户查询
+## 9. 用户查询
 
 ```bash
 # 按 user_id 查名字
@@ -358,7 +549,7 @@ curl -X POST http://127.0.0.1:8085/api/v1/users/names \
   -H "Content-Type: application/json" \
   -d '{"ids":["user_aaa","user_bbb"]}'
 
-# 按业务 bus_id 查（前提是用户已走过三方登录）
+# 按业务 bus_id 查
 curl -X POST http://127.0.0.1:8085/api/v1/users/resolve \
   -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
@@ -372,88 +563,116 @@ curl http://127.0.0.1:8085/api/v1/users/<user_id>/room
 
 ---
 
-## 8. 错误码速查
+## 10. 错误码速查
 
 | HTTP | code | 含义 |
 |---|---|---|
 | 200 | 0 | 成功 |
-| 400 | 400 | 参数错误（看 message：缺字段 / 格式不对） |
+| 400 | 400 | 参数错误 |
 | 401 | 401 | 未鉴权 / token 失效 / 撤销 |
 | 403 | 403 | 越权（如非 owner 试图生成邀请码） |
 | 404 | 404 | 资源不存在 |
-| 409 | 409 | 冲突（如用户名已存在） |
+| 409 | 409 | 冲突（如单设备互斥 `user already active in this room on another device`） |
 | 429 | 429 | 限流（看 message：`retry in Ns`） |
-| 500 | 500 | 服务器异常（看 message + 看日志） |
+| 500 | 500 | 服务器异常 |
 
 **业务 message 关键字**：
-- `not authenticated` → 没带 Authorization
-- `token expired` → token 过期，重新登录
-- `room not found` → 房间 id 不存在
-- `invite_code required` → 加入房间需要邀请码
-- `invite code not found or not unused` → 邀请码无效或已用过
-- `too many invites, retry in 30s` → 限流
-- `owner_id must match current user` → 越权
+
+| message | 场景 |
+|---|---|
+| `not authenticated` | 没带 Authorization |
+| `token expired` | token 过期，重新登录 |
+| `room not found` | 房间 id 不存在 |
+| `invite_code required` | 旧接口兼容；新文档已移除此约束（见 §4.6） |
+| `invite code not found or not unused` | 邀请码无效或已用过 |
+| `invite code bound to another user` | 邀请码绑定他人（R2 校验失败） |
+| `pass code not found or inactive` | join 时未找到该用户该房间的 active 通行码 |
+| `user already active in this room on another device` | 单设备互斥触发 |
+| `too many invites, retry in 30s` | 邀请限流 |
+| `too many knocks, retry in Ns` | 敲门限流 |
+| `owner_id must match current user` | 越权 |
 
 ---
 
-## 9. 调试工具 & 常用命令
+## 11. 调试工具 & 常用命令
 
-### 9.1 实时指标
+### 11.1 实时指标
 
 ```bash
 curl http://127.0.0.1:8085/api/v1/metrics | python3 -m json.tool
 ```
 
-返回 counters / gauges / latencies。可看：消息吞吐、邀请码使用、限流命中、推送成功率等。
+返回 counters / gauges / latencies。可看：消息吞吐、邀请码使用、限流命中、推送成功率、推送延迟（ms）等。
 
-### 9.2 健康检查
+### 11.2 健康检查
 
 ```bash
 curl http://127.0.0.1:8085/api/v1/health
 # {"status":"ok"}
 ```
 
-### 9.3 日志
+### 11.3 日志
 
 ```
-srs/logs/server_fastapi.log    # 主服务（含 access log + 错误）
+srs/logs/server_fastapi.log    # 主服务
 srs/logs/ws_server.log         # WS 服务
 srs/audit.log                  # 审计日志（JSON Lines）
 ```
 
 审计日志示例（`tail -f srs/audit.log`）：
+
 ```json
-{"ts":1786760903,"iso":"2026-08-15T10:28:23","action":"room_created","actor_id":"user_f18c92924c71","target_id":"","room_id":"team_alpha","details":{"name":"team_alpha","overwritten":false}}
-{"ts":1786761000,"iso":"2026-08-15T10:30:00","action":"invite_code_generated","actor_id":"user_f18c92924c71","target_id":"","room_id":"team_alpha","details":{"code":"ABC123","target_user_id":""}}
+{"ts":1786760903,"iso":"2026-08-15T10:28:23","action":"room_created","actor_id":"user_f18c","target_id":"","room_id":"team_alpha","details":{"name":"team_alpha","overwritten":false}}
+{"ts":1786761000,"iso":"2026-08-15T10:30:00","action":"invite_code_generated","actor_id":"user_f18c","target_id":"","room_id":"team_alpha","details":{"code":"ABC123","target_user_id":""}}
 {"ts":1786761100,"iso":"2026-08-15T10:31:40","action":"invite_code_used","actor_id":"user_xyz","target_id":"","room_id":"team_alpha","details":{"code":"ABC123"}}
+{"ts":1786761200,"iso":"2026-08-15T10:32:20","action":"room_closed","actor_id":"user_f18c","target_id":"","room_id":"team_alpha","details":{"reason":"owner_close"}}
 ```
 
-可审计的 action：`room_created` / `room_deleted` / `room_overwritten` / `member_joined` / `member_kicked` / `member_role_changed` / `member_muted` / `member_unmuted` / `room_mute_all` / `room_unmute_all` / `invite_code_generated` / `invite_code_used` / `invite_code_revoked` 等。
+可审计的 action：`room_created` / `room_closed` / `room_overwritten` / `member_joined` / `member_kicked` / `member_role_changed` / `member_muted` / `member_unmuted` / `room_mute_all` / `room_unmute_all` / `invite_code_generated` / `invite_code_used` / `invite_code_revoked` 等。
 
-### 9.4 看 Redis 缓存
+### 11.4 看 Redis 缓存
 
 ```bash
 # 邀请码有效缓存
 redis-cli get "invite:valid:ABC123"
+
+# 通行码有效缓存（用户绑定的）
+redis-cli get "pass:valid:user_xyz:team_alpha"
 
 # 在线状态
 redis-cli get "presence:user_xxx"
 
 # 房间在线列表
 redis-cli smembers "room_online:team_alpha"
+
+# 邀请码校验失败计数（5 次锁码）
+redis-cli get "invite_fail:ABC123"
 ```
 
-### 9.5 看 MySQL 用户表
+### 11.5 看 MySQL
 
 ```bash
-mysql -uroot -e "SELECT user_id, username, role, bus_id FROM chat_room.chat_user WHERE username='alice';"
+# 邀请码
+mysql -uroot -e "SELECT code, room_id, status, target_user_id FROM chat_room.invite_codes WHERE code='ABC123';"
+
+# 通行码
+mysql -uroot -e "SELECT id, user_id, room_id, status FROM chat_room.pass_codes WHERE user_id='user_xyz';"
+
+# 邀请记录
+mysql -uroot -e "SELECT id, from_user_id, to_user_id, status, invite_code FROM chat_room.invite_records WHERE to_user_id='user_xyz';"
+
+# 房间
+mysql -uroot -e "SELECT room_id, room_name, owner_id, status FROM chat_room.rooms;"
+
+# 用户
+mysql -uroot -e "SELECT user_id, username, role FROM chat_room.chat_user WHERE username='alice';"
 ```
 
 ---
 
-## 10. 常见坑
+## 12. 常见坑
 
-### 10.1 send_message 返回 `room_id required (query param)`
+### 12.1 send_message 返回 `room_id required (query param)`
 
 **room_id 在 query string，不在 body 里**：
 
@@ -465,86 +684,127 @@ curl -X POST /api/v1/messages/send -d '{"room_id":"...","content":"hi"}'
 curl -X POST "/api/v1/messages/send?room_id=..." -d '{"content":"hi"}'
 ```
 
-### 10.2 join 房间返回 `invite_code required`
+### 12.2 join 房间返回 `pass code not found or inactive`
 
-普通成员（role=member）必须传邀请码，owner/admin 直接通过：
+新文档下 join **不再传邀请码**——服务端查通行码。流程应该是：
 
-```bash
-# 房主/管理员：直接 join
-curl -X POST /api/v1/room/<r>/join -d '{"role":"admin"}'
+1. 用户通过邀请链接 / 邀请事件拿到邀请码
+2. 调 `/api/v1/invites/<id>/redeem` 或 `/api/v1/invites/code/redeem` → 服务端生成通行码存服务端
+3. 调 `/api/v1/room/<room>/join`（不带 invite_code）→ 服务端查通行码 → 放行
 
-# 普通成员：必须带邀请码
-curl -X POST /api/v1/room/<r>/join -d '{"role":"member","invite_code":"ABC123"}'
-```
+直接 join 没兑换过会失败。
 
-### 10.3 ws 一直断、提示 `member_left`
+### 12.3 ws 一直断、提示 `member_left`
 
 99% 是心跳没回。检查：
-1. 是否处理了 `type=pong` / 收到 `ping` 是否回了 `pong`
-2. 网络中间是否有 idle 切断（nginx 默认 60s idle close，需要在 nginx 侧配 `proxy_read_timeout 600s;`）
+1. 是否处理了 `type=ping` 回 `pong`
+2. nginx 侧 `proxy_read_timeout` 是否 ≥ 服务端 `HEARTBEAT_INTERVAL` × `HEARTBEAT_FAIL_THRESHOLD`
 
-### 10.4 resolve 返回 `user not found`
+### 12.4 resolve 返回 `user not found`
 
-可能是业务后端用户首次登录还没落库；让用户先走一次 `/api/v1/auth/login` 完成三方认证，再 resolve。
+业务后端用户首次登录还没落库；让用户先走一次 `/api/v1/auth/login` 完成三方认证，再 resolve。
 
-### 10.5 消息发不出去（400 / 403）
+### 12.5 消息发不出去（400 / 403）
 
-- 400：通常是 `client_msg_id` 缺失，或 body JSON 解析失败
+- 400：通常 `client_msg_id` 缺失，或 body JSON 解析失败
 - 403：被全员禁言（`room_mute_changed`=`allow_speak=false` 且你是普通成员）
-- 403：你在黑名单（被踢后没真正退出）
+- 403：你在黑名单（被踢后没真正退出；被踢后通行码也被撤销，必须重新获取）
 
-### 10.6 token 经常 401
+### 12.6 token 经常 401
 
 - 检查服务器时钟：`date`，偏差 ±30s 内才稳（`JWT_LEEWAY_SECONDS`）
 - 检查是否调过 logout：撤销表 `srs/revoked_tokens.json` 里的 jti 无法复用
 
+### 12.7 新设备登录收不到房间
+
+新设备登录后**必须主动调** `GET /api/v1/me/rooms` 拉房间列表。服务端不主动推送。
+
+### 12.8 同一账号在两台设备想加入同一个房间
+
+触发 **R7.3 单设备互斥**：后加入的设备会收到 409 `user already active in this room on another device`。等旧设备心跳超时（3 × 30s = 90s）或主动关闭旧设备的 WS 后，新设备才能加入。
+
 ---
 
-## 11. 端到端测试脚本（5 分钟跑通）
+## 13. 端到端测试脚本（10 分钟跑通 R3/R4/R7）
 
 ```bash
 #!/bin/bash
 set -e
 BASE=http://127.0.0.1:8085
 
-# 1) 拿两个 token（owner + member）
+# 1) 三个 token（owner / invitee / knocker）
 TOK_O=$(curl -s -X POST $BASE/api/v1/auth/test_login -H "Content-Type: application/json" \
   -d '{"user_name":"o","role":"owner","bus_id":"990001"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['token'])")
 TOK_M=$(curl -s -X POST $BASE/api/v1/auth/test_login -H "Content-Type: application/json" \
   -d '{"user_name":"m","role":"member","bus_id":"990002"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['token'])")
+TOK_K=$(curl -s -X POST $BASE/api/v1/auth/test_login -H "Content-Type: application/json" \
+  -d '{"user_name":"k","role":"member","bus_id":"990003"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['token'])")
 
 # 2) Owner 建房间
 curl -s -X POST $BASE/api/v1/room -H "Authorization: Bearer $TOK_O" \
   -H "Content-Type: application/json" -d '{"room_id":"r1"}' > /dev/null
 
-# 3) Owner 生成邀请码
-CODE=$(curl -s -X POST "$BASE/api/v1/invite/code/generate?room_id=r1" -H "Authorization: Bearer $TOK_O" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['code'])")
+# 3) Owner 定向邀请 m（自动生成邀请码 + 推送 invite_received）
+INVITE=$(curl -s -X POST $BASE/api/v1/invite -H "Authorization: Bearer $TOK_O" \
+  -H "Content-Type: application/json" -d '{"room_id":"r1","invitee_user_id":"user_m","message":"hi"}')
+echo "invite response: $INVITE"
+INVITE_ID=$(echo $INVITE | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['id'])")
+INVITE_CODE=$(echo $INVITE | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['invite_code'])")
 
-# 4) Member 加房间
+# 4) M 兑换邀请 → 通行码存服务端
+curl -s -X POST $BASE/api/v1/invites/$INVITE_ID/redeem -H "Authorization: Bearer $TOK_M"
+
+# 5) M 加入房间（不带邀请码）
 curl -s -X POST $BASE/api/v1/room/r1/join -H "Authorization: Bearer $TOK_M" \
-  -H "Content-Type: application/json" -d "{\"role\":\"member\",\"invite_code\":\"$CODE\"}"
+  -H "Content-Type: application/json" -d '{"role":"member"}'
 
-# 5) Owner 发消息
+# 6) Owner 发消息
 curl -s -X POST "$BASE/api/v1/messages/send?room_id=r1" -H "Authorization: Bearer $TOK_O" \
-  -H "Content-Type: application/json" -d '{"client_msg_id":"u-1","type":"text","content":"hi"}'
+  -H "Content-Type: application/json" -d '{"client_msg_id":"u-1","type":"text","content":"hi m"}'
 
-# 6) Member 拉历史
+# 7) M 拉历史
 curl -s "$BASE/api/v1/messages/history?room_id=r1" -H "Authorization: Bearer $TOK_M"
+
+# 8) K 敲门
+curl -s -X POST $BASE/api/v1/room/r1/knock -H "Authorization: Bearer $TOK_K" \
+  -H "Content-Type: application/json" -d '{"message":"想加入"}'
+
+# 9) Owner 接受敲门（K 直接成为成员）
+curl -s -X POST $BASE/api/v1/room/r1/knock/accept -H "Authorization: Bearer $TOK_O" \
+  -H "Content-Type: application/json" -d '{"knocker_id":"user_k","role":"member"}'
+
+# 10) K 现在可以 join
+curl -s -X POST $BASE/api/v1/room/r1/join -H "Authorization: Bearer $TOK_K" \
+  -H "Content-Type: application/json" -d '{"role":"member"}'
+
+# 11) 新设备登录：拉房间列表
+TOK_M2=$(curl -s -X POST $BASE/api/v1/auth/test_login -H "Content-Type: application/json" \
+  -d '{"user_name":"m","role":"member","bus_id":"990002"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['token'])")
+echo "M new device rooms:"
+curl -s "$BASE/api/v1/me/rooms" -H "Authorization: Bearer $TOK_M2"
+
+# 12) Owner 关闭房间（级联撤销通行码 + room_closed）
+curl -s -X DELETE $BASE/api/v1/room/r1 -H "Authorization: Bearer $TOK_O"
 
 echo "DONE"
 ```
 
 ---
 
-## 12. 已知约束 / 调试备忘
+## 14. 已知约束 / 调试备忘
 
 - **用户表**：MySQL 主存储 + `users.json` 兜底；不要直接编辑 `users.json`（会被下次同步覆盖）
-- **邀请码缓存**：Redis 主存 + 进程内兜底；删 Redis key 后邀请码仍可能短暂通过（用未过期的进程内副本）
-- **房间**：纯内存（`user_manager.json`），重启会丢；如需持久化请走 MySQL（已规划 P6+）
-- **消息**：纯内存（`messages.json`），重启会丢；如需持久化请走 MySQL（已规划 P6+）
-- **WS 多实例**：当前单进程，多实例需要 Redis pub/sub 广播（已规划）
-- **生产部署**：务必把 `/api/v1/auth/test_login` 加 nginx 白名单
+- **邀请码缓存**：Redis 主存 + 进程内兜底
+- **通行码**：服务端 `pass_codes` 表保存（MySQL）；删 Redis 缓存后仍以 DB 为准
+- **房间/成员/消息**：纯内存（`user_manager.json`/`messages.json`），重启会丢；如需持久化请走 MySQL（规划中）
+- **WS 多实例**：当前单进程；多实例需要 Redis pub/sub 广播（规划中）
+- **notice_socket 端口**：当前与 room_socket 共用 8085（兼容期），未来 R1 完成后独立端口（待产品定）
+- **生产部署**：
+  - 务必把 `/api/v1/auth/test_login` 加 nginx 白名单
+  - 文件上传加 virus scan + 私有存储 + 签名 URL
+  - 邀请码校验失败锁定防爆破（5 次/码 → 锁 5 分钟）
 
 ---
 
-> 文档维护：服务端团队（2026-08-15 起与 P0~P6 同步更新）
+> 文档维护：服务端团队（2026-08-15 起与 `需求文档.md` 同步更新）
+> 参照需求：`需求文档.md`（R1~R7 改进）

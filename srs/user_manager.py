@@ -506,6 +506,40 @@ class UserManager:
                     return room_id
             return None
 
+    def get_user_rooms(self, user_id: str) -> List[dict]:
+        """返回 user_id 关联的所有 ACTIVE 房间（含 owner + member）。
+
+        2026-08-15 R7.2：多设备同步房间列表。
+
+        返回元素结构：
+        {"room_id": ..., "room_name": ..., "role": "owner"/"admin"/"member", "joined_at": ...}
+        """
+        if not user_id:
+            return []
+        with self._lock:
+            out = []
+            for room_id, room in self._rooms.items():
+                if room.status != RoomStatus.ACTIVE:
+                    continue
+                if room.owner_id == user_id:
+                    out.append({
+                        "room_id": room_id,
+                        "room_name": getattr(room, "name", "") or getattr(room, "room_name", ""),
+                        "role": "owner",
+                        "joined_at": room.created_at,
+                        "owner_id": room.owner_id,
+                    })
+                elif user_id in room.members:
+                    user = room.members[user_id]
+                    out.append({
+                        "room_id": room_id,
+                        "room_name": getattr(room, "name", "") or getattr(room, "room_name", ""),
+                        "role": user.role.value,
+                        "joined_at": user.joined_at,
+                        "owner_id": room.owner_id,
+                    })
+            return out
+
     def update_room(self, room_id: str, name: Optional[str] = None,
                     max_members: Optional[int] = None,
                     allow_speak: Optional[bool] = None) -> Optional[Room]:

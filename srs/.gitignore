@@ -103,6 +103,7 @@ messages_seq.json
 notifications.json
 notifications_active.json
 notifications_archive.json
+pass_codes.json
 
 # 音频 / 录制临时数据
 input_recordings/
