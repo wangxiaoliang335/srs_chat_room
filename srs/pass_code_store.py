@@ -171,6 +171,7 @@ class PassCodeStore:
         if not user_id:
             return []
         out = []
+        expired_keys = []
         now = int(time.time())
         with self._lock:
             keys = list(self._by_user.get(user_id, set()))
@@ -182,9 +183,11 @@ class PassCodeStore:
                     continue
                 if rec.get("expires_at", 0) and now > rec["expires_at"]:
                     rec["status"] = "expired"
+                    expired_keys.append(key)
                     continue
                 out.append(dict(rec))
-            if any(r.get("status") == "expired" for r in self._by_key.values()):
+            # 只在确有 expired 时 flush，避免无意义写盘
+            if expired_keys:
                 self._flush()
         return out
 

@@ -219,7 +219,7 @@ curl -X POST http://127.0.0.1:8085/api/v1/invites/code/redeem \
 ### 4.4 拒绝邀请
 
 ```bash
-curl -X POST http://127.0.0.1:8085/api/v1/invite/<invite_id>/reject \
+curl -X POST http://127.0.0.1:8085/api/v1/invites/<invite_id>/reject \
   -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"reason":"不感兴趣"}'
@@ -583,7 +583,6 @@ curl http://127.0.0.1:8085/api/v1/users/<user_id>/room
 | `not authenticated` | 没带 Authorization |
 | `token expired` | token 过期，重新登录 |
 | `room not found` | 房间 id 不存在 |
-| `invite_code required` | 旧接口兼容；新文档已移除此约束（见 §4.6） |
 | `invite code not found or not unused` | 邀请码无效或已用过 |
 | `invite code bound to another user` | 邀请码绑定他人（R2 校验失败） |
 | `pass code not found or inactive` | join 时未找到该用户该房间的 active 通行码 |

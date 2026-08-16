@@ -2116,6 +2116,11 @@ async def kick_member(request: Request, room_id: str, user_id: str, operator_id:
             return api_err(403, "权限不足：群主可踢任何人，admin 可踢普通成员")
 
         user_manager.leave_room(room_id, user_id)
+        # R3：被踢撤销该用户的本房间通行码（文档 §3.2.8）
+        try:
+            pass_code_store.revoke(user_id, room_id, operator_id=operator_id)
+        except Exception as e:
+            logger.warning(f"[Kick] revoke pass_code failed: {e}")
 
         asyncio.create_task(sync.member_kicked(room_id=room_id, user_id=user_id, operator_id=operator_id))
 
@@ -2235,9 +2240,15 @@ async def knock_accept(request: Request, room_id: str, req: KnockAcceptRequest):
 
         knock_info = knock_requests.pop(req.knocker_id, None)
 
-        # 将敲门者加入房间（使用请求中指定的角色）
+        # 文档 §3.2.7 + §3.2.8：被踢后需重新获得邀请码兑换通行码才能加入。
+        # 房主接受敲门 = 直接签发一条 active 通行码并加入（避免被踢者绕道）。
         role_map = {"owner": UserRole.OWNER, "admin": UserRole.ADMIN, "member": UserRole.MEMBER, "guest": UserRole.GUEST}
         role = role_map.get(req.role, UserRole.MEMBER)
+        # R3：生成 active 通行码给敲门者（服务端保存）
+        try:
+            pass_code_store.issue(req.knocker_id, room_id)
+        except Exception as e:
+            logger.warning(f"[KnockAccept] issue pass_code failed: {e}")
         user = user_manager.join_room(room_id, req.knocker_id, role=role)
 
         asyncio.create_task(sync.member_joined(
@@ -2881,12 +2892,23 @@ async def join_via_share_link(request: Request, share_id: str):
 
 @app.post("/api/v1/invite")
 async def create_invitation(request: Request, req: InviteCreateRequest):
-    """§3.1 发送邀请：邀请者从 JWT 取，被邀请者走 invitee_id。"""
+    """§3.1 + R4 发送邀请：邀请者从 JWT 取，被邀请者走 invitee_id。
+
+    2026-08-15 文档 §3.4：发送邀请限流 1 次/30s。
+    """
     try:
         jwt_user_id = request.state.user_id
         jwt_username = request.state.username
         if not jwt_user_id:
             return api_err(401, "not authenticated")
+        # §3.4：发送邀请限流 1 次/30s
+        try:
+            from rate_limiter import rate_limiter
+            ok, retry_in = rate_limiter.check_invite(jwt_user_id)
+            if not ok:
+                return api_err(429, f"too many invites, retry in {retry_in}s")
+        except Exception:
+            pass
         if not req.room_id or not req.invitee_id:
             return api_err(400, "room_id and invitee_id are required")
         # invitee_id 必须是本系统分配给被邀请者的 user_id（格式 user_<12hex>，共 17 字符），
