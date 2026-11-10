@@ -29,7 +29,7 @@ WORKDIR /srs/trunk
 # Build and install SRS.
 # Note that SRT is enabled by default, so we configure without --srt=on.
 # Note that we have copied all files by make install.
-RUN ./configure ${CONFARGS} && make ${MAKEARGS} && make install
+RUN bash /srs/apply-media-patches.sh && ./configure ${CONFARGS} && make ${MAKEARGS} && make install
 
 ############################################################
 # dist

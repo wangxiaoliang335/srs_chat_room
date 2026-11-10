@@ -29,6 +29,8 @@ distributed under their [licenses](https://ossrs.io/lts/en-us/license).
 
 ## Usage
 
+聊天室媒体服务的构建和回归流程见[本仓库 SRS 补丁](patches/README.md)。
+
 Please check the Getting Started guide in [English](https://ossrs.io/lts/en-us/docs/v5/doc/getting-started) 
 or [Chinese](https://ossrs.net/lts/zh-cn/docs/v5/doc/getting-started). We highly recommend using SRS with docker:
 

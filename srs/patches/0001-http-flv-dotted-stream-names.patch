@@ -1,0 +1,57 @@
+--- a/trunk/src/protocol/srs_protocol_utility.cpp
++++ b/trunk/src/protocol/srs_protocol_utility.cpp
+@@ -333,8 +333,8 @@
+         url += vhost;
+     }
+     url += "/" + app;
+-    // Note that we ignore any extension.
+-    url += "/" + srs_path_filename(stream);
++    // Protocol parsers remove transport suffixes. Preserve dots in stream identifiers.
++    url += "/" + stream;
+     
+     return url;
+ }
+--- a/trunk/src/app/srs_app_http_stream.cpp
++++ b/trunk/src/app/srs_app_http_stream.cpp
+@@ -606,9 +606,8 @@
+     // session that should have statistics for itself.
+     hxc->set_enable_stat(true);
+ 
+-    // Correct the app and stream by path, which is created from template.
+-    // @remark Be careful that the stream has extension now, might cause identify fail.
+-    req->stream = srs_path_basename(r->path());
++    // Strip the HTTP media suffix once, preserving dots in the published stream name.
++    req->stream = srs_path_filename(srs_path_basename(r->path()));
+ 
+     // update client ip
+     req->ip = hc->remote_ip();
+@@ -1024,14 +1023,17 @@
+ 
+         tmpl->req = r->copy()->as_http();
+ 
+-        streamHandlers[sid] = entry;
+-
+         // mount the http flv stream.
+         // we must register the handler, then start the thread,
+         // for the thread will cause thread switch context.
+         if ((err = mux.handle(mount, entry->stream)) != srs_success) {
++            srs_freep(entry->stream);
++            srs_freep(entry->cache);
++            srs_freep(entry);
+             return srs_error_wrap(err, "http: mount flv stream for vhost=%s failed", sid.c_str());
+         }
++        // Keep failed registrations out of the stream map.
++        streamHandlers[sid] = entry;
+ 
+         // start http stream cache thread
+         if ((err = entry->cache->start()) != srs_success) {
+@@ -1045,7 +1047,8 @@
+         entry->cache->update_auth(r);
+     }
+     
+-    if (entry->stream) {
++    std::map<std::string, SrsLiveEntry*>::iterator mounted = streamHandlers.find(sid);
++    if (mounted != streamHandlers.end() && mounted->second == entry && entry->stream && entry->stream->entry) {
+         entry->stream->entry->enabled = true;
+         return err;
+     }
