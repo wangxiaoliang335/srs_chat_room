@@ -3,7 +3,9 @@
 
 import argparse
 import array
+import base64
 from contextlib import ExitStack
+from http.client import IncompleteRead
 import json
 import math
 from pathlib import Path
@@ -15,13 +17,18 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.request import ProxyHandler, build_opener
+from urllib.error import HTTPError
+from urllib.request import ProxyHandler, Request, build_opener
 import wave
 
 
 RATE = 48000
 FREQUENCIES = (431, 787)
 HTTP = build_opener(ProxyHandler({}))
+MANAGEMENT_USER = "qa-flv-operator"
+MANAGEMENT_PASSWORD = "qa-flv-password"
+MANAGEMENT_AUTH = "Basic " + base64.b64encode(f"{MANAGEMENT_USER}:{MANAGEMENT_PASSWORD}".encode()).decode()
+CASES = ("dotted", "shutdown", "disconnect", "redaction")
 
 
 def free_tcp_ports():
@@ -45,8 +52,10 @@ def wait_for(label, check, timeout=12):
     raise AssertionError(f"Timed out waiting for {label}")
 
 
-def api(port, endpoint):
-    with HTTP.open(f"http://127.0.0.1:{port}/api/v1/{endpoint}", timeout=1) as response:
+def api(port, endpoint, method="GET"):
+    request = Request(f"http://127.0.0.1:{port}/api/v1/{endpoint}",
+                      headers={"Authorization": MANAGEMENT_AUTH}, method=method)
+    with HTTP.open(request, timeout=1) as response:
         result = json.load(response)
     if result["code"] != 0:
         raise AssertionError(f"SRS API {endpoint} returned code {result['code']}")
@@ -88,6 +97,46 @@ def stop(child):
             child.wait()
 
 
+def verify_flv_disconnect(management, flv, stream, publisher):
+    try:
+        with HTTP.open(f"http://127.0.0.1:{management}/api/v1/versions", timeout=1):
+            raise AssertionError("SRS management accepted an anonymous request")
+    except HTTPError as error:
+        if error.code != 401:
+            raise
+
+    def clients():
+        return {client["id"]: client for client in api(management, "clients/")["clients"]}
+
+    retained = clients()
+    with HTTP.open(f"http://127.0.0.1:{flv}/live/{stream}.flv", timeout=1) as player:
+        if player.read(3) != b"FLV":
+            raise AssertionError("SRS did not send an FLV header")
+        current = clients()
+        added = set(current) - set(retained)
+        if len(added) != 1:
+            raise AssertionError("SRS did not register exactly one additional FLV player")
+        (client_id,) = added
+        if current[client_id]["type"] != "flv-play":
+            raise AssertionError("Unexpected SRS client type")
+
+        # Keep the publisher connected while its audio queue drains. Otherwise socket writes can hide a missed interrupt.
+        publisher.send_signal(signal.SIGSTOP)
+        try:
+            time.sleep(0.3)
+            api(management, f"clients/{client_id}", "DELETE")
+            wait_for("the idle FLV player to disconnect", lambda: client_id not in clients(), timeout=1)
+            try:
+                player.read()
+            except IncompleteRead:
+                # Closing a live HTTP-FLV connection may interrupt the final HTTP chunk.
+                pass
+            if not set(retained).issubset(clients()):
+                raise AssertionError("SRS disconnected an unrelated media client")
+        finally:
+            publisher.send_signal(signal.SIGCONT)
+
+
 def run_case(binary, ffmpeg, case):
     rtmp, management, flv = free_tcp_ports()
     # Plain stream names make the shutdown regression independent of the FLV naming fix.
@@ -100,9 +149,15 @@ def run_case(binary, ffmpeg, case):
 daemon off;
 srs_log_tank console;
 pid ./srs.pid;
-http_api {{ enabled on; listen 127.0.0.1:{management}; }}
+http_api {{
+    enabled on;
+    listen 127.0.0.1:{management};
+    auth {{ enabled on; username {MANAGEMENT_USER}; password {MANAGEMENT_PASSWORD}; }}
+}}
 http_server {{ enabled on; listen 127.0.0.1:{flv}; }}
 vhost __defaultVhost__ {{
+    play {{ mw_latency 10; }}
+    publish {{ normal_timeout 20000; }}
     hls {{ enabled off; }}
     http_remux {{ enabled on; mount [vhost]/[app]/[stream].flv; }}
 }}
@@ -167,25 +222,55 @@ vhost __defaultVhost__ {{
                     stop(child)
                 start_server("restarted")
                 start_media("after")
+            elif case == "disconnect":
+                verify_flv_disconnect(management, flv, names[0], media[0])
         finally:
             for child in reversed(children):
                 stop(child)
     print(f"PASS {case}", flush=True)
 
 
+def run_redaction():
+    wrapper = Path(__file__).resolve().parents[1] / "deploy/srs-log-redact.sh"
+    ticket = "%65yJhbGciOiJIUzI1NiJ9%2Ee30%2Eprobe"
+    hook_key = "qa-callback-secret"
+    authorization = "cHJvYmU6cHJpdmF0ZQ=="
+    jwt = "eyJhbGciOiJIUzI1NiJ9.e30.probe"
+    output = subprocess.run(
+        ["bash", str(wrapper), "cat"],
+        input=(f"on_publish HTTP 401 http://chat-api/on_publish?key={hook_key} "
+               f'{{"param":"?srs_ticket={ticket}"}}\n'
+               f"Authorization: Basic {authorization}\n"
+               f"unexpected token {jwt}\n"),
+        capture_output=True, text=True, check=True, timeout=5,
+    ).stdout
+    if any(value in output for value in (ticket, hook_key, authorization, jwt)):
+        raise AssertionError("SRS output contained a raw credential")
+    if not all(value in output for value in ("on_publish HTTP 401", "?[redacted]", '"param":"[redacted]"',
+                                             "Authorization: Basic [redacted]", "[redacted-jwt]")):
+        raise AssertionError("SRS diagnostic output was lost or did not contain the expected redactions")
+    print("PASS redaction", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--srs", type=Path, default=Path(__file__).resolve().parents[1] / "trunk/objs/srs")
     parser.add_argument("--ffmpeg", default="ffmpeg")
-    parser.add_argument("--case", choices=("all", "dotted", "shutdown"), default="all")
+    parser.add_argument("--case", choices=("all", *CASES), default="all")
     args = parser.parse_args()
+    if args.case == "redaction":
+        run_redaction()
+        return
     ffmpeg = shutil.which(args.ffmpeg)
     if ffmpeg is None:
         parser.error(f"FFmpeg executable not found: {args.ffmpeg}")
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    cases = ("dotted", "shutdown") if args.case == "all" else (args.case,)
+    cases = CASES if args.case == "all" else (args.case,)
     for case in cases:
-        run_case(args.srs.resolve(strict=True), str(Path(ffmpeg).resolve()), case)
+        if case == "redaction":
+            run_redaction()
+        else:
+            run_case(args.srs.resolve(strict=True), str(Path(ffmpeg).resolve()), case)
 
 
 if __name__ == "__main__":

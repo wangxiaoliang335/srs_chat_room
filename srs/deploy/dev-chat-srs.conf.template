@@ -1,0 +1,46 @@
+srs_log_level error;
+listen 1935;
+max_connections 100;
+daemon off;
+srs_log_tank console;
+
+http_api {
+    enabled on;
+    listen 1985;
+    auth {
+        enabled on;
+        username chat-media-control;
+        password @@SRS_HTTP_API_PASSWORD@@;
+    }
+}
+http_server {
+    enabled on;
+    listen 8080;
+    dir ./objs/nginx/html;
+}
+rtc_server {
+    enabled on;
+    listen 8000;
+    candidate @@SRS_RTC_CANDIDATE@@;
+}
+vhost __defaultVhost__ {
+    http_hooks {
+        enabled on;
+        on_publish http://chat-api:8085/api/v1/streams/on_publish?key=@@SRS_MEDIA_HOOK_SECRET@@;
+        on_unpublish http://chat-api:8085/api/v1/streams/on_unpublish?key=@@SRS_MEDIA_HOOK_SECRET@@;
+        on_play http://chat-api:8085/api/v1/streams/on_play?key=@@SRS_MEDIA_HOOK_SECRET@@;
+        on_stop http://chat-api:8085/api/v1/streams/on_stop?key=@@SRS_MEDIA_HOOK_SECRET@@;
+    }
+    hls {
+        enabled off;
+    }
+    http_remux {
+        enabled on;
+        mount [vhost]/[app]/[stream].flv;
+    }
+    rtc {
+        enabled on;
+        rtmp_to_rtc on;
+        rtc_to_rtmp on;
+    }
+}

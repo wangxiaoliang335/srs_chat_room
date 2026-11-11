@@ -24,15 +24,17 @@ import jwt
 
 from db import mysql_db
 
+from chat_data import DATA_DIR
+
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\-]{3,32}$")
 
 logger = logging.getLogger(__name__)
 
 # 用户表文件
-USERS_FILE = Path(__file__).parent / "users.json"
+USERS_FILE = DATA_DIR / "users.json"
 
 # 被撤销 token 持久化文件
-REVOKED_FILE = Path(__file__).parent / "revoked_tokens.json"
+REVOKED_FILE = DATA_DIR / "revoked_tokens.json"
 
 # 密码哈希参数
 PBKDF2_ITERS = 200_000
@@ -47,7 +49,7 @@ JWT_ISSUER = "srs-project"
 JWT_LEEWAY_SECONDS = 30
 
 # JWT 密钥：优先环境变量，否则用一个随机生成的并落到 users.json 同目录的 .jwt_secret
-JWT_SECRET_FILE = Path(__file__).parent / ".jwt_secret"
+JWT_SECRET_FILE = DATA_DIR / ".jwt_secret"
 
 
 class AuthError(Exception):
@@ -518,6 +520,7 @@ def issue_token(
     role: str = "member",
     name: Optional[str] = None,
     app_id: str = "default",
+    device_id: Optional[str] = None,
 ) -> Tuple[str, str, int]:
     """签发 JWT。返回 (token, jti, expires_at_unix)。
     同时把 jti 注册到 revocation.active_jtis，供后续 logout-all 使用。
@@ -527,7 +530,8 @@ def issue_token(
           写入 JWT 的 `name` claim，便于 WebSocket 事件直接读取，避免每次查库。
     app_id: 业务应用标识，写入 JWT `app` claim，resolve 时作 defaultAppId 来源之一。
     """
-    now = int(time.time())
+    issued_at_us = time.time_ns() // 1_000
+    now = issued_at_us // 1_000_000
     exp = now + JWT_TTL_SECONDS
     jti = uuid.uuid4().hex
     payload = {
@@ -538,12 +542,15 @@ def issue_token(
         "role": role,
         "jti": jti,
         "iat": now,
+        "iat_us": issued_at_us,
         "exp": exp,
         "iss": JWT_ISSUER,
         "app": app_id,
     }
+    if device_id:
+        payload["device"] = device_id
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
-    revocation.register(username, jti, exp)
+    revocation.register(user_id, jti, exp)
     return token, jti, exp
 
 
@@ -579,7 +586,7 @@ class TokenRevocationStore:
     """撤销列表（持久化到 revoked_tokens.json）。
     支持两类撤销：
       1) 按 jti 撤销单个 token
-      2) 按用户名撤销该用户所有活跃 token（需要先追踪 jti）
+      2) 按聊天室用户 ID 撤销该用户在撤销时间以前签发的 token
     """
 
     def __init__(self, path: Path = REVOKED_FILE):
@@ -587,9 +594,9 @@ class TokenRevocationStore:
         self._lock = threading.RLock()
         # jti -> expires_at
         self._revoked_jtis: dict = {}
-        # username -> {jti: expires_at}
-        # 维护每个用户签发过的活跃 token，用于 logout-all
+        # user_id -> {jti: expires_at}
         self._active_jtis: dict = {}
+        self._revoked_through_us: dict = {}
         self._load()
 
     def _load(self):
@@ -601,15 +608,19 @@ class TokenRevocationStore:
                     self._revoked_jtis = {
                         str(k): int(v) for k, v in (data.get("jtis") or {}).items()
                     }
-                    active = data.get("active") or {}
+                    active = data.get("active_by_uid") or {}
                     self._active_jtis = {
                         str(u): {str(j): int(e) for j, e in (jtis or {}).items()}
                         for u, jtis in active.items()
+                    }
+                    self._revoked_through_us = {
+                        str(uid): int(when) for uid, when in (data.get("revoked_through_us") or {}).items()
                     }
                 self._gc()
             except Exception:
                 self._revoked_jtis = {}
                 self._active_jtis = {}
+                self._revoked_through_us = {}
 
     def _flush(self):
         tmp = self._path.with_suffix(".json.tmp")
@@ -617,7 +628,8 @@ class TokenRevocationStore:
             json.dump(
                 {
                     "jtis": self._revoked_jtis,
-                    "active": self._active_jtis,
+                    "active_by_uid": self._active_jtis,
+                    "revoked_through_us": self._revoked_through_us,
                 },
                 f, ensure_ascii=False, indent=2,
             )
@@ -634,10 +646,10 @@ class TokenRevocationStore:
             for u, jtis in self._active_jtis.items()
         }
 
-    def register(self, username: str, jti: str, exp: int):
+    def register(self, user_id: str, jti: str, exp: int):
         """注册一个新签发的活跃 token（用于后续 logout-all）"""
         with self._lock:
-            self._active_jtis.setdefault(username, {})[jti] = exp
+            self._active_jtis.setdefault(user_id, {})[jti] = exp
             self._flush()
 
     def revoke_jti(self, jti: str, exp: int):
@@ -648,16 +660,16 @@ class TokenRevocationStore:
                 jtis.pop(jti, None)
             self._flush()
 
-    def revoke_user_all(self, username: str) -> int:
+    def revoke_user_all(self, user_id: str) -> int:
         """撤销该用户所有活跃 token，返回撤销数量"""
         with self._lock:
-            jtis = self._active_jtis.get(username, {})
+            self._revoked_through_us[user_id] = time.time_ns() // 1_000
+            jtis = self._active_jtis.pop(user_id, {})
             count = 0
             for jti, exp in list(jtis.items()):
                 if exp > int(time.time()):
                     self._revoked_jtis[jti] = exp
                     count += 1
-            self._active_jtis.pop(username, None)
             self._flush()
             return count
 
@@ -666,7 +678,11 @@ class TokenRevocationStore:
             jti = payload.get("jti", "")
             if jti and jti in self._revoked_jtis:
                 return True
-            return False
+            cutoff = self._revoked_through_us.get(payload.get("uid", ""))
+            if cutoff is None:
+                return False
+            issued_at_us = payload.get("iat_us") or int(payload["iat"]) * 1_000_000
+            return issued_at_us <= cutoff
 
     def status(self) -> dict:
         with self._lock:

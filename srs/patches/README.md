@@ -6,8 +6,10 @@
 - `0001` 保留 RTMP 流名中的点号。HTTP-FLV 请求只去掉末尾的媒体后缀，失败的挂载也不会留下无效的流记录。
 - `0002` 回移[上游退出崩溃修复](https://github.com/ossrs/srs/commit/da5683e4784f4acf0e6eee8dce91fa52a7e770b4)，
   避免活跃推流还在清理时提前销毁全局对象。
+- `0003` 回移[上游 HTTP-FLV 断连修复](https://github.com/ossrs/srs/commit/551ee22d1f226fa3b584f47ffa49d6611bdba04e)，
+  让发送循环及时处理管理接口发出的连接中断信号。
 
-本目录所在项目的 Dockerfile 在编译前自动应用这两份补丁。Linux 本机构建时，从 `srs/` 运行以下命令，
+本目录所在项目的 Dockerfile 在编译前自动应用这些补丁。Linux 本机构建时，从 `srs/` 运行以下命令，
 并按部署环境传入原有的 `configure` 参数。
 
 ```bash
@@ -21,5 +23,5 @@ bash ./apply-media-patches.sh && (cd trunk && ./configure && make -j2)
 python3 tests/srs_media_regression.py --srs trunk/objs/srs
 ```
 
-测试在回环地址启动临时 SRS。它验证同一房间的两路带点号流能分别解码出各自的音频，
-以及仍有推流和播放连接时收到 `SIGTERM` 能以状态码 0 退出，重启后可重新推流和播放。
+测试在回环地址启动临时 SRS，验证两路带点号的流各自能解码出正确的音频，以及带流停机重启。
+还会验证管理接口拒绝匿名访问，删除空闲的 HTTP-FLV 拉流后在一秒内释放连接，并检查 SRS 日志是否隐藏凭证。

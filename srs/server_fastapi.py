@@ -20,13 +20,15 @@ import uuid
 import logging
 import asyncio
 import threading
-from typing import Dict, Set, Optional, List, Tuple
+from typing import Dict, Set, Optional, List, Tuple, Literal
 from contextlib import asynccontextmanager
 from datetime import datetime
+from urllib.parse import urlsplit
 
+import aiohttp
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 # 自定义路径参数转换器：只匹配 inv_ 开头的字符串
 class InvitationIdConvertor:
@@ -46,7 +48,7 @@ try:
     register_url_convertor("inv_id", InvitationIdConvertor())
 except Exception:
     pass
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 import requests
 
@@ -68,7 +70,12 @@ from message_store import message_store
 from invite_code_store import invite_code_store
 from pass_code_store import pass_code_store
 from rate_limiter import rate_limiter
-from auth import user_store, issue_token, verify_token, AuthError, JWT_TTL_SECONDS, revocation, USERNAME_RE
+from auth import user_store, issue_token, verify_token, AuthError, JWT_SECRET, JWT_TTL_SECONDS, revocation, USERNAME_RE
+from chat_data import DATA_DIR
+from android_device_proof import AndroidDeviceProof
+from media_auth import MEDIA_STREAM, MediaAuthError, MediaAuthorization, load_applications
+from media_sessions import MediaSessions
+from srs_management import SrsManagement
 from sync_client import sync
 from invitation_store import invitation_store
 from share_manager import share_manager, SHARE_DOMAIN
@@ -83,7 +90,7 @@ from user_name_resolver import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'callback_server.log')
+log_file = DATA_DIR / "callback_server.log"
 file_handler = logging.FileHandler(log_file, encoding='utf-8')
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
@@ -154,14 +161,7 @@ def verify_external_token(external_token: str) -> dict:
     验证成功返回用户信息 dict，失败抛 AuthError。
     """
     url = BUSINESS_PROFILE_URL
-    headers = {
-        "Authorization": f"Bearer {external_token[:8]}...",  # 日志中只截前8位
-        "X-External-Service-Token": BUSINESS_APP_KEY,
-    }
-    logger.info(
-        f"[Auth] 业务后端验证开始: url={url} "
-        f"external_token_len={len(external_token)} external_token_prefix={external_token[:8]}..."
-    )
+    logger.info("[Auth] 验证业务用户身份")
     t0 = time.time()
     try:
         resp = requests.get(
@@ -184,12 +184,12 @@ def verify_external_token(external_token: str) -> dict:
     elapsed = int((time.time() - t0) * 1000)
     logger.info(
         f"[Auth] 业务后端响应: status={resp.status_code} elapsed_ms={elapsed} "
-        f"body_len={len(resp.text)} body_preview={resp.text[:300]!r}"
+        f"body_len={len(resp.text)}"
     )
 
     if resp.status_code == 401 or resp.status_code == 403:
         # 业务后端明确拒绝（token 无效/过期/权限不足）
-        logger.warning(f"[Auth] 业务后端拒绝: HTTP {resp.status_code} -> resp={resp.text[:300]}")
+        logger.warning(f"[Auth] 业务后端拒绝: HTTP {resp.status_code}")
         raise AuthError(401, "token 无效或已过期")
     if resp.status_code == 404:
         # 404 说明接口路径不对，或者业务后端服务停了/换了
@@ -212,11 +212,11 @@ def verify_external_token(external_token: str) -> dict:
     # 区分业务成功 vs 业务失败：成功必须有 data 字段且为非空 dict
     backend_code = body.get("code")
     data = body.get("data")
-    if not isinstance(data, dict) or not data:
+    if backend_code != 200 or not isinstance(data, dict) or not data:
         # data 缺失或为空 → 真正的失败
         msg = body.get("message", "token 无效或已过期")
         logger.warning(
-            f"[Auth] 业务后端业务失败: backend_code={backend_code} message={msg} body={body!r}"
+            f"[Auth] 业务后端业务失败: backend_code={backend_code}"
         )
         raise AuthError(401, msg)
 
@@ -238,18 +238,55 @@ def verify_external_token(external_token: str) -> dict:
     return data
 
 
-# 不需要鉴权的路径（公开接口、SRS 内部回调）
+def can_access_room_media(operation, room_id, user_id, speaker_id):
+    return user_manager.can_access_media(
+        operation, room_id, user_id, speaker_id, pass_code_store.allows_existing_member,
+    )
+
+
+android_devices = AndroidDeviceProof(
+    os.getenv("CHAT_ANDROID_DEVICE_REGISTRY", ""),
+    DATA_DIR / "android-device-proofs.sqlite3",
+    os.getenv("CHAT_ANDROID_PROOF_AUDIENCE", ""),
+)
+media_authorization = MediaAuthorization(
+    JWT_SECRET,
+    os.getenv("SRS_MEDIA_HOOK_SECRET", ""),
+    load_applications(os.getenv("SRS_THIRD_PARTY_APPS", "")),
+    can_access_room_media,
+    revocation.is_revoked,
+    lambda key_id: android_devices.is_enabled(key_id),
+)
+
+
+def media_auth_error(error):
+    return JSONResponse(status_code=error.status, content={"code": error.status, "message": str(error)})
+
+
+async def verify_android_device(request, expected_key=None):
+    proofs = request.headers.getlist("X-Chat-Device-Proof")
+    return await asyncio.to_thread(
+        android_devices.verify,
+        proofs[0] if len(proofs) == 1 else "",
+        method=request.method,
+        path=request.scope["raw_path"].decode("ascii"),
+        body=await request.body(),
+        authorization=request.headers.get("Authorization", ""),
+        expected_key=expected_key,
+    )
+
+
+# 无需用户 JWT 的入口各自核验登录或应用凭据。
 PUBLIC_PATHS = {
     "/api/v1/health",
     "/api/v1/metrics",  # 2026-08-13 文档 §12.7：metrics 公开给内网监控
     "/api/v1/auth/register",
     "/api/v1/auth/login",
+    "/api/v1/app/verify",
     "/api/v1/auth/test_login",  # 仅本地/测试环境使用，生产部署建议网关鉴权
     # WS 元接口：返回 ws URL / 房间连接数，无需业务鉴权
     "/api/v1/ws/subscribe",
     "/api/v1/ws/status",
-    # ID 解析：允许任意客户端查询 bus_id → chat_user_id 的映射
-    "/api/v1/users/resolve",
 }
 
 # SRS 内部回调（来自 localhost，无法带 token）
@@ -275,8 +312,12 @@ class ApiAuthMiddleware(BaseHTTPMiddleware):
         # 公开接口放行
         if path in PUBLIC_PATHS:
             return await call_next(request)
-        # SRS 回调放行
         if path in SRS_CALLBACK_PATHS:
+            try:
+                keys = request.query_params.getlist("key")
+                media_authorization.verify_hook_key(keys[0] if len(keys) == 1 else "")
+            except MediaAuthError as e:
+                return media_auth_error(e)
             return await call_next(request)
         # 提取 Bearer token
         auth_header = request.headers.get("Authorization", "")
@@ -287,6 +328,8 @@ class ApiAuthMiddleware(BaseHTTPMiddleware):
             token = request.headers.get("X-Auth-Token", "").strip()
         try:
             payload = verify_token(token)
+            if not media_authorization.is_user_session_enabled(payload):
+                raise AuthError(401, "user session client is not authorized")
         except AuthError as e:
             return JSONResponse(
                 status_code=e.code,
@@ -329,6 +372,48 @@ port = int(os.getenv('CALLBACK_PORT', 8085))
 SRS_URL = os.getenv("SRS_URL", "rtmp://localhost:1935")
 _srs_host = SRS_URL.split("//", 1)[-1].split(":")[0]
 SRS_HTTP_API = os.getenv("SRS_HTTP_API", f"http://{_srs_host}:1985")
+media_sessions = MediaSessions(DATA_DIR / "media_sessions.sqlite3")
+
+
+def _srs_management():
+    return SrsManagement(
+        SRS_HTTP_API, os.getenv("SRS_HTTP_API_USERNAME", ""), os.getenv("SRS_HTTP_API_PASSWORD", ""),
+    )
+
+
+def _queue_media_revocations(*, room_id=None, user_id=None, operation=None, jti=None):
+    def should_close(claims):
+        if (
+            (room_id is not None and claims["room"] != room_id)
+            or (user_id is not None and user_id not in (claims["uid"], claims["speaker"]))
+            or (operation is not None and claims["operation"] != operation)
+            or (jti is not None and claims["session"] != jti)
+        ):
+            return False
+        try:
+            media_authorization.require_ticket_session(claims)
+        except MediaAuthError:
+            return True
+        return not can_access_room_media(claims["operation"], claims["room"], claims["uid"], claims["speaker"])
+
+    return media_sessions.mark_pending(should_close)
+
+
+async def _media_revocation_worker():
+    next_reconciliation = 0
+    while True:
+        try:
+            _queue_media_revocations()
+            management = _srs_management()
+            await media_sessions.close_pending(management)
+            if time.monotonic() >= next_reconciliation:
+                next_reconciliation = time.monotonic() + 30
+                await media_sessions.reconcile(management)
+        except (aiohttp.ClientError, TimeoutError, ValueError) as error:
+            logger.warning("SRS media reconciliation unavailable: %s", error)
+        except Exception:
+            logger.exception("SRS media revocation worker failed")
+        await asyncio.sleep(1)
 
 # 客户端可访问的公网 host（用于返回 ws URL 等）
 # 默认从环境变量读，否则用 0.0.0.0（本机测试）；生产应该设成 ECS 公网 IP 或域名
@@ -453,6 +538,20 @@ def _get_timestamp() -> str:
 # ConnectionManager（WebSocket）
 # ==============================================================================
 
+def is_room_socket_session_valid(payload: dict, user_id: str) -> bool:
+    if user_id != payload.get("uid") or int(payload["exp"]) <= time.time():
+        return False
+    if revocation.is_revoked(payload):
+        return False
+    return media_authorization.is_user_session_enabled(payload)
+
+
+def can_access_room_socket(payload: dict, room_id: str, user_id: str) -> bool:
+    return is_room_socket_session_valid(payload, user_id) and can_access_room_media(
+        "play", room_id, user_id, user_id,
+    )
+
+
 class ConnectionManager:
     """WebSocket 连接管理器
 
@@ -465,89 +564,147 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, list] = {}
         self.user_connections: Dict[str, WebSocket] = {}
-        # 2026-08-13：心跳 + 在线状态跟踪
-        # _ws_state: ws -> {user_id, room_id, last_pong_at, fail_count}
         self._ws_state: Dict[WebSocket, dict] = {}
-        self._ws_lock = threading.RLock()
 
-    async def connect(self, websocket: WebSocket, room_id: str, user_id: str = ""):
+    async def connect(self, websocket: WebSocket, room_id: str, user_id: str, payload: dict) -> bool:
+        if not can_access_room_socket(payload, room_id, user_id):
+            await websocket.close(code=1008, reason="Room access denied")
+            return False
+        state = {
+            "user_id": user_id,
+            "room_id": room_id,
+            "payload": payload,
+            "last_pong_at": time.time(),
+            "fail_count": 0,
+        }
         with native_ws_lock:
-            if room_id not in self.active_connections:
-                self.active_connections[room_id] = []
-            self.active_connections[room_id].append(websocket)
-        if user_id:
+            self.active_connections.setdefault(room_id, []).append(websocket)
             self.user_connections[user_id] = websocket
-            with self._ws_lock:
-                self._ws_state[websocket] = {
-                    "user_id": user_id,
-                    "room_id": room_id,
-                    "last_pong_at": time.time(),
-                    "fail_count": 0,
-                }
-        # 2026-08-13 §2.2：连接建立 → 标记在线（覆盖之前的 offline）
+            self._ws_state[websocket] = state
+
         try:
-            room = user_manager.get_room(room_id)
-            if room and user_id in room.members:
-                user_manager._mark_member_online(room_id, user_id)
-                # 2026-08-13 §2.5：缓存
-                from cache import cache
-                cache.mark_user_online(user_id, room_id)
+            user_manager._mark_member_online(room_id, user_id)
+            from cache import cache
+            cache.mark_user_online(user_id, room_id)
         except Exception as e:
             logger.warning(f"[WS] mark_online failed for {user_id}/{room_id}: {e}")
-        # 2026-08-13 §12.7：metrics
         from metrics import metrics
         metrics.inc("ws_connect_total")
         metrics.gauge("ws_active_connections", len(self.user_connections))
         logger.info(f"[WS] Connected: room={room_id}, user={user_id}")
-        await websocket.send_json({
+        if not await self.send(websocket, {
             "type": "connected",
             "room_id": room_id,
-            "user_id": user_id
-        })
-        # 2026-08-13 §2.2：状态变更广播
-        if user_id:
-            await self._broadcast_online_status(room_id, user_id, "online")
+            "user_id": user_id,
+        }, state):
+            return False
+        await self._broadcast_online_status(room_id, user_id, "online")
+        return True
 
-    def disconnect(self, websocket: WebSocket, room_id: str):
+    def disconnect(self, websocket: WebSocket, expected_state: Optional[dict] = None) -> bool:
         with native_ws_lock:
-            if room_id in self.active_connections:
-                if websocket in self.active_connections[room_id]:
-                    self.active_connections[room_id].remove(websocket)
-                if not self.active_connections[room_id]:
-                    del self.active_connections[room_id]
-        user_id = None
-        for uid, ws in list(self.user_connections.items()):
-            if ws == websocket:
-                user_id = uid
-                del self.user_connections[uid]
-        # 2026-08-13 §2.2：断开 → 标记 offline（保留房间关联）
+            state = self._ws_state.get(websocket)
+            if state is None or (expected_state is not None and state is not expected_state):
+                return False
+            del self._ws_state[websocket]
+            room_id, user_id = state["room_id"], state["user_id"]
+            connections = self.active_connections[room_id]
+            connections.remove(websocket)
+            if not connections:
+                del self.active_connections[room_id]
+
+            remaining = [ws for ws, entry in self._ws_state.items() if entry["user_id"] == user_id]
+            if self.user_connections.get(user_id) is websocket:
+                if remaining:
+                    self.user_connections[user_id] = remaining[-1]
+                else:
+                    del self.user_connections[user_id]
+            still_in_room = any(self._ws_state[ws]["room_id"] == room_id for ws in remaining)
+
         offline_at = None
-        if user_id:
-            with self._ws_lock:
-                self._ws_state.pop(websocket, None)
+        if not still_in_room:
             try:
-                room = user_manager.get_room(room_id)
-                if room and user_id in room.members:
-                    offline_at = user_manager._mark_member_offline(room_id, user_id)
-                    # 2026-08-13 §2.5：缓存
-                    from cache import cache
+                offline_at = user_manager._mark_member_offline(room_id, user_id)
+                from cache import cache
+                if remaining:
+                    cache.srem(f"room_online:{room_id}", user_id)
+                else:
                     cache.mark_user_offline(user_id, room_id)
             except Exception as e:
                 logger.warning(f"[WS] mark_offline failed for {user_id}/{room_id}: {e}")
         logger.info(f"[WS] Disconnected: room={room_id}, user={user_id}")
-        # 2026-08-13 §12.7：metrics
         from metrics import metrics
         metrics.inc("ws_disconnect_total")
         metrics.gauge("ws_active_connections", len(self.user_connections))
-        # 2026-08-13 §2.2：状态变更广播（异步触发）
-        if user_id and offline_at is not None:
+        if offline_at is not None:
+            asyncio.create_task(self._broadcast_online_status(
+                room_id, user_id, "offline", offline_at=offline_at))
+        return True
+
+    async def close(self, websocket: WebSocket, state: dict, code: int, reason: str):
+        if self.disconnect(websocket, state):
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(self._broadcast_online_status(
-                        room_id, user_id, "offline", offline_at=offline_at))
-            except RuntimeError:
+                await websocket.close(code=code, reason=reason)
+            except Exception:
                 pass
+
+    async def authorize(self, websocket: WebSocket, expected_state: Optional[dict] = None) -> bool:
+        with native_ws_lock:
+            state = self._ws_state.get(websocket)
+        if state is None or (expected_state is not None and state is not expected_state):
+            return False
+        if can_access_room_socket(state["payload"], state["room_id"], state["user_id"]):
+            return True
+        await self.close(websocket, state, 1008, "Room access denied")
+        return False
+
+    async def send(self, websocket: WebSocket, message: dict, expected_state: Optional[dict] = None) -> bool:
+        with native_ws_lock:
+            state = self._ws_state.get(websocket) if expected_state is None else expected_state
+        if state is None or not await self.authorize(websocket, state):
+            return False
+        try:
+            await websocket.send_json(message)
+            return True
+        except Exception:
+            self.disconnect(websocket, state)
+            return False
+
+    async def prune_unauthorized(self, *, jti=None, user_id=None):
+        with native_ws_lock:
+            connections = [
+                (ws, state) for ws, state in self._ws_state.items()
+                if (jti is None or state["payload"]["jti"] == jti)
+                and (user_id is None or state["user_id"] == user_id)
+            ]
+        for ws, state in connections:
+            await self.authorize(ws, state)
+
+    def _room_connections(self, room_id: str) -> list:
+        with native_ws_lock:
+            return [(ws, self._ws_state[ws]) for ws in self.active_connections.get(room_id, [])]
+
+    async def close_kicked_member(self, event: dict):
+        room_id, user_id = event["room_id"], event["user_id"]
+        # Detach all of the member's sockets before sending the terminal event.
+        kicked = []
+        for ws, state in self._room_connections(room_id):
+            if state["user_id"] == user_id and self.disconnect(ws, state):
+                kicked.append((ws, state))
+        for ws, state in kicked:
+            if is_room_socket_session_valid(state["payload"], user_id):
+                try:
+                    await ws.send_json(event)
+                except Exception:
+                    pass
+            try:
+                await ws.close(code=1008, reason="Room access denied")
+            except Exception:
+                pass
+
+    async def close_room_connections(self, room_id: str):
+        for ws, state in self._room_connections(room_id):
+            await self.close(ws, state, 1000, f"room {room_id} closed")
 
     async def _broadcast_online_status(self, room_id: str, user_id: str,
                                         status: str, offline_at: int = 0):
@@ -580,63 +737,41 @@ class ConnectionManager:
 
     def record_pong(self, websocket: WebSocket):
         """客户端响应 pong 时重置失败计数（2026-08-13 §2.2）"""
-        with self._ws_lock:
+        with native_ws_lock:
             state = self._ws_state.get(websocket)
             if state:
                 state["last_pong_at"] = time.time()
                 state["fail_count"] = 0
 
     async def check_heartbeats(self, ping_interval: int = 30, fail_threshold: int = 3):
-        """扫描所有 ws：对超过 ping_interval*fail_threshold 秒未 pong 的 → 强制关闭。
-
-        文档 §2.2：3 次 ping 无响应 → 判离线。
-        """
         now = time.time()
-        stale: List[Tuple[WebSocket, str, str]] = []  # (ws, room_id, user_id)
-        with self._ws_lock:
-            for ws, state in list(self._ws_state.items()):
+        with native_ws_lock:
+            connections = list(self._ws_state.items())
+        for ws, state in connections:
+            if not await self.authorize(ws, state):
+                continue
+            with native_ws_lock:
                 elapsed = now - state["last_pong_at"]
-                # 超过 ping_interval 秒未收到 pong → 计数 +1
-                if elapsed > ping_interval:
-                    state["fail_count"] += 1
-                    if state["fail_count"] >= fail_threshold:
-                        stale.append((ws, state["room_id"], state["user_id"]))
-        # 警告但未到阈值：发一次 ping（让客户端有最后一次响应机会）
-        for ws, state in list(self._ws_state.items()):
-            with self._ws_lock:
-                elapsed = now - state["last_pong_at"]
-                if ping_interval < elapsed < ping_interval * fail_threshold:
-                    try:
-                        await ws.send_json({"type": "ping"})
-                    except Exception:
-                        stale.append((ws, state["room_id"], state["user_id"]))
-        # 强制断开
-        for ws, room_id, user_id in stale:
-            logger.info(f"[WS] Heartbeat failure threshold: closing {user_id}/{room_id}")
-            try:
-                await ws.close(code=1011, reason="heartbeat_timeout")
-            except Exception:
-                pass
-            self.disconnect(ws, room_id)
+                if elapsed <= ping_interval:
+                    continue
+                state["fail_count"] += 1
+                failed = state["fail_count"] >= fail_threshold
+            if failed:
+                logger.info(f"[WS] Heartbeat failure threshold: closing {state['user_id']}/{state['room_id']}")
+                await self.close(ws, state, 1011, "heartbeat_timeout")
+            elif elapsed < ping_interval * fail_threshold:
+                await self.send(ws, {"type": "ping"}, state)
 
     async def broadcast_to_room(self, room_id: str, message: dict):
-        with native_ws_lock:
-            connections = list(self.active_connections.get(room_id, []))
-        disconnected = []
-        for ws in connections:
-            try:
-                await ws.send_json(message)
-            except:
-                disconnected.append(ws)
-        for ws in disconnected:
-            self.disconnect(ws, room_id)
+        for ws, state in self._room_connections(room_id):
+            await self.send(ws, message, state)
 
     async def send_to_user(self, user_id: str, message: dict):
-        if user_id in self.user_connections:
-            try:
-                await self.user_connections[user_id].send_json(message)
-            except:
-                del self.user_connections[user_id]
+        with native_ws_lock:
+            ws = self.user_connections.get(user_id)
+            state = self._ws_state.get(ws)
+        if state is not None:
+            await self.send(ws, message, state)
 
     async def broadcast_to_room_with_timestamp(self, room_id: str, message: dict):
         """广播时附上 timestamp"""
@@ -651,20 +786,14 @@ class ConnectionManager:
 
     async def broadcast_to_room_exclude(self, room_id: str, message: dict, exclude_user_ids: Set[str]):
         """广播给房间内除指定用户外的所有在线成员"""
-        msg = dict(message)
-        msg["timestamp"] = _get_timestamp()
+        msg = {**message, "timestamp": _get_timestamp()}
         with native_ws_lock:
-            # 从 user_connections 找在线用户（排除 owner）
-            for uid, ws in list(self.user_connections.items()):
-                if uid in exclude_user_ids:
-                    continue
-                # 检查该用户是否在当前房间
-                room = user_manager.get_room(room_id)
-                if room and uid in room.members:
-                    try:
-                        await ws.send_json(msg)
-                    except:
-                        del self.user_connections[uid]
+            connections = [
+                (ws, self._ws_state[ws]) for uid, ws in self.user_connections.items()
+                if uid not in exclude_user_ids and self._ws_state[ws]["room_id"] == room_id
+            ]
+        for ws, state in connections:
+            await self.send(ws, msg, state)
 
 
 manager = ConnectionManager()
@@ -676,7 +805,8 @@ manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("[FastAPI] Starting up...")
-    start_heartbeat_checker()
+    heartbeat_task = asyncio.create_task(heartbeat_check_worker())
+    media_revocation_task = asyncio.create_task(_media_revocation_worker())
     notification_service._native_ws_manager = manager
 
     # 启动邀请过期清理后台线程
@@ -696,7 +826,12 @@ async def lifespan(app: FastAPI):
     share_cleanup_thread.start()
 
     await sync.start()
-    yield
+    try:
+        yield
+    finally:
+        heartbeat_task.cancel()
+        media_revocation_task.cancel()
+        await asyncio.gather(heartbeat_task, media_revocation_task, return_exceptions=True)
 
     # 停止邀请过期清理
     invitation_cleanup_running = False
@@ -758,35 +893,46 @@ async def websocket_endpoint(websocket: WebSocket):
     room_id = websocket.query_params.get("room", "")
     user_id = websocket.query_params.get("user", "")
 
-    if not room_id:
-        await websocket.close(code=1008, reason="Missing room parameter")
+    try:
+        payload = verify_token(websocket.query_params.get("token", ""))
+    except AuthError:
+        await websocket.close(code=1008, reason="Invalid room session")
+        return
+    if not can_access_room_socket(payload, room_id, user_id):
+        await websocket.close(code=1008, reason="Room access denied")
         return
 
     await websocket.accept()
-    await manager.connect(websocket, room_id, user_id)
-
     try:
+        if not await manager.connect(websocket, room_id, user_id, payload):
+            return
         while True:
             data = await websocket.receive_json()
+            if not await manager.authorize(websocket):
+                return
             msg_type = data.get('type', '')
 
             if msg_type == 'ping':
                 # 客户端 → 服务端 ping（兼容旧客户端）
-                await websocket.send_json({"type": "pong"})
+                await manager.send(websocket, {"type": "pong"})
             elif msg_type == 'pong':
                 # 服务端 ping → 客户端 pong（2026-08-13 §2.2）
                 manager.record_pong(websocket)
             elif msg_type == 'subscribe':
                 new_room = data.get('room_id', room_id)
-                manager.disconnect(websocket, room_id)
-                await manager.connect(websocket, new_room, user_id)
+                if not isinstance(new_room, str) or not can_access_room_socket(payload, new_room, user_id):
+                    await manager.send(websocket, {"type": "error", "message": "Room access denied"})
+                    continue
+                manager.disconnect(websocket)
+                if not await manager.connect(websocket, new_room, user_id, payload):
+                    return
                 room_id = new_room
             elif msg_type == 'chat_message':
                 # 2026-08-13 §5.2：WS 发送消息（持久化 + 广播）
                 try:
                     client_msg_id = data.get('client_msg_id', '')
                     if not client_msg_id:
-                        await websocket.send_json({"type": "error", "message": "client_msg_id required"})
+                        await manager.send(websocket, {"type": "error", "message": "client_msg_id required"})
                         continue
                     item = message_store.send(
                         room_id=room_id,
@@ -803,7 +949,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                     if not item.get("_idempotent"):
                         await _broadcast_chat_message(room_id, item)
-                    await websocket.send_json({
+                    await manager.send(websocket, {
                         "type": "chat_message_ack",
                         "id": item["id"],
                         "seq": item["seq"],
@@ -813,7 +959,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 except Exception as e:
                     logger.warning(f"[WS] chat_message error: {e}")
                     try:
-                        await websocket.send_json({"type": "error", "message": str(e)})
+                        await manager.send(websocket, {"type": "error", "message": str(e)})
                     except Exception:
                         pass
             elif msg_type == 'history_sync':
@@ -821,7 +967,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     after_seq = int(data.get('after_seq', 0))
                     items = message_store.history(room_id, after_seq=after_seq, limit=200)
-                    await websocket.send_json({
+                    await manager.send(websocket, {
                         "type": "history_sync",
                         "room_id": room_id,
                         "items": items,
@@ -831,10 +977,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.warning(f"[WS] history_sync error: {e}")
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket, room_id)
+        pass
     except Exception as e:
         logger.warning(f"[WS] Error: {e}")
-        manager.disconnect(websocket, room_id)
+    finally:
+        manager.disconnect(websocket)
 
 
 # ==============================================================================
@@ -1000,9 +1147,28 @@ class LoginRequest(BaseModel):
     app_id: Optional[str] = None
 
 
+class AppVerifyRequest(BaseModel):
+    app_id: str
+    app_key: str
+    package_name: str
+    signature_sha256: str
+
+
+@app.post("/api/v1/app/verify")
+async def verify_application(req: AppVerifyRequest):
+    try:
+        return api_ok(media_authorization.authenticate_app(
+            req.app_id, req.app_key, req.package_name, req.signature_sha256,
+        ))
+    except MediaAuthError as e:
+        return media_auth_error(e)
+
+
 @app.post("/api/v1/auth/register")
 async def auth_register(req: RegisterRequest):
     """注册新用户。成功直接返回 JWT。"""
+    if os.getenv("CHAT_NATIVE_REGISTRATION_ENABLED") != "1":
+        return JSONResponse(status_code=403, content={"code": 403, "message": "native registration is closed"})
     try:
         record = user_store.register(req.username, req.password)
     except AuthError as e:
@@ -1053,6 +1219,8 @@ async def auth_test_login(req: TestLoginRequest):
       - 若都不存在 → 创建新记录
       - 不动业务后端、不写审计日志
     """
+    if os.getenv("CHAT_TEST_LOGIN_ENABLED") != "1":
+        return JSONResponse(status_code=403, content={"code": 403, "message": "test login is disabled"})
     user_name = (req.user_name or "").strip()
     if not user_name:
         return api_err(400, "user_name 不能为空")
@@ -1165,7 +1333,7 @@ async def auth_test_login(req: TestLoginRequest):
 
 
 @app.post("/api/v1/auth/login")
-async def auth_login(req: LoginRequest):
+async def auth_login(request: Request, req: LoginRequest):
     """登录，支持两种模式：
 
     1. 三方验证（external_token 优先）：
@@ -1174,16 +1342,21 @@ async def auth_login(req: LoginRequest):
     2. 内部账号（兼容旧模式）：
        客户端直接带 username+password → 聊天服务器本地验 → 发 JWT
     """
-    # ---------- 模式1：业务后端三方验证 ----------
-    logger.info(
-        f"[Auth] /auth/login 入口: mode=external "
-        f"external_token_len={len(req.external_token) if req.external_token else 0} "
-        f"external_token_prefix={req.external_token[:8] if req.external_token else None} "
-        f"user_name={req.user_name!r}"
-    )
+    app_token = request.headers.get("X-App-Token", "")
+    device_id = None
+    try:
+        app_id = media_authorization.verify_app(app_token)["app"] if app_token else "default"
+        if req.app_id and req.app_id != app_id:
+            raise MediaAuthError(403, "application does not match login request")
+        if app_id == "default":
+            if not req.external_token:
+                raise MediaAuthError(401, "application credential required for native login")
+            device_id = await verify_android_device(request)
+    except MediaAuthError as e:
+        return media_auth_error(e)
     if req.external_token:
         try:
-            ext_data = verify_external_token(req.external_token)
+            ext_data = await asyncio.to_thread(verify_external_token, req.external_token)
         except AuthError as e:
             return api_err(e.code, e.message)
 
@@ -1199,12 +1372,9 @@ async def auth_login(req: LoginRequest):
             logger.error(f"[Auth] 业务后端用户信息缺身份字段: data_keys={list(ext_data.keys())}")
             return api_err(500, "业务后端返回的用户信息缺少身份字段")
 
-        # app_id 优先级：1) 请求体  2) 业务后端 ext_data.app_id  3) "default"
-        app_id = (
-            (req.app_id or "").strip()
-            or (ext_data.get("app_id") or "").strip()
-            or "default"
-        )
+        bus_id = str(ext_data.get("userId", ext_data.get("id", ""))).strip()
+        if not bus_id.isascii() or not bus_id.isdecimal():
+            return api_err(403, "verified profile is missing its user ID")
 
         # 校验 client 传入的 user_name（可选）。
         try:
@@ -1214,7 +1384,10 @@ async def auth_login(req: LoginRequest):
 
         # 用 user_store 做"注册或取记录"：按 (app_id, bus_id) 定位，
         # 同一业务用户在同 app 下始终映射到同一个 chat_user_id
-        record = user_store.get_or_create_from_external(username, ext_data, app_id=app_id)
+        record = user_store.get_or_create_from_external(f"{app_id}:{bus_id}", ext_data, app_id=app_id)
+        record_app_id = record.get("app_id", "default")
+        if record_app_id != app_id:
+            return media_auth_error(MediaAuthError(403, "application does not match user identity"))
 
         # 需求 §2.3 优先级：1) 请求体 user_name  2) 业务后端 nickname  3) user_id 兜底
         biz_user_name = (
@@ -1236,7 +1409,6 @@ async def auth_login(req: LoginRequest):
                 )
 
         # 发 token 时把 name 写入 JWT，便于 WebSocket 事件直接读
-        record_app_id = record.get("app_id", "default")
         token, _jti, exp = issue_token(
             username=record["username"],
             user_id=record["user_id"],
@@ -1244,6 +1416,7 @@ async def auth_login(req: LoginRequest):
             role=record.get("role", "member"),
             name=final_user_name,
             app_id=record_app_id,
+            device_id=device_id,
         )
         logger.info(
             f"[Auth] 三方登录成功: app_id={record_app_id} username={record['username']} "
@@ -1306,6 +1479,7 @@ async def auth_login(req: LoginRequest):
         room_id=record.get("room_id"),
         role=record.get("role", "member"),
         name=final_user_name,
+        app_id=app_id,
     )
     return {
         "code": 0,
@@ -1383,6 +1557,9 @@ async def auth_logout(request: Request):
     if not jti:
         raise HTTPException(status_code=401, detail="not authenticated")
     revocation.revoke_jti(jti, exp)
+    pending_media = _queue_media_revocations(jti=jti)
+    await manager.prune_unauthorized(jti=jti)
+    await media_sessions.close_pending(_srs_management(), pending_media)
     logger.info(f"[Auth] logout: user={username} jti={jti[:8]}...")
     return {"code": 0, "message": "logged out", "data": {}}
 
@@ -1398,12 +1575,16 @@ async def auth_logout_all(request: Request, req: LogoutAllRequest):
     - body 里传 username：必须等于当前登录用户（不允许撤销别人）
     """
     cur_username = getattr(request.state, "username", "")
-    if not cur_username:
+    user_id = getattr(request.state, "user_id", "")
+    if not cur_username or not user_id:
         raise HTTPException(status_code=401, detail="not authenticated")
     target = req.username.strip() or cur_username
     if target != cur_username:
         raise HTTPException(status_code=403, detail="只能撤销自己的 token")
-    count = revocation.revoke_user_all(target)
+    count = revocation.revoke_user_all(user_id)
+    pending_media = _queue_media_revocations(user_id=user_id)
+    await manager.prune_unauthorized(user_id=user_id)
+    await media_sessions.close_pending(_srs_management(), pending_media)
     logger.info(f"[Auth] logout-all: user={target} revoked={count}")
     return {"code": 0, "message": "all tokens revoked", "data": {"username": target, "revoked_count": count}}
 
@@ -1850,25 +2031,6 @@ async def delete_room(request: Request, room_id: str):
             }
         })
 
-        # 关闭非房主成员的 WS 连接
-        conns = list(manager.active_connections.get(room_id, []))
-        for ws in conns:
-            try:
-                await ws.send_json({
-                    "type": "room_closed",
-                    "room_id": room_id,
-                    "data": {
-                        "closed_by": operator_id,
-                        "reason": "owner_entered_another_room",
-                        "timestamp": int(time.time())
-                    },
-                    "timestamp": _get_timestamp(),
-                })
-                await ws.close(code=1000, reason=f"room {room_id} closed")
-            except:
-                pass
-        manager.active_connections.pop(room_id, None)
-
         # 清理拉流追踪
         with room_players_lock:
             room_players.pop(room_id, None)
@@ -1880,6 +2042,9 @@ async def delete_room(request: Request, room_id: str):
             pass_code_store.revoke_all_for_room(room_id, operator_id=operator_id)
         except Exception as e:
             logger.warning(f"[CloseRoom] revoke pass_codes failed: {e}")
+        pending_media = _queue_media_revocations(room_id=room_id)
+        await manager.close_room_connections(room_id)
+        await media_sessions.close_pending(_srs_management(), pending_media)
         asyncio.create_task(sync.room_deleted(room_id=room_id, deleted_by=operator_id))
         logger.info(f"[API] Room {room_id} closed (operator={operator_id})")
 
@@ -2020,15 +2185,24 @@ async def join_room(request: Request, room_id: str, req: RoomJoinRequest):
         if req.user_id and req.user_id != jwt_user_id:
             return api_err(403, "user_id must match current user")
 
-        actual_room_id = req.room_id if req.room_id else room_id
+        if req.room_id and req.room_id != room_id:
+            return api_err(400, "room_id must match the request path")
+        actual_room_id = room_id
 
         # 先检查房间状态（拒绝加入已关闭房间）
         existing_room = user_manager.get_room(actual_room_id)
-        if existing_room and existing_room.status.value == "closed":
+        if not existing_room:
+            return api_err(404, "room not found")
+        if existing_room.status.value == "closed":
             return api_err(400, "room is closed")
 
-        role_map = {"owner": UserRole.OWNER, "admin": UserRole.ADMIN, "member": UserRole.MEMBER, "guest": UserRole.GUEST}
-        role = role_map.get(req.role, UserRole.MEMBER)
+        member = user_manager.get_member(actual_room_id, jwt_user_id)
+        if jwt_user_id == existing_room.owner_id:
+            role = UserRole.OWNER
+        elif member:
+            role = member.role
+        else:
+            role = UserRole.GUEST if req.role == "guest" else UserRole.MEMBER
 
         # 2026-08-15 文档 R3/R7.1：通行码校验
         # owner/admin 免码；普通成员/guest 必须存在 active 通行码
@@ -2121,7 +2295,19 @@ async def kick_member(request: Request, room_id: str, user_id: str, operator_id:
             pass_code_store.revoke(user_id, room_id, operator_id=operator_id)
         except Exception as e:
             logger.warning(f"[Kick] revoke pass_code failed: {e}")
+        pending_media = _queue_media_revocations(room_id=room_id, user_id=user_id)
 
+        event = {
+            "type": "member_kicked",
+            "room_id": room_id,
+            "user_id": user_id,
+            "operator_id": operator_id,
+            "timestamp": _get_timestamp(),
+        }
+        await asyncio.gather(
+            manager.close_kicked_member(event),
+            media_sessions.close_pending(_srs_management(), pending_media),
+        )
         asyncio.create_task(sync.member_kicked(room_id=room_id, user_id=user_id, operator_id=operator_id))
 
         # 2026-08-13 文档 §6.2：通知持久化（被踢人是 recipient）+ notice_socket 实时推送
@@ -2135,12 +2321,7 @@ async def kick_member(request: Request, room_id: str, user_id: str, operator_id:
             data={},
         )
 
-        await manager.broadcast_to_room_with_timestamp(room_id, {
-            "type": "member_kicked",
-            "room_id": room_id,
-            "user_id": user_id,
-            "operator_id": operator_id
-        })
+        await manager.broadcast_to_room(room_id, event)
 
         # 2026-08-13 文档 §12.7：审计日志
         from audit_log import audit_logger
@@ -2405,6 +2586,8 @@ async def mute_member(request: Request, room_id: str, user_id: str, req: MemberO
         ok = user_manager.mute_user(room_id, user_id)
         if not ok:
             return api_err(400, "禁言失败，用户不存在或不能禁言群主")
+        pending_media = _queue_media_revocations(room_id=room_id, user_id=user_id, operation="publish")
+        await media_sessions.close_pending(_srs_management(), pending_media)
 
         member = user_manager.get_member(room_id, user_id)
 
@@ -2489,6 +2672,8 @@ async def disable_mic(request: Request, room_id: str, user_id: str, req: MemberO
         ok = user_manager.disable_mic(room_id, user_id)
         if not ok:
             return api_err(400, "禁麦失败，用户不存在或不能禁麦群主")
+        pending_media = _queue_media_revocations(room_id=room_id, user_id=user_id, operation="publish")
+        await media_sessions.close_pending(_srs_management(), pending_media)
 
         member = user_manager.get_member(room_id, user_id)
 
@@ -2571,6 +2756,8 @@ async def mute_all(request: Request, room_id: str, req: MemberOperatorRequest):
             return api_err(403, "权限不足，仅群主/管理员可操作")
 
         count = user_manager.mute_all(room_id)
+        pending_media = _queue_media_revocations(room_id=room_id, operation="publish")
+        await media_sessions.close_pending(_srs_management(), pending_media)
 
         asyncio.create_task(sync.room_mute_changed(room_id=room_id, allow_speak=False, operator_id=jwt_user_id))
 
@@ -3826,26 +4013,35 @@ async def get_message_history(request: Request, room_id: str, after_seq: int = 0
 # ==============================================================================
 
 @app.get("/api/v1/room/{room_id}/speaking")
-async def get_speaking(room_id: str):
+async def get_speaking(request: Request, room_id: str):
     """§7.1 获取正在说话的用户（基于 SRS 推流判断）"""
+    viewer = request.state.user_id
+    if not can_access_room_media("play", room_id, viewer, viewer):
+        return media_auth_error(MediaAuthError(403, "room media access denied"))
     try:
-        streams = await _srs_list_streams()
-        room_prefix = f"{room_id}_"
-        speaking = []
-        for s in streams:
-            name = s.get("name", "")
-            if name.startswith(room_prefix):
-                # 从 stream_name 提取 user_id：{room_id}_{user_id}
-                user_id = name[len(room_prefix):]
-                if user_id:
-                    speaking.append(user_id)
+        streams = await _srs_list_streams(strict=True)
+        room_prefix = f"{room_id.removeprefix('alove_room_')}."
+        legacy_prefix = f"{room_id}_"
+        speaking = set()
+        for stream in streams:
+            if stream.get("app") != "live" or not (stream.get("publish") or {}).get("active"):
+                continue
+            name = stream.get("name", "")
+            if name.startswith(room_prefix) and MEDIA_STREAM.fullmatch(name):
+                speaker = "user_" + name.removeprefix(room_prefix)
+            elif name.startswith(legacy_prefix):
+                speaker = name.removeprefix(legacy_prefix)
+            else:
+                continue
+            if can_access_room_media("play", room_id, viewer, speaker):
+                speaking.add(speaker)
         return api_ok({
             "room_id": room_id,
-            "speaking_users": speaking
+            "speaking_users": sorted(speaking),
         })
-    except Exception as e:
+    except (aiohttp.ClientError, TimeoutError, ValueError) as e:
         logger.error(f"[API] get_speaking error: {e}")
-        return api_err(500, str(e))
+        return JSONResponse(status_code=503, content={"code": 503, "message": "SRS stream list unavailable"})
 
 
 # ==============================================================================
@@ -3870,6 +4066,10 @@ async def broadcast_speaking_event(room_id: str, request: Request):
 
         if not user_id:
             return api_err(400, "user_id is required")
+
+        operation = "publish" if event_type == "start" else "play"
+        if user_id != request.state.user_id or not can_access_room_media(operation, room_id, user_id, user_id):
+            return media_auth_error(MediaAuthError(403, "room media access denied"))
 
         # 取说话者的显示名（user_id 是说话者；这里没鉴权，从 user_store 取）
         speaker_name = resolve_display_name(user_id, user_store=user_store, fallback=user_id)
@@ -4129,12 +4329,81 @@ async def ws_status():
 # SRS HTTP Hooks 回调端点
 # ==============================================================================
 
+class MediaTicketRequest(BaseModel):
+    operation: Literal["publish", "play"]
+    speaker_id: Optional[str] = None
+
+
+@app.post("/api/v1/room/{room_id}/media-ticket")
+async def issue_media_ticket(request: Request, room_id: str, req: MediaTicketRequest):
+    try:
+        user = request.state.payload
+        if user.get("app", "default") == "default":
+            if not request.headers.get("Authorization", "").lower().startswith("bearer "):
+                raise MediaAuthError(401, "Bearer user session required")
+            await verify_android_device(request, expected_key=user.get("device"))
+        return api_ok(media_authorization.issue_ticket(
+            user, request.headers.get("X-App-Token", ""),
+            room_id, req.operation, req.speaker_id,
+        ))
+    except MediaAuthError as e:
+        return media_auth_error(e)
+
+
+@app.get("/internal/media/flv-auth")
+async def authorize_flv(request: Request):
+    try:
+        media_authorization.authorize_stream(
+            "play", request.headers.get("X-Media-Stream", ""), request.headers.get("X-Media-Query", ""),
+        )
+        return Response(status_code=204)
+    except MediaAuthError as e:
+        return media_auth_error(e)
+
+
+class RtcOffer(BaseModel):
+    sdp: str = Field(min_length=1, max_length=65536)
+    streamurl: str = Field(min_length=1, max_length=8192)
+
+
+async def forward_rtc_offer(action, payload):
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.post(f"{SRS_HTTP_API}/rtc/v1/{action}/", json=payload) as response:
+                return JSONResponse(status_code=response.status, content=await response.json())
+    except (aiohttp.ClientError, TimeoutError, ValueError):
+        return JSONResponse(status_code=502, content={"code": 502, "message": "SRS signaling unavailable"})
+
+
+@app.post("/rtc/v1/{action}/")
+async def signal_rtc(action: Literal["play", "publish"], offer: RtcOffer):
+    try:
+        url = urlsplit(offer.streamurl)
+        stream = url.path.removeprefix("/live/")
+        if url.scheme != "webrtc" or not url.netloc or not url.path.startswith("/live/") or not MEDIA_STREAM.fullmatch(stream):
+            raise ValueError
+    except ValueError:
+        return JSONResponse(status_code=400, content={"code": 400, "message": "invalid WebRTC stream URL"})
+    try:
+        ticket = media_authorization.authorize_stream(action, stream, url.query)
+    except MediaAuthError as e:
+        return media_auth_error(e)
+    return await forward_rtc_offer(action, {
+        "sdp": offer.sdp,
+        "streamurl": f"webrtc://localhost/live/{stream}?srs_ticket={ticket}",
+    })
+
+
+@app.post("/api/v1/hooks/on_publish")
 @app.post("/api/v1/streams/on_publish")
 async def streams_on_publish(request: Request):
     try:
         data = await request.json()
-        logger.info(f"[SRS Hook] on_publish: {data}")
+        claims = media_authorization.authorize_callback("publish", data)
+        media_sessions.remember(data, claims)
         return {"code": 0, "server": SRS_URL}
+    except MediaAuthError as e:
+        return media_auth_error(e)
     except Exception as e:
         logger.error(f"[SRS Hook] on_publish error: {e}")
         return {"code": 1, "msg": str(e)}
@@ -4143,7 +4412,7 @@ async def streams_on_publish(request: Request):
 async def streams_on_unpublish(request: Request):
     try:
         data = await request.json()
-        logger.info(f"[SRS Hook] on_unpublish: {data}")
+        media_sessions.forget_callback(data, "on_unpublish", "publish")
         stream = data.get("stream", "")
         client_id = str(data.get("client_id", ""))
         if client_id and stream:
@@ -4162,15 +4431,15 @@ async def streams_on_unpublish(request: Request):
         logger.error(f"[SRS Hook] on_unpublish error: {e}")
         return {"code": 1, "msg": str(e)}
 
+@app.post("/api/v1/hooks/on_play")
 @app.post("/api/v1/streams/on_play")
 async def streams_on_play(request: Request):
     try:
         data = await request.json()
-        logger.info(f"[SRS Hook] on_play: {data}")
+        claims = media_authorization.authorize_callback("play", data)
+        media_sessions.remember(data, claims)
         stream = data.get("stream", "")
-        client_id = str(data.get("client_id", ""))
-        if not client_id:
-            client_id = f"unknown_{id(data)}"
+        client_id = data["client_id"]
         if stream:
             rid = _extract_room_id_from_stream(stream)
             if rid:
@@ -4179,6 +4448,8 @@ async def streams_on_play(request: Request):
                     entry["clients"].add(client_id)
                     entry["count"] = len(entry["clients"])
         return {"code": 0}
+    except MediaAuthError as e:
+        return media_auth_error(e)
     except Exception as e:
         logger.error(f"[SRS Hook] on_play error: {e}")
         return {"code": 1, "msg": str(e)}
@@ -4187,7 +4458,7 @@ async def streams_on_play(request: Request):
 async def streams_on_stop(request: Request):
     try:
         data = await request.json()
-        logger.info(f"[SRS Hook] on_stop: {data}")
+        media_sessions.forget_callback(data, "on_stop", "play")
         stream = data.get("stream", "")
         client_id = str(data.get("client_id", ""))
         if client_id and stream:
@@ -4207,20 +4478,11 @@ async def streams_on_stop(request: Request):
         return {"code": 1, "msg": str(e)}
 
 # 原始路径别名
-@app.post("/api/v1/hooks/on_publish")
-async def on_publish(request: Request):
-    try:
-        data = await request.json()
-        logger.info(f"[SRS Hook] on_publish: {data}")
-        return {"code": 0, "server": SRS_URL}
-    except Exception as e:
-        return {"code": 1, "msg": str(e)}
-
 @app.post("/api/v1/hooks/on_unpublish")
 async def on_unpublish(request: Request):
     try:
         data = await request.json()
-        logger.info(f"[SRS Hook] on_unpublish: {data}")
+        media_sessions.forget_callback(data, "on_unpublish", "publish")
         stream_key = data.get("stream_key", "")
         request_id = translation_processes_by_stream.get(stream_key)
         if request_id:
@@ -4230,20 +4492,11 @@ async def on_unpublish(request: Request):
     except Exception as e:
         return {"code": 1, "msg": str(e)}
 
-@app.post("/api/v1/hooks/on_play")
-async def on_play(request: Request):
-    try:
-        data = await request.json()
-        logger.info(f"[SRS Hook] on_play: {data}")
-        return {"code": 0}
-    except Exception as e:
-        return {"code": 1, "msg": str(e)}
-
 @app.post("/api/v1/hooks/on_stop")
 async def on_stop(request: Request):
     try:
         data = await request.json()
-        logger.info(f"[SRS Hook] on_stop: {data}")
+        media_sessions.forget_callback(data, "on_stop", "play")
         return {"code": 0}
     except Exception as e:
         return {"code": 1, "msg": str(e)}
@@ -4253,57 +4506,31 @@ async def on_stop(request: Request):
 # 心跳检查线程
 # ==============================================================================
 
-heartbeat_check_thread = None
-heartbeat_check_running = False
-
-def heartbeat_check_worker():
-    global heartbeat_check_running
-    from translation_manager import translation_manager
+async def heartbeat_check_worker():
     logger.info("[HeartbeatCheck] Starting heartbeat check worker")
-
-    while heartbeat_check_running:
+    while True:
         try:
-            results = translation_manager.check_and_cleanup()
+            results = await asyncio.to_thread(translation_manager.check_and_cleanup)
             for result in results:
                 if result["stopped"]:
                     logger.info(f"[HeartbeatCheck] Cleaned up translation: {result['request_id']}")
-                    asyncio.run(manager.broadcast_to_room(result["room_id"], {
+                    await manager.broadcast_to_room(result["room_id"], {
                         "type": "translation_stopped",
                         "room_id": result["room_id"],
                         "user_id": result["source_user"],
-                        "data": {}
-                    }))
+                        "data": {},
+                    })
         except Exception as e:
             logger.error(f"[HeartbeatCheck] Error: {e}", exc_info=True)
 
-        # 2026-08-13 §2.2：扫描 room_socket 心跳（HEARTBEAT_INTERVAL/HOLD_THRESHOLD 来自 .env）
         try:
-            asyncio.run(manager.check_heartbeats(
+            await manager.check_heartbeats(
                 ping_interval=HEARTBEAT_INTERVAL,
                 fail_threshold=HEARTBEAT_FAIL_THRESHOLD,
-            ))
+            )
         except Exception as e:
             logger.error(f"[HeartbeatCheck] WS heartbeat error: {e}", exc_info=True)
-
-        for _ in range(10):
-            if not heartbeat_check_running:
-                break
-            threading.Event().wait(1)
-
-def start_heartbeat_checker():
-    global heartbeat_check_thread, heartbeat_check_running
-    if heartbeat_check_thread is not None and heartbeat_check_thread.is_alive():
-        return
-    heartbeat_check_running = True
-    heartbeat_check_thread = threading.Thread(target=heartbeat_check_worker, daemon=True)
-    heartbeat_check_thread.start()
-    logger.info("[HeartbeatCheck] Heartbeat checker started")
-
-def stop_heartbeat_checker():
-    global heartbeat_check_running
-    heartbeat_check_running = False
-    if heartbeat_check_thread:
-        heartbeat_check_thread.join(timeout=5)
+        await asyncio.sleep(10)
 
 
 # ==============================================================================
@@ -4321,44 +4548,14 @@ def _extract_room_id_from_stream(stream: str) -> str:
             return stream[:idx]
     return ""
 
-async def _srs_list_streams() -> list:
+async def _srs_list_streams(*, strict=False) -> list:
     try:
-        import aiohttp
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-            async with session.get(f"{SRS_HTTP_API}/api/v1/streams/") as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                return data.get("streams", []) or []
-    except ImportError:
-        try:
-            import requests
-            r = requests.get(f"{SRS_HTTP_API}/api/v1/streams/", timeout=5)
-            if r.status_code == 200:
-                return (r.json().get("streams", []) or [])
-        except:
-            pass
-        return []
-    except Exception as e:
+        return await _srs_management().list_streams()
+    except (aiohttp.ClientError, TimeoutError, ValueError) as e:
+        if strict:
+            raise
         logger.warning(f"[SRS API] list streams error: {e}")
         return []
-
-async def _srs_kick_stream(stream_url: str, action: str = "publish") -> bool:
-    try:
-        import aiohttp
-        path = stream_url
-        if "://" in path:
-            path = path.split("://", 1)[1]
-        if "/" in path:
-            path = "/" + path.split("/", 1)[1]
-        path = path.split("?")[0].split(".")[0]
-        url = f"{SRS_HTTP_API}/api/v1/streams/{path.lstrip('/')}"
-        params = {"action": action}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-            async with session.delete(url, params=params) as resp:
-                return resp.status == 200
-    except:
-        return False
 
 def get_room_active_streams(room_id: str) -> dict:
     result = {

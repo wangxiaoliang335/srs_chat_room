@@ -1,0 +1,14 @@
+services:
+  srs:
+    command: ["/usr/bin/bash", "/etc/srs-dev/log-redact.sh", "./objs/srs", "-c", "/etc/srs-dev/srs.conf"]
+    ports: !override
+      - "0.0.0.0:8000:8000/udp"
+    volumes:
+      - ${SRS_AUTH_CONFIG:?SRS_AUTH_CONFIG is required}:/etc/srs-dev/srs.conf:ro
+      - ${SRS_LOG_REDACTOR:?SRS_LOG_REDACTOR is required}:/etc/srs-dev/log-redact.sh:ro
+  chat-api:
+    image: ${CHAT_API_IMAGE:?CHAT_API_IMAGE is required}
+    env_file: !override
+      - ${CHAT_API_ENV_FILE:?CHAT_API_ENV_FILE is required}
+    volumes:
+      - ${CHAT_ANDROID_REGISTRY_DIR:?CHAT_ANDROID_REGISTRY_DIR is required}:/run/chat-android:ro

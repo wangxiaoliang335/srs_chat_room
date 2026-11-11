@@ -64,6 +64,8 @@ core-*
 # Test and docs
 test/
 test_*.py
+!tests/test_media_auth.py
+!tests/test_media_revocation.py
 
 # Config
 .env
@@ -94,6 +96,9 @@ invitations_active.json
 invitations_archive.json
 invitations.json.legacy
 revoked_tokens.json
+android-device-proofs.sqlite3*
+media_sessions.sqlite3*
+devices.json
 
 # 运行时状态数据（运行时生成，不入库）
 invite_codes.json

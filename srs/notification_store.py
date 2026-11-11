@@ -32,10 +32,12 @@ import queue
 import threading
 import time
 from pathlib import Path
+
+from chat_data import DATA_DIR
 from typing import Dict, List, Optional, Tuple
 
-ACTIVE_FILE = Path(__file__).parent / "notifications_active.json"
-ARCHIVE_FILE = Path(__file__).parent / "notifications_archive.json"
+ACTIVE_FILE = DATA_DIR / "notifications_active.json"
+ARCHIVE_FILE = DATA_DIR / "notifications_archive.json"
 
 FLUSH_INTERVAL = 0.2  # 写盘线程每 200ms 消费一次队列
 

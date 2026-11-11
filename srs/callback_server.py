@@ -38,7 +38,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 # 文件日志处理器
-log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'callback_server.log')
+from chat_data import DATA_DIR
+
+log_file = DATA_DIR / "callback_server.log"
 file_handler = logging.FileHandler(log_file, encoding='utf-8')
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))

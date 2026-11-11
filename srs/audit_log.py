@@ -17,7 +17,9 @@ import threading
 import time
 from pathlib import Path
 
-LOG_FILE = Path(__file__).parent / "audit.log"
+from chat_data import DATA_DIR
+
+LOG_FILE = DATA_DIR / "audit.log"
 
 
 class AuditLogger:

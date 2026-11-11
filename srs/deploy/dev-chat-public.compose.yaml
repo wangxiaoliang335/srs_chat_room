@@ -1,0 +1,28 @@
+services:
+  chat-api:
+    image: ${CHAT_API_IMAGE:?CHAT_API_IMAGE is required}
+  srs:
+    volumes:
+      - ${SRS_AUTH_CONFIG:?SRS_AUTH_CONFIG is required}:/etc/srs-dev/srs.conf:ro
+    ports: !override
+      - "0.0.0.0:8000:8000/udp"
+  chat-media:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    mem_limit: 64m
+    pids_limit: 32
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "0.0.0.0:1936:1936/tcp"
+    volumes:
+      - ${CHAT_MEDIA_NGINX_CONFIG:?CHAT_MEDIA_NGINX_CONFIG is required}:/etc/nginx/nginx.conf:ro
+      - ${CHAT_TLS_DIR:?CHAT_TLS_DIR is required}:/etc/chat-tls:ro
+    networks:
+      - default
+      - coupon-backend
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

@@ -1,0 +1,50 @@
+services:
+  srs:
+    depends_on:
+      chat-api:
+        condition: service_healthy
+    volumes:
+      - ${SRS_AUTH_CONFIG:?SRS_AUTH_CONFIG is required}:/etc/srs-dev/srs.conf:ro
+  chat-api:
+    image: ${CHAT_API_IMAGE:?CHAT_API_IMAGE is required}
+    restart: unless-stopped
+    mem_limit: 256m
+    pids_limit: 96
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - ${CHAT_API_ENV_FILE:?CHAT_API_ENV_FILE is required}
+    environment:
+      BUSINESS_BACKEND_URL: http://coupon-gateway:8080
+      MYSQL_DISABLE: "1"
+      REDIS_DISABLE: "1"
+      SYNC_ENABLED: "false"
+      CHAT_NATIVE_REGISTRATION_ENABLED: "0"
+      CHAT_TEST_LOGIN_ENABLED: "0"
+      SRS_URL: rtmp://srs:1935
+      SRS_HTTP_API: http://srs:1985
+    ports:
+      - "127.0.0.1:8085:8085"
+    volumes:
+      - chat-data:/var/lib/coupon-chat
+    networks:
+      - default
+      - coupon-backend
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8085/health', timeout=2))['status'] == 'ok'"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  coupon-backend:
+    external: true
+    name: coupon-prod
+
+volumes:
+  chat-data:

@@ -28,10 +28,12 @@ import queue
 import threading
 import time
 from pathlib import Path
+
+from chat_data import DATA_DIR
 from typing import Dict, Optional, List, Tuple
 
-ACTIVE_FILE = Path(__file__).parent / "invitations_active.json"
-ARCHIVE_FILE = Path(__file__).parent / "invitations_archive.json"
+ACTIVE_FILE = DATA_DIR / "invitations_active.json"
+ARCHIVE_FILE = DATA_DIR / "invitations_archive.json"
 
 FLUSH_INTERVAL = 0.2     # 写盘线程每 200ms 消费一次队列
 TERMINAL_STATUSES = ("accepted", "rejected", "expired")
@@ -103,7 +105,7 @@ class InvitationStore:
                 print(f"[InvitationStore] load {path} failed: {e}", flush=True)
 
         # 老格式兼容
-        legacy_path = Path(__file__).parent / "invitations.json"
+        legacy_path = DATA_DIR / "invitations.json"
         if legacy_path.exists():
             try:
                 with legacy_path.open("r", encoding="utf-8") as f:

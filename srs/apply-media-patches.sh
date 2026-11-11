@@ -35,6 +35,7 @@ fi
 patches=(
     "$here/patches/0001-http-flv-dotted-stream-names.patch"
     "$here/patches/0002-fix-shutdown-with-active-publishers.patch"
+    "$here/patches/0003-interrupt-http-flv-on-client-delete.patch"
 )
 pending=()
 for patch in "${patches[@]}"; do

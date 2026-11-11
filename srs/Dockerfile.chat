@@ -1,0 +1,11 @@
+FROM python:3.11-slim-bookworm@sha256:a83ba18aef0f865b1a4a611c2cf460fe446f2795673bbb9fe43be570439e3b39
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 CHAT_DATA_DIR=/var/lib/coupon-chat
+WORKDIR /app
+COPY requirements-chat.txt .
+RUN python -m pip install --no-cache-dir -r requirements-chat.txt
+COPY *.py ./
+RUN mkdir -p /var/lib/coupon-chat && chown 10001:10001 /var/lib/coupon-chat
+USER 10001:10001
+EXPOSE 8085
+CMD ["python", "-m", "uvicorn", "server_fastapi:app", "--host", "0.0.0.0", "--port", "8085", "--workers", "1", "--no-access-log", "--log-level", "warning"]

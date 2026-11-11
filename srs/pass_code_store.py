@@ -20,11 +20,13 @@ import secrets
 import threading
 import time
 from pathlib import Path
+
+from chat_data import DATA_DIR
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-PASS_CODES_FILE = Path(__file__).parent / "pass_codes.json"
+PASS_CODES_FILE = DATA_DIR / "pass_codes.json"
 
 # 过期时间：默认 30 天（可调）
 DEFAULT_TTL_SECONDS = 30 * 24 * 3600
@@ -121,6 +123,12 @@ class PassCodeStore:
                 self._flush()
                 return False
             return True
+
+    def allows_existing_member(self, user_id: str, room_id: str) -> bool:
+        """已有成员可能经分享或旧版邀请直接入房，没有单独的通行码。"""
+        with self._lock:
+            key = self._k(user_id, room_id)
+            return key not in self._by_key or self.has_active(user_id, room_id)
 
     def get_active(self, user_id: str, room_id: str) -> Optional[dict]:
         """返回 active 通行码（用于查询/审计）；过期返回 None。"""

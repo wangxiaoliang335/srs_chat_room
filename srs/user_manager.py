@@ -11,10 +11,12 @@
 import os
 import json
 import threading
+
+from chat_data import DATA_DIR
 import time
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from datetime import datetime
 import logging
 from pathlib import Path
@@ -22,7 +24,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # 持久化文件：与 auth.py 的 USERS_FILE 同目录
-ROOMS_FILE = Path(__file__).parent / "user_manager.json"
+ROOMS_FILE = DATA_DIR / "user_manager.json"
 
 
 class UserRole(Enum):
@@ -743,6 +745,25 @@ class UserManager:
                 self._flush()
             return count
     
+    def can_access_media(
+        self, operation: str, room_id: str, user_id: str, speaker_id: str,
+        allows_existing_member: Callable[[str, str], bool],
+    ) -> bool:
+        """在同一把房间锁内检查媒体操作权限。"""
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if not room or room.status != RoomStatus.ACTIVE:
+                return False
+            for member_id in {user_id, speaker_id}:
+                member = room.members.get(member_id)
+                if not member:
+                    return False
+                if member.role in (UserRole.MEMBER, UserRole.GUEST) and not allows_existing_member(member_id, room_id):
+                    return False
+            if operation == "publish":
+                return user_id == speaker_id and self.can_publish(room_id, user_id)
+            return operation == "play"
+
     def can_publish(self, room_id: str, user_id: str) -> bool:
         """检查用户是否可以发布（发言）"""
         with self._lock:

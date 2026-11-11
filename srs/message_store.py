@@ -22,11 +22,13 @@ import queue
 import threading
 import time
 from pathlib import Path
+
+from chat_data import DATA_DIR
 from typing import Dict, List, Optional, Tuple
 
-ROOT_DIR = Path(__file__).parent / "messages_data"
-MESSAGES_FILE = Path(__file__).parent / "messages.json"  # 合并版（用户少时够用）
-SEQ_FILE = Path(__file__).parent / "messages_seq.json"
+ROOT_DIR = DATA_DIR / "messages_data"
+MESSAGES_FILE = DATA_DIR / "messages.json"  # 合并版（用户少时够用）
+SEQ_FILE = DATA_DIR / "messages_seq.json"
 
 FLUSH_INTERVAL = 0.2
 

@@ -28,9 +28,11 @@ import random
 import threading
 import time
 from pathlib import Path
+
+from chat_data import DATA_DIR
 from typing import Dict, Optional, Tuple
 
-DATA_FILE = Path(__file__).parent / "invite_codes.json"
+DATA_FILE = DATA_DIR / "invite_codes.json"
 
 DEFAULT_EXPIRE_SECONDS = 600  # 10 分钟
 CODE_LEN = 10  # 8~12 位随机
