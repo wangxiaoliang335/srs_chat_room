@@ -1,0 +1,16 @@
+--- a/trunk/src/app/srs_app_server.cpp
++++ b/trunk/src/app/srs_app_server.cpp
+@@ -1150,6 +1150,13 @@ srs_error_t SrsServer::on_tcp_client(ISrsListener* listener, srs_netfd_t stfd)
+     // We always try to close the stfd, because it should be NULL if it has been handled or closed.
+     srs_close_stfd(stfd);
+ 
++    // 达到连接上限只拒绝本次连接，不能让 TCP accept 协程退出；容量释放后仍需接入新客户端。
++    if (err != srs_success && srs_error_code(err) == ERROR_EXCEED_CONNECTIONS) {
++        srs_warn("Connection rejected at max_connections");
++        srs_freep(err);
++        return srs_success;
++    }
++
+     return err;
+ }
+ 

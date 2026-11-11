@@ -31,6 +31,13 @@ distributed under their [licenses](https://ossrs.io/lts/en-us/license).
 
 聊天室媒体服务的构建和回归流程见[本仓库 SRS 补丁](patches/README.md)。
 
+### 聊天室 API 约定
+
+- `POST /api/v1/room` 和 `/api/v1/rooms` 的 `room_id` 必须完整匹配 `alove_room_[0-9]{1,20}`，例如 `alove_room_1794379200123`。不合法的 ID 在创建或覆盖房间之前返回 HTTP 400 / `code: 400`，与媒体凭证使用的房间规则一致。
+- 踢人、禁言、禁麦、全体禁言、注销和关闭房间会先持久化权限变更，再等待 SRS 确认连接断开。正常完成仍返回原有 `code: 0` 及原有数据；如果管理服务不可用、DELETE 后连接仍在，或 RTC 尚未登记，则返回 HTTP 503 / `code: 503`，并在原有 `data` 中加入 `permission_applied: true`、`media_disconnect: "pending"`、`pending_media_connections: <待断开数量>`、`retrying: true`，响应头包含 `Retry-After: 1`。客户端必须将此状态显示为权限已生效、撤流待完成，不能显示为全部成功。
+- 后台继续重试待断开的旧连接，记录跨重启保留；解禁或重新入房不会取消旧连接的撤流，也不会使旧撤流任务关闭新建的合法连接。目标已离房时，授权管理员可重试踢人以完成撤流；房间已关闭时，房主可重试关房。目标重新入房后的再次踢人属于新操作，调用前应刷新成员状态。注销返回 503 时原 token 已失效，以该 token 重试将返回 401；撤流由后台继续完成。
+- 关房前检测到活动发布流时返回 409；检查兼容当前 `<房间数字>.<用户哈希>` 媒体流名。`callback_server.log` 使用 10 MiB 轮转阈值，并保留 3 个备份。
+
 Please check the Getting Started guide in [English](https://ossrs.io/lts/en-us/docs/v5/doc/getting-started) 
 or [Chinese](https://ossrs.net/lts/zh-cn/docs/v5/doc/getting-started). We highly recommend using SRS with docker:
 

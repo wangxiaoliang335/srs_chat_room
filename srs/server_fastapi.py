@@ -18,6 +18,7 @@ import json
 import time
 import uuid
 import logging
+from logging.handlers import RotatingFileHandler
 import asyncio
 import threading
 from typing import Dict, Set, Optional, List, Tuple, Literal
@@ -73,7 +74,7 @@ from rate_limiter import rate_limiter
 from auth import user_store, issue_token, verify_token, AuthError, JWT_SECRET, JWT_TTL_SECONDS, revocation, USERNAME_RE
 from chat_data import DATA_DIR
 from android_device_proof import AndroidDeviceProof
-from media_auth import MEDIA_STREAM, MediaAuthError, MediaAuthorization, load_applications
+from media_auth import MEDIA_STREAM, ROOM_ID, MediaAuthError, MediaAuthorization, load_applications
 from media_sessions import MediaSessions
 from srs_management import SrsManagement
 from sync_client import sync
@@ -91,7 +92,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 log_file = DATA_DIR / "callback_server.log"
-file_handler = logging.FileHandler(log_file, encoding='utf-8')
+file_handler = RotatingFileHandler(log_file, maxBytes=10 * 1024 * 1024, backupCount=3, encoding='utf-8')
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
@@ -382,21 +383,22 @@ def _srs_management():
 
 
 def _queue_media_revocations(*, room_id=None, user_id=None, operation=None, jti=None):
-    def should_close(claims):
-        if (
+    def in_scope(claims):
+        return not (
             (room_id is not None and claims["room"] != room_id)
             or (user_id is not None and user_id not in (claims["uid"], claims["speaker"]))
             or (operation is not None and claims["operation"] != operation)
             or (jti is not None and claims["session"] != jti)
-        ):
-            return False
+        )
+
+    def should_close(claims):
         try:
             media_authorization.require_ticket_session(claims)
         except MediaAuthError:
             return True
         return not can_access_room_media(claims["operation"], claims["room"], claims["uid"], claims["speaker"])
 
-    return media_sessions.mark_pending(should_close)
+    return media_sessions.mark_pending(should_close, in_scope=in_scope)
 
 
 async def _media_revocation_worker():
@@ -528,6 +530,20 @@ def api_err(code: int, message: str) -> JSONResponse:
         "code": code,
         "message": message
     })
+
+
+def api_revocation_result(data, pending_media, *, message="success"):
+    """Keep legacy success responses, but never acknowledge unconfirmed media closure."""
+    if pending_media:
+        return JSONResponse(status_code=503, headers={"Retry-After": "1"}, content={
+            "code": 503,
+            "message": "权限变更已生效，媒体连接仍在断开中，后台将继续重试",
+            "data": {
+                **data, "permission_applied": True, "media_disconnect": "pending",
+                "pending_media_connections": pending_media, "retrying": True,
+            },
+        })
+    return {"code": 0, "message": message, "data": data}
 
 
 def _get_timestamp() -> str:
@@ -1559,9 +1575,9 @@ async def auth_logout(request: Request):
     revocation.revoke_jti(jti, exp)
     pending_media = _queue_media_revocations(jti=jti)
     await manager.prune_unauthorized(jti=jti)
-    await media_sessions.close_pending(_srs_management(), pending_media)
+    remaining_media = await media_sessions.close_pending(_srs_management(), pending_media)
     logger.info(f"[Auth] logout: user={username} jti={jti[:8]}...")
-    return {"code": 0, "message": "logged out", "data": {}}
+    return api_revocation_result({}, remaining_media, message="logged out")
 
 
 class LogoutAllRequest(BaseModel):
@@ -1584,9 +1600,11 @@ async def auth_logout_all(request: Request, req: LogoutAllRequest):
     count = revocation.revoke_user_all(user_id)
     pending_media = _queue_media_revocations(user_id=user_id)
     await manager.prune_unauthorized(user_id=user_id)
-    await media_sessions.close_pending(_srs_management(), pending_media)
+    remaining_media = await media_sessions.close_pending(_srs_management(), pending_media)
     logger.info(f"[Auth] logout-all: user={target} revoked={count}")
-    return {"code": 0, "message": "all tokens revoked", "data": {"username": target, "revoked_count": count}}
+    return api_revocation_result(
+        {"username": target, "revoked_count": count}, remaining_media, message="all tokens revoked",
+    )
 
 
 @app.get("/api/v1/auth/revocation-status")
@@ -1635,6 +1653,9 @@ async def create_room(request: Request, req: RoomCreateRequest):
         # 若请求体里指定了 owner_id，必须等于当前登录用户（防越权）
         if req.owner_id and req.owner_id != jwt_user_id:
             return api_err(403, "owner_id must match current user")
+
+        if not ROOM_ID.fullmatch(req.room_id):
+            return api_err(400, "room_id must match alove_room_[0-9]{1,20}")
 
         # 2026-08-13 文档 §7.1：房主唯一性 + 覆盖更新语义
         existing_owned = user_manager.find_owned_room(jwt_user_id)
@@ -2006,6 +2027,15 @@ async def delete_room(request: Request, room_id: str):
         if room.owner_id != operator_id:
             return api_err(403, "只有群主可以关闭房间")
 
+        # A retry after permission changes only needs to finish the pending disconnects.
+        if room.status.value == "closed":
+            pending_media = _queue_media_revocations(room_id=room_id)
+            await manager.close_room_connections(room_id)
+            remaining_media = await media_sessions.close_pending(_srs_management(), pending_media)
+            return api_revocation_result({
+                "room_id": room_id, "owner_id": room.owner_id, "closed_members": [],
+            }, remaining_media)
+
         # 检查活跃资源
         check = await check_room_can_delete(room_id)
         if not check["can_delete"]:
@@ -2044,15 +2074,15 @@ async def delete_room(request: Request, room_id: str):
             logger.warning(f"[CloseRoom] revoke pass_codes failed: {e}")
         pending_media = _queue_media_revocations(room_id=room_id)
         await manager.close_room_connections(room_id)
-        await media_sessions.close_pending(_srs_management(), pending_media)
+        remaining_media = await media_sessions.close_pending(_srs_management(), pending_media)
         asyncio.create_task(sync.room_deleted(room_id=room_id, deleted_by=operator_id))
         logger.info(f"[API] Room {room_id} closed (operator={operator_id})")
 
-        return api_ok({
+        return api_revocation_result({
             "room_id": room_id,
             "owner_id": room.owner_id,
             "closed_members": member_ids
-        })
+        }, remaining_media)
     except JSONResponse:
         raise
     except Exception as e:
@@ -2283,7 +2313,11 @@ async def kick_member(request: Request, room_id: str, user_id: str, operator_id:
 
         member = user_manager.get_member(room_id, user_id)
         if not member:
-            return api_err(404, f"Member {user_id} not found in room {room_id}")
+            if operator_id == user_id or not user_manager.can_manage_members(room_id, operator_id):
+                return api_err(403, "权限不足，仅群主/管理员可重试踢出操作")
+            pending_media = _queue_media_revocations(room_id=room_id, user_id=user_id)
+            remaining_media = await media_sessions.close_pending(_srs_management(), pending_media)
+            return api_revocation_result({}, remaining_media)
 
         # 权限检查：群主可踢任何人；admin 可踢 member
         if not user_manager.can_kick(room_id, operator_id, user_id):
@@ -2304,7 +2338,7 @@ async def kick_member(request: Request, room_id: str, user_id: str, operator_id:
             "operator_id": operator_id,
             "timestamp": _get_timestamp(),
         }
-        await asyncio.gather(
+        _, remaining_media = await asyncio.gather(
             manager.close_kicked_member(event),
             media_sessions.close_pending(_srs_management(), pending_media),
         )
@@ -2333,7 +2367,7 @@ async def kick_member(request: Request, room_id: str, user_id: str, operator_id:
         )
 
         logger.info(f"[API] User {user_id} kicked from room {room_id} by {operator_id}")
-        return api_ok({})
+        return api_revocation_result({}, remaining_media)
     except JSONResponse:
         raise
     except Exception as e:
@@ -2587,7 +2621,7 @@ async def mute_member(request: Request, room_id: str, user_id: str, req: MemberO
         if not ok:
             return api_err(400, "禁言失败，用户不存在或不能禁言群主")
         pending_media = _queue_media_revocations(room_id=room_id, user_id=user_id, operation="publish")
-        await media_sessions.close_pending(_srs_management(), pending_media)
+        remaining_media = await media_sessions.close_pending(_srs_management(), pending_media)
 
         member = user_manager.get_member(room_id, user_id)
 
@@ -2598,11 +2632,11 @@ async def mute_member(request: Request, room_id: str, user_id: str, req: MemberO
             "operator_id": req.operator_id
         })
 
-        return api_ok({
+        return api_revocation_result({
             "user_id": user_id,
             "status": member.status.value,
             "publish_allowed": member.publish_allowed
-        })
+        }, remaining_media)
     except JSONResponse:
         raise
     except Exception as e:
@@ -2673,7 +2707,7 @@ async def disable_mic(request: Request, room_id: str, user_id: str, req: MemberO
         if not ok:
             return api_err(400, "禁麦失败，用户不存在或不能禁麦群主")
         pending_media = _queue_media_revocations(room_id=room_id, user_id=user_id, operation="publish")
-        await media_sessions.close_pending(_srs_management(), pending_media)
+        remaining_media = await media_sessions.close_pending(_srs_management(), pending_media)
 
         member = user_manager.get_member(room_id, user_id)
 
@@ -2684,11 +2718,11 @@ async def disable_mic(request: Request, room_id: str, user_id: str, req: MemberO
             "operator_id": req.operator_id
         })
 
-        return api_ok({
+        return api_revocation_result({
             "user_id": user_id,
             "status": member.status.value,
             "publish_allowed": member.publish_allowed
-        })
+        }, remaining_media)
     except JSONResponse:
         raise
     except Exception as e:
@@ -2757,7 +2791,7 @@ async def mute_all(request: Request, room_id: str, req: MemberOperatorRequest):
 
         count = user_manager.mute_all(room_id)
         pending_media = _queue_media_revocations(room_id=room_id, operation="publish")
-        await media_sessions.close_pending(_srs_management(), pending_media)
+        remaining_media = await media_sessions.close_pending(_srs_management(), pending_media)
 
         asyncio.create_task(sync.room_mute_changed(room_id=room_id, allow_speak=False, operator_id=jwt_user_id))
 
@@ -2768,11 +2802,11 @@ async def mute_all(request: Request, room_id: str, req: MemberOperatorRequest):
             "data": {"muted_count": count}
         })
 
-        return api_ok({
+        return api_revocation_result({
             "room_id": room_id,
             "allow_speak": False,
             "muted_count": count
-        })
+        }, remaining_media)
     except JSONResponse:
         raise
     except Exception as e:
@@ -4597,7 +4631,11 @@ async def check_room_can_delete(room_id: str) -> dict:
 
     for s in streams:
         name = s.get("name", "")
-        if name.startswith(room_prefix) or name.startswith(translation_prefix):
+        current_room_stream = (
+            ROOM_ID.fullmatch(room_id) and MEDIA_STREAM.fullmatch(name)
+            and name.partition(".")[0] == room_id.removeprefix("alove_room_")
+        )
+        if current_room_stream or name.startswith(room_prefix) or name.startswith(translation_prefix):
             detail["publish_streams"].append(name)
             detail["has_publish"] = True
 

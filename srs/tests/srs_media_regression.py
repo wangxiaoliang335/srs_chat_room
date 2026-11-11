@@ -28,7 +28,7 @@ HTTP = build_opener(ProxyHandler({}))
 MANAGEMENT_USER = "qa-flv-operator"
 MANAGEMENT_PASSWORD = "qa-flv-password"
 MANAGEMENT_AUTH = "Basic " + base64.b64encode(f"{MANAGEMENT_USER}:{MANAGEMENT_PASSWORD}".encode()).decode()
-CASES = ("dotted", "shutdown", "disconnect", "redaction")
+CASES = ("dotted", "shutdown", "disconnect", "capacity", "redaction")
 
 
 def free_tcp_ports():
@@ -137,6 +137,33 @@ def verify_flv_disconnect(management, flv, stream, publisher):
             publisher.send_signal(signal.SIGCONT)
 
 
+def verify_connection_limit_recovery(rtmp, management, flv, server):
+    # 完成 C0/C1 握手来确认 SRS 已接受连接，避免只填满内核 backlog 造成假通过。
+    with ExitStack() as stack:
+        for _ in range(8):
+            connection = stack.enter_context(socket.create_connection(("127.0.0.1", rtmp), timeout=2))
+            connection.sendall(b"\x03" + bytes(1536))
+            if connection.recv(1) != b"\x03":
+                raise AssertionError("SRS rejected a connection below its configured capacity")
+
+        for port, request in (
+            (rtmp, b"\x03" + bytes(1536)),
+            (management, b"GET /api/v1/versions HTTP/1.0\r\n\r\n"),
+            (flv, b"GET /live/capacity.flv HTTP/1.0\r\n\r\n"),
+        ):
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as excess:
+                try:
+                    excess.sendall(request)
+                    if excess.recv(1):
+                        raise AssertionError("SRS accepted a client above its connection limit")
+                except ConnectionError:
+                    pass
+
+    # 三种监听均被触发过限额；释放连接后必须在同一进程恢复，不能依赖重启。
+    wait_for("SRS management to recover after connection saturation",
+             lambda: str(api(management, "versions")["pid"]) == str(server.pid), timeout=5)
+
+
 def run_case(binary, ffmpeg, case):
     rtmp, management, flv = free_tcp_ports()
     # Plain stream names make the shutdown regression independent of the FLV naming fix.
@@ -147,6 +174,7 @@ def run_case(binary, ffmpeg, case):
         config = work / "srs.conf"
         config.write_text(f"""listen 127.0.0.1:{rtmp};
 daemon off;
+max_connections {8 if case == "capacity" else 100};
 srs_log_tank console;
 pid ./srs.pid;
 http_api {{
@@ -211,6 +239,8 @@ vhost __defaultVhost__ {{
 
         try:
             server = start_server("server")
+            if case == "capacity":
+                verify_connection_limit_recovery(rtmp, management, flv, server)
             media = start_media("before")
             if case == "shutdown":
                 # The publishers and players are still connected when SIGTERM is sent.

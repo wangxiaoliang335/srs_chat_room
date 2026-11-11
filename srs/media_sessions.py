@@ -99,9 +99,13 @@ class MediaSessions:
             for server, service, client, claims, accepted, pending in db.execute(query)
         ]
 
-    def mark_pending(self, should_close):
+    def mark_pending(self, should_close, *, in_scope=None):
         with closing(sqlite3.connect(self.path)) as db, db:
-            matched = [conn for conn in self._connections(db) if should_close(conn.claims)]
+            # Once revoked, an old connection must still close after a rejoin/unmute.
+            matched = [
+                conn for conn in self._connections(db)
+                if (in_scope is None or in_scope(conn.claims)) and (conn.pending or should_close(conn.claims))
+            ]
             db.executemany("""
                 UPDATE media_sessions SET pending = 1
                 WHERE (server_id, service_id, client_id) = (?, ?, ?)
@@ -116,8 +120,9 @@ class MediaSessions:
             """, [(*conn.identity, conn.accepted_at) for conn in connections])
 
     async def close_pending(self, management, identities=None):
+        """Attempt disconnection and return the number still awaiting confirmation."""
         if identities is not None and not identities:
-            return
+            return 0
         # A room operation must wait if the worker already started closing its connections.
         async with self._close_lock:
             with closing(sqlite3.connect(self.path)) as db:
@@ -126,13 +131,19 @@ class MediaSessions:
                     if identities is None or conn.identity in identities
                 ]
             if not pending:
-                return
+                return 0
             self._closing.update(conn.identity for conn in pending)
             try:
                 closed = await management.close_connections(pending)
                 self._forget(closed)
             finally:
                 self._closing.clear()
+            # A stop/unpublish callback may remove records while management is awaiting SRS.
+            with closing(sqlite3.connect(self.path)) as db:
+                return sum(
+                    identities is None or conn.identity in identities
+                    for conn in self._connections(db, pending_only=True)
+                )
 
     async def reconcile(self, management):
         cutoff = time.time() - REGISTRATION_GRACE_SECONDS

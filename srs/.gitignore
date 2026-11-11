@@ -66,6 +66,7 @@ test/
 test_*.py
 !tests/test_media_auth.py
 !tests/test_media_revocation.py
+!tests/test_dev_rollout.py
 
 # Config
 .env

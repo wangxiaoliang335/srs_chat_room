@@ -2,6 +2,7 @@ import base64
 import hashlib
 import importlib
 import json
+import logging
 import secrets
 import sys
 import time
@@ -55,6 +56,7 @@ def chat(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "redis", None)
     server = importlib.import_module("server_fastapi")
     from android_device_proof import AndroidDeviceProof
+    from media_sessions import MediaSessions
     from pass_code_store import PassCodeStore
     from user_manager import UserManager
 
@@ -63,6 +65,7 @@ def chat(monkeypatch, tmp_path):
     rooms.create_room(OTHER_ROOM, OUTSIDER, "Other room")
     rooms.join_room(ROOM, MEMBER)
     monkeypatch.setattr(server, "user_manager", rooms)
+    monkeypatch.setattr(server, "media_sessions", MediaSessions(tmp_path / "media-sessions.sqlite3"))
     passes = PassCodeStore(tmp_path / "passes.json")
     passes.issue(MEMBER, ROOM)
     monkeypatch.setattr(server, "pass_code_store", passes)
@@ -133,6 +136,65 @@ def test_srs_denies_anonymous_publish_and_play(chat):
     for action in ("on_publish", "on_play"):
         response = hook(client, action, "1001.111111111111")
         assert response.status_code >= 400 or response.json()["code"] != 0
+
+
+def test_callback_log_rotates_with_bounded_retention(chat, monkeypatch):
+    server, _ = chat
+    handler = server.file_handler
+    assert 0 < getattr(handler, "maxBytes", 0) <= 10 * 1024 * 1024
+    assert 0 < getattr(handler, "backupCount", 0) <= 5
+    # Exercise the configured handler with small files rather than writing megabytes in CI.
+    monkeypatch.setattr(handler, "maxBytes", 1024)
+    monkeypatch.setattr(handler, "backupCount", 2)
+    for index in range(8):
+        handler.emit(logging.LogRecord("callback-test", logging.INFO, __file__, 1, f"entry-{index} " + "x" * 500, (), None))
+    handler.flush()
+
+    path = Path(handler.baseFilename)
+    assert path.stat().st_size < 1024
+    assert (path.parent / f"{path.name}.1").stat().st_size < 1024
+    assert (path.parent / f"{path.name}.2").stat().st_size < 1024
+    assert not (path.parent / f"{path.name}.3").exists()
+    assert "entry-7" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("path", ["/api/v1/room", "/api/v1/rooms"])
+@pytest.mark.parametrize("room_id", ["partner-demo", "", "alove_room_", "alove_room_١", "alove_room_123456789012345678901", "alove_room_123\n"])
+def test_create_room_rejects_ids_that_cannot_receive_media_before_mutation(chat, path, room_id):
+    server, client = chat
+    before = {room.room_id: room.name for room in server.user_manager.get_all_rooms()}
+
+    response = client.post(path, headers=user_headers(MEMBER), json={"room_id": room_id})
+
+    assert response.status_code == 400
+    assert response.json()["code"] == 400
+    assert {room.room_id: room.name for room in server.user_manager.get_all_rooms()} == before
+    assert server.user_manager.find_owned_room(MEMBER) is None
+
+
+@pytest.mark.parametrize("path", ["/api/v1/room", "/api/v1/rooms"])
+def test_invalid_create_id_cannot_overwrite_existing_room(chat, path):
+    server, client = chat
+
+    response = client.post(path, headers=user_headers(OWNER), json={"room_id": "partner-demo", "name": "changed"})
+
+    assert response.status_code == 400
+    assert server.user_manager.get_room(ROOM).name == "QA room"
+
+
+@pytest.mark.parametrize("path", ["/api/v1/room", "/api/v1/rooms"])
+@pytest.mark.parametrize("room_id", ["alove_room_0", "alove_room_1794379200123", "alove_room_12345678901234567890"])
+def test_create_room_accepts_android_ids_and_issues_media_ticket(chat, path, room_id):
+    _, client = chat
+    creator = "user_444444444444"
+    headers = user_headers(creator)
+
+    response = client.post(path, headers=headers, json={"room_id": room_id})
+
+    assert response.json()["code"] == 0
+    assert response.json()["data"]["room_id"] == room_id
+    grant = issue(client, headers, "publish", room=room_id, speaker=creator)
+    assert grant.json()["code"] == 0
 
 
 def test_coupon_bearer_alone_cannot_select_first_party_login(chat, monkeypatch):
